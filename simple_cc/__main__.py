@@ -21,6 +21,7 @@ from .cron import (
 )
 from .hooks import trigger_hooks
 from .models import ChatProvider, ToolCall
+from .permissions import PermissionPolicy
 from .provider import SiliconFlowProvider
 from .teams import (
     active_teammates,
@@ -86,7 +87,6 @@ def build_runtime(
     approval_callback=None,
     provider: ChatProvider | None = None,
 ) -> SimpleCCApp:
-    del approval_callback
     provider = provider or SiliconFlowProvider(settings)
     config.configure_workspace(settings.workspace)
     config.MODEL = settings.model
@@ -100,7 +100,14 @@ def build_runtime(
     subagents.MODEL = settings.model
     set_team_provider(provider)
     initialize_cron()
-    return SimpleCCApp(settings=settings, runtime=SourceRuntime(provider))
+    return SimpleCCApp(
+        settings=settings,
+        runtime=SourceRuntime(
+            provider,
+            PermissionPolicy(),
+            approval_callback,
+        ),
+    )
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -168,6 +175,8 @@ def cron_autorun_loop(
     history: list,
     context: dict,
     stop_event: threading.Event | None = None,
+    permissions: PermissionPolicy | None = None,
+    approval_callback=None,
 ):
     stop_event = stop_event or threading.Event()
     while not stop_event.wait(1):
@@ -183,7 +192,12 @@ def cron_autorun_loop(
                 terminal_print(
                     f"  \033[35m[cron auto] {job.prompt[:60]}\033[0m"
                 )
-            agent_loop(history, context)
+            agent_loop(
+                history,
+                context,
+                permissions,
+                approval_callback,
+            )
             context.update(update_context(context, history))
             print_turn_assistants(history, turn_start)
 
@@ -204,7 +218,13 @@ def main(argv: list[str] | None = None) -> int:
     context = app.runtime.context
     app.autorun_thread = threading.Thread(
         target=cron_autorun_loop,
-        args=(history, context, app.stop_event),
+        args=(
+            history,
+            context,
+            app.stop_event,
+            app.runtime.permissions,
+            app.runtime.approval_callback,
+        ),
         name="simple-cc-cron-autorun",
         daemon=True,
     )
@@ -227,7 +247,12 @@ def main(argv: list[str] | None = None) -> int:
             turn_start = len(history)
             history.append({"role": "user", "content": query})
             with agent_lock:
-                agent_loop(history, context)
+                agent_loop(
+                    history,
+                    context,
+                    app.runtime.permissions,
+                    app.runtime.approval_callback,
+                )
                 context = update_context(context, history)
                 app.runtime.context = context
                 print_turn_assistants(history, turn_start)

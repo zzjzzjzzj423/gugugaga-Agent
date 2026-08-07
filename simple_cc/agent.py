@@ -64,8 +64,15 @@ class FixedToolRegistry:
 class SourceRuntime:
     """Small public wrapper over the retained module-level S20 loop."""
 
-    def __init__(self, provider: ChatProvider):
+    def __init__(
+        self,
+        provider: ChatProvider,
+        permissions: PermissionPolicy | None = None,
+        approval_callback: Callable[[ToolCall], bool] | None = None,
+    ):
         self.provider = provider
+        self.permissions = permissions or PermissionPolicy()
+        self.approval_callback = approval_callback
         self.registry = FixedToolRegistry()
         self.messages: list[dict[str, Any]] = []
         self.context: dict[str, Any] = update_context({}, [])
@@ -105,7 +112,12 @@ class SourceRuntime:
         with agent_lock:
             turn_start = len(self.messages)
             self.messages.append({"role": "user", "content": query})
-            agent_loop(self.messages, self.context)
+            agent_loop(
+                self.messages,
+                self.context,
+                self.permissions,
+                self.approval_callback,
+            )
             self.context = update_context(self.context, self.messages)
             return self._turn_text(self.messages, turn_start)
 
@@ -132,9 +144,15 @@ def call_llm(
     )
 
 
-def agent_loop(messages: list, context: dict):
+def agent_loop(
+    messages: list,
+    context: dict,
+    permissions: PermissionPolicy | None = None,
+    approval_callback: Callable[[ToolCall], bool] | None = None,
+):
     global rounds_since_todo
     tools, handlers = TOOL_DEFINITIONS, TOOL_HANDLERS
+    permissions = permissions or PermissionPolicy()
     state = RecoveryState()
     max_tokens = config.DEFAULT_MAX_TOKENS
 
@@ -238,6 +256,20 @@ def agent_loop(messages: list, context: dict):
                         "type": "tool_result",
                         "tool_use_id": block.id,
                         "content": str(blocked),
+                    }
+                )
+                continue
+
+            call = ToolCall(block.id, block.name, block.input)
+            if not permissions.approve(call, approval_callback):
+                results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": (
+                            f"Permission denied for tool '{block.name}'. "
+                            "Choose a safer approach."
+                        ),
                     }
                 )
                 continue

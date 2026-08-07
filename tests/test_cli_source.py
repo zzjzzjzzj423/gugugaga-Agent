@@ -14,6 +14,8 @@ import pytest
 from simple_cc import agent, config, context, cron, subagents, teams, tools
 from simple_cc import __main__ as cli
 from simple_cc.config import Settings
+from simple_cc.models import ToolCall
+from simple_cc.permissions import PermissionPolicy
 from simple_cc.provider import ProviderResponse, TextBlock, ToolUseBlock
 
 
@@ -42,6 +44,8 @@ class FakeApp:
         self.runtime = self
         self.messages = []
         self.context = {}
+        self.permissions = PermissionPolicy()
+        self.approval_callback = None
         self.stop_event = threading.Event()
         self.autorun_thread = None
         self.run_count = 0
@@ -284,6 +288,70 @@ def test_production_runtime_uses_fixed_registry_and_s20_tool_history(
         }
         assert not any(message.get("role") == "tool" for message in second_history)
         assert not any("tool_calls" in message for message in second_history)
+    finally:
+        app.close()
+
+
+def test_production_runtime_denial_blocks_fixed_bash_handler_and_reaches_model(
+    tmp_path, monkeypatch
+):
+    configure_env(monkeypatch)
+    provider = ContentBlockProvider(
+        [
+            ProviderResponse(
+                content=[
+                    ToolUseBlock(
+                        id="toolu_bash",
+                        name="bash",
+                        input={
+                            "command": "echo bypassed> permission-marker.txt"
+                        },
+                    )
+                ],
+                stop_reason="tool_use",
+            ),
+            ProviderResponse(
+                content=[TextBlock(text="Used a safer approach.")],
+                stop_reason="end_turn",
+            ),
+        ]
+    )
+    approval_requests: list[ToolCall] = []
+
+    def deny(call: ToolCall) -> bool:
+        approval_requests.append(call)
+        return False
+
+    app = cli.build_runtime(
+        Settings.from_env(tmp_path),
+        approval_callback=deny,
+        provider=provider,
+    )
+    try:
+        assert app.runtime.run_turn("Create the marker with bash") == (
+            "Used a safer approach."
+        )
+        assert not (tmp_path / "permission-marker.txt").exists()
+        assert approval_requests == [
+            ToolCall(
+                "toolu_bash",
+                "bash",
+                {"command": "echo bypassed> permission-marker.txt"},
+            )
+        ]
+        assert provider.requests[1]["messages"][-1] == {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_bash",
+                    "content": (
+                        "Permission denied for tool 'bash'. "
+                        "Choose a safer approach."
+                    ),
+                }
+            ],
+        }
     finally:
         app.close()
 
