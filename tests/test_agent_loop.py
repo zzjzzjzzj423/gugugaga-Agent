@@ -80,6 +80,7 @@ def test_context_error_compacts_once_then_retries(tmp_path):
 def test_compact_tool_forces_transcript_archive(tmp_path):
     provider = ScriptedProvider([
         ModelResponse("", [ToolCall("c1", "compact", {})], "tool_calls"),
+        ModelResponse("Manual summary with goals and decisions", [], "stop"),
         ModelResponse("Compacted", [], "stop"),
     ])
     runtime = make_runtime(tmp_path, provider)
@@ -87,6 +88,7 @@ def test_compact_tool_forces_transcript_archive(tmp_path):
     runtime.messages.extend({"role": "user", "content": str(i)} for i in range(5))
     assert runtime.run_turn("compact now") == "Compacted"
     assert list((tmp_path / ".simple_cc/transcripts").glob("*.json"))
+    assert "Manual summary with goals and decisions" in runtime.messages[0]["content"]
 
 
 def test_automatic_compaction_uses_provider_summary(tmp_path):

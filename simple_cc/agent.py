@@ -123,9 +123,10 @@ class AgentRuntime:
                 elif not self.permissions.approve(call, self.approval_callback):
                     output = f"Permission denied for tool '{call.name}'. Choose a safer approach."
                 elif call.name == "compact":
+                    summary = self._summarize(self.messages)
                     self.messages = self.context.compact(
                         self.messages,
-                        "Conversation compacted by explicit tool request.",
+                        summary,
                         force=True,
                     )
                     output = "Conversation compacted and transcript archived."

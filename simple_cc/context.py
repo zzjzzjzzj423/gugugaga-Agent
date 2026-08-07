@@ -83,12 +83,15 @@ class ContextManager:
         return result
 
     def needs_compaction(self, messages: list[dict]) -> bool:
-        already_compacted = bool(
-            messages
-            and messages[0].get("role") == "user"
-            and str(messages[0].get("content", "")).startswith("<compacted>")
-        )
-        return len(messages) > self.max_messages and not already_compacted
+        if not messages or messages[0].get("role") != "user":
+            return len(messages) > self.max_messages
+        content = str(messages[0].get("content", ""))
+        marker = re.match(r'^<compacted tail="(\d+)">', content)
+        if not marker:
+            return len(messages) > self.max_messages
+        baseline_tail = int(marker.group(1))
+        current_tail = len(messages) - 1
+        return current_tail - baseline_tail > self.max_messages
 
     def _complete_tail(self, messages: list[dict]) -> list[dict]:
         start = max(0, len(messages) - self.max_messages)
@@ -109,7 +112,13 @@ class ContextManager:
         stamp = f"{int(time.time())}_{uuid.uuid4().hex[:6]}"
         (self.transcripts_dir / f"{stamp}.json").write_text(json.dumps(messages, ensure_ascii=False, indent=2), encoding="utf-8")
         kept = self._complete_tail(messages)
-        prefix = {"role": "user", "content": f"<compacted>{summary or 'Earlier conversation archived.'}</compacted>"}
+        prefix = {
+            "role": "user",
+            "content": (
+                f'<compacted tail="{len(kept)}">'
+                f"{summary or 'Earlier conversation archived.'}</compacted>"
+            ),
+        }
         return [prefix, *self.apply_output_budget(kept)]
 
     def prepare(self, messages: list[dict], summarizer=None) -> list[dict]:

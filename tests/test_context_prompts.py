@@ -48,6 +48,18 @@ def test_compaction_keeps_assistant_tool_group_with_all_results(tmp_path):
     assert [m.get("tool_call_id") for m in kept if m["role"] == "tool"] == ["c1", "c2"]
 
 
+def test_compacted_history_recompacts_after_new_tail_exceeds_budget(tmp_path):
+    manager = ContextManager(
+        tmp_path / "outputs", tmp_path / "transcripts", max_messages=3
+    )
+    first = manager.compact(
+        [{"role": "user", "content": str(i)} for i in range(5)], "first summary"
+    )
+    assert not manager.needs_compaction(first)
+    first.extend({"role": "user", "content": f"new-{i}"} for i in range(4))
+    assert manager.needs_compaction(first)
+
+
 def test_prompt_assembler_includes_named_runtime_sections():
     prompt = PromptAssembler().build({
         "identity": "alice (reviewer)",
