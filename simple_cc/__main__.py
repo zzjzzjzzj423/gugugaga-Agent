@@ -4,22 +4,68 @@ import argparse
 import json
 import sys
 import threading
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .agent import AgentRuntime, SubagentRunner
+from . import agent as agent_module
+from . import config as config_module
+from . import context as context_module
+from . import subagents as subagents_module
+from .agent import AgentRuntime, SubagentRunner, agent_lock, agent_loop
 from .background import BackgroundManager, CronScheduler
 from .config import Settings
-from .context import ContextManager, MemoryStore, SkillStore
-from .hooks import HookManager, install_audit_hooks
+from .context import (
+    ContextManager,
+    MemoryStore,
+    SkillStore,
+    block_type,
+    update_context,
+)
+from .cron import consume_cron_queue, load_durable_jobs
+from .hooks import HookManager, install_audit_hooks, trigger_hooks
 from .models import ChatProvider, ToolCall
 from .permissions import PermissionPolicy
 from .planning import TaskStore, TodoStore
 from .prompts import PromptAssembler
 from .provider import SiliconFlowProvider
-from .teams import Mailbox, ProtocolStore, TeamManager, set_team_provider
+from .teams import (
+    Mailbox,
+    ProtocolStore,
+    TeamManager,
+    active_teammates,
+    consume_lead_inbox,
+    set_team_provider,
+)
+from .tasks import run_list_tasks
 from .tools import ToolRegistry, WorkspaceTools
+
+
+try:
+    import readline
+
+    readline.parse_and_bind("set bind-tty-special-chars off")
+    READLINE_AVAILABLE = True
+except ImportError:
+    READLINE_AVAILABLE = False
+
+
+PROMPT = "\033[36msimple-cc >> \033[0m"
+CLI_ACTIVE = False
+
+
+def terminal_print(text: str):
+    if threading.current_thread() is threading.main_thread() or not CLI_ACTIVE:
+        print(text)
+        return
+    line = ""
+    if READLINE_AVAILABLE:
+        try:
+            line = readline.get_line_buffer()
+        except Exception:
+            line = ""
+    print(f"\r\033[K{text}")
+    print(PROMPT + line, end="", flush=True)
 
 
 def _schema(properties: dict | None = None, required: list[str] | None = None) -> dict:
@@ -37,8 +83,10 @@ class SimpleCCApp:
     background: BackgroundManager
     cron: CronScheduler
     team: TeamManager
+    stop_event: threading.Event = field(default_factory=threading.Event)
 
     def close(self) -> None:
+        self.stop_event.set()
         self.team.stop_all()
         self.cron.stop()
 
@@ -49,6 +97,17 @@ def build_runtime(
     provider: ChatProvider | None = None,
 ) -> SimpleCCApp:
     provider = provider or SiliconFlowProvider(settings)
+    config_module.configure_workspace(settings.workspace)
+    load_durable_jobs()
+    config_module.MODEL = settings.model
+    config_module.PRIMARY_MODEL = settings.model
+    config_module.FALLBACK_MODEL = __import__("os").getenv(
+        "SILICONFLOW_FALLBACK_MODEL"
+    )
+    agent_module.client = provider
+    context_module.client = provider
+    subagents_module.client = provider
+    subagents_module.MODEL = settings.model
     set_team_provider(provider)
     tasks = TaskStore(settings.tasks_dir)
     todos = TodoStore()
@@ -173,13 +232,20 @@ def handle_command(command: str, app: SimpleCCApp) -> tuple[bool, str]:
     if command == "/help":
         return True, "/help /status /tasks /team /memory /exit"
     if command == "/status":
-        return True, f"Workspace: {app.settings.workspace}\nModel: {app.settings.model}\n{app.team.status()}"
+        teammates = ", ".join(sorted(active_teammates)) or "none"
+        return True, (
+            f"Workspace: {app.settings.workspace}\n"
+            f"Model: {app.settings.model}\n"
+            f"Active teammates: {teammates}"
+        )
     if command == "/tasks":
-        return True, json.dumps([asdict(task) for task in app.tasks.list()], ensure_ascii=False, indent=2)
+        return True, run_list_tasks()
     if command == "/team":
-        return True, app.team.status()
+        return True, ", ".join(sorted(active_teammates)) or "No active teammates."
     if command == "/memory":
-        return True, app.memory.index_text()
+        if not config_module.MEMORY_INDEX.exists():
+            return True, "(no memories)"
+        return True, config_module.MEMORY_INDEX.read_text()[:4000]
     return False, ""
 
 
@@ -191,7 +257,43 @@ def _approval_prompt(call: ToolCall) -> bool:
     return input("Allow? [y/N] ").strip().lower() in {"y", "yes"}
 
 
+def print_turn_assistants(messages: list, turn_start: int):
+    for message in messages[turn_start:]:
+        if message.get("role") != "assistant":
+            continue
+        for block in message.get("content", []):
+            if block_type(block) == "text":
+                terminal_print(
+                    block["text"] if isinstance(block, dict) else block.text
+                )
+
+
+def cron_autorun_loop(
+    history: list,
+    context: dict,
+    stop_event: threading.Event | None = None,
+):
+    stop_event = stop_event or threading.Event()
+    while not stop_event.wait(1):
+        fired = consume_cron_queue()
+        if not fired:
+            continue
+        with agent_lock:
+            turn_start = len(history)
+            for job in fired:
+                history.append(
+                    {"role": "user", "content": f"[Scheduled] {job.prompt}"}
+                )
+                terminal_print(
+                    f"  \033[35m[cron auto] {job.prompt[:60]}\033[0m"
+                )
+            agent_loop(history, context)
+            context.update(update_context(context, history))
+            print_turn_assistants(history, turn_start)
+
+
 def main(argv: list[str] | None = None) -> int:
+    global CLI_ACTIVE
     args = create_parser().parse_args(argv)
     try:
         settings = Settings.from_env(Path(args.workspace), args.model)
@@ -199,46 +301,62 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as error:
         print(f"Configuration error: {error}", file=sys.stderr)
         return 2
+    CLI_ACTIVE = True
     print(f"Simple CC | model={settings.model} | workspace={settings.workspace}")
-    print("Type /help for commands.")
-    wake_stop = threading.Event()
-
-    def wake_loop():
-        while not wake_stop.wait(0.2):
-            if (
-                app.cron.has_pending()
-                or app.background.has_pending()
-                or app.team.mailbox.peek("lead")
-            ):
-                try:
-                    answer = app.runtime.run_pending()
-                    if answer:
-                        print(f"\n[async] {answer}\nsimple-cc> ", end="", flush=True)
-                except Exception as error:
-                    print(f"\n[async error] {type(error).__name__}: {error}")
-
-    threading.Thread(target=wake_loop, name="simple-cc-wakeup", daemon=True).start()
+    print("Enter a question, press Enter to send. Type q to quit.\n")
+    history = []
+    context = update_context({}, [])
+    stop_event = getattr(app, "stop_event", threading.Event())
+    threading.Thread(
+        target=cron_autorun_loop,
+        args=(history, context, stop_event),
+        name="simple-cc-cron-autorun",
+        daemon=True,
+    ).start()
     try:
         while True:
             try:
-                query = input("simple-cc> ").strip()
+                query = input(PROMPT)
             except (EOFError, KeyboardInterrupt):
                 break
-            if not query:
-                continue
+            if query.strip().lower() in {"q", "exit", "/exit", "/quit", ""}:
+                break
             handled, output = handle_command(query, app)
             if handled:
                 if output == "__exit__":
                     break
                 print(output)
                 continue
-            try:
-                print(app.runtime.run_turn(query))
-            except Exception as error:
-                print(f"Agent error: {type(error).__name__}: {error}")
+            trigger_hooks("UserPromptSubmit", query)
+            turn_start = len(history)
+            history.append({"role": "user", "content": query})
+            with agent_lock:
+                agent_loop(history, context)
+                context = update_context(context, history)
+                print_turn_assistants(history, turn_start)
+
+            inbox = consume_lead_inbox(route_protocol=True)
+            if inbox:
+                def inbox_label(message):
+                    request_id = message.get("metadata", {}).get(
+                        "request_id", ""
+                    )
+                    suffix = f" req:{request_id}" if request_id else ""
+                    return f"{message.get('type', 'message')}{suffix}"
+
+                inbox_text = "\n".join(
+                    f"From {message['from']} [{inbox_label(message)}]: "
+                    f"{message['content'][:200]}"
+                    for message in inbox
+                )
+                history.append(
+                    {"role": "user", "content": f"[Inbox]\n{inbox_text}"}
+                )
+            print()
     finally:
-        wake_stop.set()
+        stop_event.set()
         app.close()
+        CLI_ACTIVE = False
     return 0
 
 

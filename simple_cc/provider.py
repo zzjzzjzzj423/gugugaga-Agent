@@ -8,7 +8,7 @@ from typing import Any
 from openai import OpenAI
 
 from .config import Settings
-from .models import ChatProvider, ModelResponse, ToolCall, ToolSpec
+from .models import ChatProvider, ToolCall, ToolSpec
 
 
 class ContextLengthError(RuntimeError):
@@ -202,22 +202,3 @@ class SiliconFlowProvider(ChatProvider):
                 time.sleep(min(2**attempt, 4))
         assert last_error is not None
         raise last_error
-
-    def complete(
-        self,
-        system: str,
-        messages: list[dict[str, Any]],
-        tools: list[ToolSpec],
-        max_tokens: int = 8192,
-    ) -> ModelResponse:
-        """Temporary compatibility wrapper for the pre-S20 runtime modules."""
-        response = self.create(messages, system, tools, max_tokens)
-        return ModelResponse(
-            content="".join(block.text for block in response.content if block.type == "text"),
-            tool_calls=[
-                ToolCall(id=block.id, name=block.name, arguments=block.input)
-                for block in response.content
-                if block.type == "tool_use"
-            ],
-            finish_reason=response.stop_reason,
-        )

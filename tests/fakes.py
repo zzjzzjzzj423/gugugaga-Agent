@@ -1,4 +1,5 @@
 from simple_cc.models import ModelResponse
+from simple_cc.provider import ProviderResponse, TextBlock, ToolUseBlock
 
 
 class ScriptedProvider:
@@ -9,17 +10,32 @@ class ScriptedProvider:
     def queue(self, response: ModelResponse):
         self.responses.append(response)
 
-    def complete(self, system, messages, tools, max_tokens=8192):
+    def create(self, messages, system, tools, max_tokens=8192, model=None):
         self.requests.append({
             "system": system,
             "messages": [dict(message) for message in messages],
             "tools": list(tools),
             "max_tokens": max_tokens,
+            "model": model,
         })
         if not self.responses:
             raise AssertionError("ScriptedProvider has no queued response")
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response
-        return response
-
+        if isinstance(response, ProviderResponse):
+            return response
+        assert isinstance(response, ModelResponse)
+        content = []
+        if response.content:
+            content.append(TextBlock(text=response.content))
+        content.extend(
+            ToolUseBlock(call.id, call.name, call.arguments)
+            for call in response.tool_calls
+        )
+        stop_reason = {
+            "stop": "end_turn",
+            "tool_calls": "tool_use",
+            "length": "max_tokens",
+        }.get(response.finish_reason, response.finish_reason)
+        return ProviderResponse(content=content, stop_reason=stop_reason)

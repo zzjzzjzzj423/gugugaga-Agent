@@ -4,9 +4,6 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from dotenv import load_dotenv
-
-
 WORKDIR = Path.cwd()
 MODEL = os.getenv("SILICONFLOW_MODEL", "")
 PRIMARY_MODEL = MODEL
@@ -74,7 +71,6 @@ class Settings:
     def from_env(
         cls, workspace: Path | str, model_override: str | None = None
     ) -> "Settings":
-        load_dotenv(override=False)
         workspace_path = Path(workspace).expanduser().resolve()
         workspace_path.mkdir(parents=True, exist_ok=True)
         api_key = os.getenv("SILICONFLOW_API_KEY", "").strip()

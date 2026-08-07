@@ -4,14 +4,215 @@ import json
 import threading
 from typing import Any, Callable
 
-from .background import BackgroundManager, CronScheduler
-from .context import ContextManager
+from . import config
+from .background import (
+    BackgroundManager,
+    CronScheduler,
+    should_run_background,
+    start_background_task,
+)
+from .context import (
+    ContextManager,
+    build_user_content,
+    compact_history,
+    inject_background_notifications,
+    prepare_context,
+    reactive_compact,
+    update_context,
+)
+from .cron import consume_cron_queue
 from .hooks import HookEvent, HookManager
+from .hooks import trigger_hooks
 from .models import ChatProvider, ToolCall
 from .permissions import PermissionPolicy
-from .prompts import PromptAssembler
+from .prompts import PromptAssembler, assemble_system_prompt
 from .provider import ContextLengthError
-from .tools import ToolRegistry
+from .recovery import RecoveryState, is_prompt_too_long_error, with_retry
+from .subagents import has_tool_use
+from .tools import (
+    TOOL_DEFINITIONS,
+    TOOL_HANDLERS,
+    ToolRegistry,
+    call_tool_handler,
+)
+
+
+client = None
+rounds_since_todo = 0
+agent_lock = threading.Lock()
+
+
+def call_llm(
+    messages: list,
+    context: dict,
+    tools: list,
+    state: RecoveryState,
+    max_tokens: int,
+):
+    if client is None:
+        raise RuntimeError("Agent provider is not configured")
+    system = assemble_system_prompt(context)
+    return with_retry(
+        lambda: client.create(
+            model=state.current_model or None,
+            system=system,
+            messages=messages,
+            tools=tools,
+            max_tokens=max_tokens,
+        ),
+        state,
+    )
+
+
+def agent_loop(messages: list, context: dict):
+    global rounds_since_todo
+    tools, handlers = TOOL_DEFINITIONS, TOOL_HANDLERS
+    state = RecoveryState()
+    max_tokens = config.DEFAULT_MAX_TOKENS
+
+    while True:
+        fired = consume_cron_queue()
+        for job in fired:
+            messages.append(
+                {"role": "user", "content": f"[Scheduled] {job.prompt}"}
+            )
+            print(f"  \033[35m[cron inject] {job.prompt[:60]}\033[0m")
+
+        inject_background_notifications(messages)
+
+        if rounds_since_todo >= 3:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "<reminder>Update your todos.</reminder>",
+                }
+            )
+            rounds_since_todo = 0
+
+        prepare_context(messages)
+        context = update_context(context, messages)
+
+        try:
+            response = call_llm(messages, context, tools, state, max_tokens)
+        except Exception as error:
+            if (
+                is_prompt_too_long_error(error)
+                and not state.has_attempted_reactive_compact
+            ):
+                messages[:] = reactive_compact(messages)
+                state.has_attempted_reactive_compact = True
+                continue
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                f"[Error] {type(error).__name__}: {error}"
+                            ),
+                        }
+                    ],
+                }
+            )
+            return
+
+        if response.stop_reason == "max_tokens":
+            if not state.has_escalated:
+                max_tokens = config.ESCALATED_MAX_TOKENS
+                state.has_escalated = True
+                print(
+                    f"  \033[33m[max_tokens] retry with {max_tokens}\033[0m"
+                )
+                continue
+            messages.append(
+                {"role": "assistant", "content": response.content}
+            )
+            if state.recovery_count < config.MAX_RECOVERY_RETRIES:
+                messages.append(
+                    {"role": "user", "content": config.CONTINUATION_PROMPT}
+                )
+                state.recovery_count += 1
+                continue
+            return
+
+        max_tokens = config.DEFAULT_MAX_TOKENS
+        state.has_escalated = False
+        messages.append({"role": "assistant", "content": response.content})
+        if not has_tool_use(response.content):
+            trigger_hooks("Stop", messages)
+            return
+
+        results = []
+        compacted_now = False
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+            print(f"\033[36m> {block.name}\033[0m")
+
+            if block.name == "compact":
+                messages[:] = compact_history(messages)
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "[Compacted. Continue with summarized context.]"
+                        ),
+                    }
+                )
+                compacted_now = True
+                break
+
+            blocked = trigger_hooks("PreToolUse", block)
+            if blocked:
+                results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": str(blocked),
+                    }
+                )
+                continue
+
+            if should_run_background(block.name, block.input):
+                background_id = start_background_task(block, handlers)
+                output = (
+                    f"[Background task {background_id} started] "
+                    "Result will arrive as a task_notification."
+                )
+                results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": output,
+                    }
+                )
+                continue
+
+            handler = handlers.get(block.name)
+            output = call_tool_handler(handler, block.input, block.name)
+            trigger_hooks("PostToolUse", block, output)
+            print(str(output)[:300])
+
+            if block.name == "todo_write":
+                rounds_since_todo = 0
+            else:
+                rounds_since_todo += 1
+
+            results.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": output,
+                }
+            )
+
+        if compacted_now:
+            continue
+
+        messages.append(
+            {"role": "user", "content": build_user_content(results)}
+        )
 
 
 class AgentRuntime:
@@ -66,15 +267,36 @@ class AgentRuntime:
         if len(transcript) > 30_000:
             transcript = transcript[:15_000] + "\n...[middle omitted]...\n" + transcript[-15_000:]
         try:
-            response = self.provider.complete(
-                "Summarize this coding-agent history. Preserve goals, decisions, files changed, pending tasks, and errors.",
-                [{"role": "user", "content": transcript}],
-                [],
-                min(self.max_tokens, 2048),
+            response = self.provider.create(
+                system=(
+                    "Summarize this coding-agent history. Preserve goals, "
+                    "decisions, files changed, pending tasks, and errors."
+                ),
+                messages=[{"role": "user", "content": transcript}],
+                tools=[],
+                max_tokens=min(self.max_tokens, 2048),
             )
-            return response.content or "Earlier conversation archived."
+            return self._response_text(response.content) or (
+                "Earlier conversation archived."
+            )
         except Exception:
             return "Earlier conversation archived after summary generation failed."
+
+    @staticmethod
+    def _response_text(content) -> str:
+        return "".join(
+            getattr(block, "text", "")
+            for block in content
+            if getattr(block, "type", None) == "text"
+        )
+
+    @staticmethod
+    def _response_calls(content) -> list[ToolCall]:
+        return [
+            ToolCall(block.id, block.name, block.input)
+            for block in content
+            if getattr(block, "type", None) == "tool_use"
+        ]
 
     def run_turn(self, query: str) -> str:
         with self._run_lock:
@@ -95,8 +317,11 @@ class AgentRuntime:
             self.messages = self.context.prepare(self.messages, self._summarize)
             system = self.prompts.build(self.state_builder())
             try:
-                response = self.provider.complete(
-                    system, self.messages, self.registry.specs(), self.max_tokens
+                response = self.provider.create(
+                    system=system,
+                    messages=self.messages,
+                    tools=self.registry.specs(),
+                    max_tokens=self.max_tokens,
                 )
             except ContextLengthError:
                 if attempted_reactive_compact:
@@ -107,12 +332,30 @@ class AgentRuntime:
                 attempted_reactive_compact = True
                 continue
 
-            self.messages.append(response.as_assistant_message())
-            if not response.tool_calls:
+            response_text = self._response_text(response.content)
+            response_calls = self._response_calls(response.content)
+            assistant_message: dict[str, Any] = {
+                "role": "assistant",
+                "content": response_text,
+            }
+            if response_calls:
+                assistant_message["tool_calls"] = [
+                    {
+                        "id": call.id,
+                        "type": "function",
+                        "function": {
+                            "name": call.name,
+                            "arguments": json.dumps(call.arguments),
+                        },
+                    }
+                    for call in response_calls
+                ]
+            self.messages.append(assistant_message)
+            if not response_calls:
                 self.hooks.trigger(HookEvent.STOP, messages=self.messages)
-                return response.content
+                return response_text
 
-            for call in response.tool_calls:
+            for call in response_calls:
                 hook_results = self.hooks.trigger(HookEvent.PRE_TOOL_USE, call=call)
                 blocked = next(
                     (str(result) for result in hook_results if result not in (None, False, "")),

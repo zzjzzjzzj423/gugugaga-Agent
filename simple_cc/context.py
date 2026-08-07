@@ -328,3 +328,50 @@ def reactive_compact(messages: list) -> list:
         {"role": "user", "content": f"[Reactive compact]\n\n{summary}"},
         *messages[tail_start:],
     ]
+
+
+def prepare_context(messages: list) -> list:
+    """Run every model turn through S20's layered context budget."""
+    messages[:] = tool_result_budget(messages)
+    messages[:] = snip_compact(messages)
+    messages[:] = micro_compact(messages)
+    if estimate_size(messages) > config.CONTEXT_LIMIT:
+        messages[:] = compact_history(messages)
+    return messages
+
+
+def build_user_content(results: list[dict]) -> list[dict]:
+    from .background import collect_background_results
+
+    content = list(results)
+    for note in collect_background_results():
+        content.append({"type": "text", "text": note})
+    return content
+
+
+def inject_background_notifications(messages: list):
+    from .background import collect_background_results
+
+    notes = collect_background_results()
+    if notes:
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": note} for note in notes
+                ],
+            }
+        )
+
+
+def update_context(context: dict, messages: list) -> dict:
+    del context, messages
+    from .teams import active_teammates
+
+    memories = ""
+    if config.MEMORY_INDEX.exists():
+        memories = config.MEMORY_INDEX.read_text()[:2000]
+    return {
+        "memories": memories,
+        "active_teammates": list(active_teammates.keys()),
+    }

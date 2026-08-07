@@ -42,11 +42,11 @@ class ModelResponse:
 
 
 class ChatProvider(Protocol):
-    def complete(
+    def create(
         self,
-        system: str,
         messages: list[dict[str, Any]],
-        tools: list[ToolSpec],
+        system: str,
+        tools: list[ToolSpec | dict[str, Any]],
         max_tokens: int = 8192,
-    ) -> ModelResponse: ...
-
+        model: str | None = None,
+    ) -> Any: ...
