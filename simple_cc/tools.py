@@ -4,6 +4,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Callable
 
+from .cron import run_cancel_cron, run_list_crons, run_schedule_cron
 from .models import ToolSpec
 from .skills import load_skill
 from .tasks import (
@@ -196,6 +197,38 @@ TOOL_DEFINITIONS: list[dict] = [
             "required": ["task_id"],
         },
     },
+    {
+        "name": "schedule_cron",
+        "description": (
+            "Schedule a cron job. cron is 5-field: min hour dom month dow. "
+            "For one-shot reminders, compute the target minute and set "
+            "recurring=false."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "cron": {"type": "string"},
+                "prompt": {"type": "string"},
+                "recurring": {"type": "boolean"},
+                "durable": {"type": "boolean"},
+            },
+            "required": ["cron", "prompt"],
+        },
+    },
+    {
+        "name": "list_crons",
+        "description": "List registered cron jobs.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "cancel_cron",
+        "description": "Cancel a cron job by ID.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"job_id": {"type": "string"}},
+            "required": ["job_id"],
+        },
+    },
 ]
 
 
@@ -217,6 +250,9 @@ TOOL_HANDLERS: dict[str, Callable] = {
     "get_task": run_get_task,
     "claim_task": run_claim_task,
     "complete_task": run_complete_task,
+    "schedule_cron": run_schedule_cron,
+    "list_crons": run_list_crons,
+    "cancel_cron": run_cancel_cron,
 }
 
 BUILTIN_TOOLS = TOOL_DEFINITIONS

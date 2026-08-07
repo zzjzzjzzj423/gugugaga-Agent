@@ -1,16 +1,95 @@
 from __future__ import annotations
 
-import json
-import os
 import threading
-import time
 import uuid
-from dataclasses import asdict, dataclass
-from datetime import datetime
-from pathlib import Path
 from typing import Callable
 
+from .hooks import trigger_hooks
 from .models import ToolCall
+from .tools import call_tool_handler
+
+
+_bg_counter = 0
+background_tasks: dict[str, dict] = {}
+background_results: dict[str, str] = {}
+background_lock = threading.Lock()
+
+
+def is_slow_operation(tool_name: str, tool_input: dict) -> bool:
+    if tool_name != "bash":
+        return False
+    command = tool_input.get("command", "").lower()
+    slow_keywords = [
+        "install",
+        "build",
+        "test",
+        "deploy",
+        "compile",
+        "docker build",
+        "pip install",
+        "npm install",
+        "cargo build",
+        "pytest",
+        "make",
+    ]
+    return any(keyword in command for keyword in slow_keywords)
+
+
+def should_run_background(tool_name: str, tool_input: dict) -> bool:
+    if tool_name != "bash":
+        return False
+    return bool(tool_input.get("run_in_background")) or is_slow_operation(
+        tool_name, tool_input
+    )
+
+
+def start_background_task(block, handlers: dict) -> str:
+    global _bg_counter
+    _bg_counter += 1
+    bg_id = f"bg_{_bg_counter:04d}"
+    command = block.input.get("command", block.name)
+
+    def worker():
+        handler = handlers.get(block.name)
+        result = call_tool_handler(handler, block.input, block.name)
+        trigger_hooks("PostToolUse", block, result)
+        with background_lock:
+            background_tasks[bg_id]["status"] = "completed"
+            background_results[bg_id] = str(result)
+
+    with background_lock:
+        background_tasks[bg_id] = {
+            "tool_use_id": block.id,
+            "command": command,
+            "status": "running",
+        }
+    threading.Thread(target=worker, daemon=True).start()
+    print(f"  \033[33m[background] {bg_id}: {str(command)[:60]}\033[0m")
+    return bg_id
+
+
+def collect_background_results() -> list[str]:
+    with background_lock:
+        ready = [
+            bg_id
+            for bg_id, task in background_tasks.items()
+            if task["status"] == "completed"
+        ]
+    notifications = []
+    for bg_id in ready:
+        with background_lock:
+            task = background_tasks.pop(bg_id)
+            output = background_results.pop(bg_id, "")
+        summary = output[:200] if len(output) > 200 else output
+        notifications.append(
+            f"<task_notification>\n"
+            f"  <task_id>{bg_id}</task_id>\n"
+            f"  <status>completed</status>\n"
+            f"  <command>{task['command']}</command>\n"
+            f"  <summary>{summary}</summary>\n"
+            f"</task_notification>"
+        )
+    return notifications
 
 
 class BackgroundManager:
@@ -46,137 +125,4 @@ class BackgroundManager:
             return items
 
 
-@dataclass
-class CronJob:
-    id: str
-    expression: str
-    prompt: str
-    recurring: bool = True
-    last_fired: str = ""
-
-
-def _field_matches(field: str, value: int, low: int, high: int) -> bool:
-    if field == "*":
-        return True
-    if field.startswith("*/"):
-        step = int(field[2:])
-        return step > 0 and value % step == 0
-    return any(part.isdigit() and int(part) == value for part in field.split(","))
-
-
-def validate_cron(expression: str) -> str | None:
-    fields = expression.split()
-    if len(fields) != 5:
-        return "cron must contain five fields"
-    ranges = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 6)]
-    for field, (low, high) in zip(fields, ranges):
-        try:
-            probes = field[2:] if field.startswith("*/") else field.replace("*", str(low))
-            values = [int(part) for part in probes.split(",")]
-        except ValueError:
-            return f"invalid cron field: {field}"
-        if any(value < (1 if field.startswith("*/") else low) or value > high for value in values):
-            return f"cron field out of range: {field}"
-    return None
-
-
-def cron_matches(expression: str, value: datetime) -> bool:
-    fields = expression.split()
-    if len(fields) != 5:
-        return False
-    minute, hour, day_of_month, month, day_of_week = fields
-    if not _field_matches(minute, value.minute, 0, 59):
-        return False
-    if not _field_matches(hour, value.hour, 0, 23):
-        return False
-    if not _field_matches(month, value.month, 1, 12):
-        return False
-    dom_ok = _field_matches(day_of_month, value.day, 1, 31)
-    dow_ok = _field_matches(day_of_week, (value.weekday() + 1) % 7, 0, 6)
-    if day_of_month == "*" and day_of_week == "*":
-        return True
-    if day_of_month == "*":
-        return dow_ok
-    if day_of_week == "*":
-        return dom_ok
-    return dom_ok or dow_ok
-
-
-class CronScheduler:
-    def __init__(self, path: Path):
-        self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._jobs: dict[str, CronJob] = {}
-        self._queue: list[str] = []
-        self._lock = threading.RLock()
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._load()
-
-    def _load(self):
-        if self.path.exists():
-            self._jobs = {raw["id"]: CronJob(**raw) for raw in json.loads(self.path.read_text(encoding="utf-8"))}
-
-    def _save(self):
-        temp = self.path.with_suffix(".tmp")
-        temp.write_text(json.dumps([asdict(job) for job in self._jobs.values()], indent=2), encoding="utf-8")
-        os.replace(temp, self.path)
-
-    def schedule(self, expression: str, prompt: str, recurring: bool = True) -> CronJob:
-        error = validate_cron(expression)
-        if error:
-            raise ValueError(error)
-        with self._lock:
-            job = CronJob(f"cron_{uuid.uuid4().hex[:8]}", expression, prompt, recurring)
-            self._jobs[job.id] = job
-            self._save()
-            return job
-
-    def list(self) -> list[CronJob]:
-        with self._lock:
-            return list(self._jobs.values())
-
-    def cancel(self, job_id: str) -> str:
-        with self._lock:
-            if self._jobs.pop(job_id, None) is None:
-                return f"Error: unknown cron {job_id}"
-            self._save()
-            return f"Cancelled {job_id}"
-
-    def fire_due(self, now: datetime | None = None):
-        now = now or datetime.now()
-        marker = now.strftime("%Y-%m-%dT%H:%M")
-        with self._lock:
-            remove = []
-            for job in self._jobs.values():
-                if job.last_fired != marker and cron_matches(job.expression, now):
-                    self._queue.append(job.prompt)
-                    job.last_fired = marker
-                    if not job.recurring:
-                        remove.append(job.id)
-            for job_id in remove:
-                self._jobs.pop(job_id, None)
-            if remove or self._jobs:
-                self._save()
-
-    def drain(self) -> list[str]:
-        with self._lock:
-            items, self._queue = self._queue, []
-            return items
-
-    def has_pending(self) -> bool:
-        with self._lock:
-            return bool(self._queue)
-
-    def start(self):
-        if self._thread and self._thread.is_alive():
-            return
-        self._stop.clear()
-        def loop():
-            while not self._stop.wait(1):
-                self.fire_due()
-        self._thread = threading.Thread(target=loop, daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        self._stop.set()
+from .cron import CronJob, CronScheduler, cron_matches, validate_cron

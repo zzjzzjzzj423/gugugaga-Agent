@@ -19,7 +19,7 @@ TASKS_DIR = WORKDIR / ".tasks"
 MAILBOX_DIR = WORKDIR / ".mailboxes"
 MEMORY_DIR = WORKDIR / ".memory"
 MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
-DURABLE_PATH = WORKDIR / ".cron_jobs.json"
+DURABLE_PATH = WORKDIR / ".scheduled_tasks.json"
 
 DEFAULT_MAX_TOKENS = 8000
 ESCALATED_MAX_TOKENS = 16000
@@ -48,7 +48,7 @@ def configure_workspace(workspace: Path | str) -> Path:
     MAILBOX_DIR = WORKDIR / ".mailboxes"
     MEMORY_DIR = WORKDIR / ".memory"
     MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
-    DURABLE_PATH = WORKDIR / ".cron_jobs.json"
+    DURABLE_PATH = WORKDIR / ".scheduled_tasks.json"
     return WORKDIR
 
 
