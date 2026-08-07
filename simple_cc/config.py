@@ -7,6 +7,51 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 
+WORKDIR = Path.cwd()
+MODEL = os.getenv("SILICONFLOW_MODEL", "")
+PRIMARY_MODEL = MODEL
+FALLBACK_MODEL = os.getenv("SILICONFLOW_FALLBACK_MODEL")
+
+SKILLS_DIR = WORKDIR / "skills"
+TRANSCRIPT_DIR = WORKDIR / ".transcripts"
+TOOL_RESULTS_DIR = WORKDIR / ".task_outputs" / "tool-results"
+TASKS_DIR = WORKDIR / ".tasks"
+MAILBOX_DIR = WORKDIR / ".mailboxes"
+MEMORY_DIR = WORKDIR / ".memory"
+MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
+DURABLE_PATH = WORKDIR / ".cron_jobs.json"
+
+DEFAULT_MAX_TOKENS = 8000
+ESCALATED_MAX_TOKENS = 16000
+MAX_RETRIES = 3
+MAX_CONSECUTIVE_529 = 2
+MAX_RECOVERY_RETRIES = 2
+BASE_DELAY_MS = 500
+CONTEXT_LIMIT = 50000
+KEEP_RECENT_TOOL_RESULTS = 3
+PERSIST_THRESHOLD = 30000
+CONTINUATION_PROMPT = (
+    "Continue from the previous response. Do not repeat completed work."
+)
+
+
+def configure_workspace(workspace: Path | str) -> Path:
+    """Select the S20 workspace before stateful modules are used."""
+    global WORKDIR, SKILLS_DIR, TRANSCRIPT_DIR, TOOL_RESULTS_DIR
+    global TASKS_DIR, MAILBOX_DIR, MEMORY_DIR, MEMORY_INDEX, DURABLE_PATH
+
+    WORKDIR = Path(workspace).expanduser().resolve()
+    SKILLS_DIR = WORKDIR / "skills"
+    TRANSCRIPT_DIR = WORKDIR / ".transcripts"
+    TOOL_RESULTS_DIR = WORKDIR / ".task_outputs" / "tool-results"
+    TASKS_DIR = WORKDIR / ".tasks"
+    MAILBOX_DIR = WORKDIR / ".mailboxes"
+    MEMORY_DIR = WORKDIR / ".memory"
+    MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
+    DURABLE_PATH = WORKDIR / ".cron_jobs.json"
+    return WORKDIR
+
+
 @dataclass(frozen=True)
 class Settings:
     workspace: Path
@@ -64,4 +109,3 @@ class Settings:
             idle_timeout_seconds=float(os.getenv("SIMPLE_CC_IDLE_TIMEOUT", "30")),
             **paths,
         )
-
