@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import json
 import random
+import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -11,6 +12,7 @@ from . import config
 
 
 CURRENT_TODOS: list[dict] = []
+_task_claim_lock = threading.RLock()
 
 
 @dataclass
@@ -74,7 +76,7 @@ def can_start(task_id: str) -> bool:
     return True
 
 
-def claim_task(task_id: str, owner: str = "agent") -> str:
+def _claim_task_unlocked(task_id: str, owner: str = "agent") -> str:
     task = load_task(task_id)
     if task.status != "pending":
         return f"Task {task_id} is {task.status}, cannot claim"
@@ -103,6 +105,13 @@ def claim_task(task_id: str, owner: str = "agent") -> str:
     save_task(task)
     print(f"  \033[36m[claim] {task.subject} → in_progress\033[0m")
     return f"Claimed {task.id} ({task.subject})"
+
+
+def claim_task(task_id: str, owner: str = "agent") -> str:
+    # Autonomous teammates share one task directory. The full read/check/write
+    # transition must be indivisible between their polling threads.
+    with _task_claim_lock:
+        return _claim_task_unlocked(task_id, owner)
 
 
 def complete_task(task_id: str) -> str:

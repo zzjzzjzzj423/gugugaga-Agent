@@ -11,7 +11,9 @@ PROMPT_SECTIONS = {
     "tools": (
         "Available tools: bash, read_file, write_file, edit_file, glob, "
         "todo_write, task, load_skill, compact, "
-        "create_task, list_tasks, get_task, claim_task, complete_task."
+        "create_task, list_tasks, get_task, claim_task, complete_task, "
+        "spawn_teammate, send_message, check_inbox, request_shutdown, "
+        "request_plan, review_plan."
     ),
     "memory": "Relevant memories are injected below when available.",
 }

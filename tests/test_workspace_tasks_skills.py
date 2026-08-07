@@ -112,7 +112,7 @@ def test_system_prompt_rebuilds_from_live_workspace_skills_and_memory(
     assert "stale" not in second
     assert "compact" in second
     assert "schedule_cron" not in second
-    assert "spawn_teammate" not in second
+    assert "spawn_teammate" in second
     assert "create_worktree" not in second
     assert "connect_mcp" not in second
 

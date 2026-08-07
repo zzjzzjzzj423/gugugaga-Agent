@@ -18,7 +18,7 @@ from .permissions import PermissionPolicy
 from .planning import TaskStore, TodoStore
 from .prompts import PromptAssembler
 from .provider import SiliconFlowProvider
-from .teams import Mailbox, ProtocolStore, TeamManager
+from .teams import Mailbox, ProtocolStore, TeamManager, set_team_provider
 from .tools import ToolRegistry, WorkspaceTools
 
 
@@ -49,6 +49,7 @@ def build_runtime(
     provider: ChatProvider | None = None,
 ) -> SimpleCCApp:
     provider = provider or SiliconFlowProvider(settings)
+    set_team_provider(provider)
     tasks = TaskStore(settings.tasks_dir)
     todos = TodoStore()
     memory = MemoryStore(settings.memory_dir)

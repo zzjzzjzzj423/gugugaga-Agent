@@ -15,6 +15,14 @@ from .tasks import (
     run_list_tasks,
     run_todo_write,
 )
+from .teams import (
+    run_check_inbox,
+    run_request_plan,
+    run_request_shutdown,
+    run_review_plan,
+    run_send_message,
+    run_spawn_teammate,
+)
 from .workspace import run_bash, run_edit, run_glob, run_read, run_write
 
 
@@ -229,6 +237,74 @@ TOOL_DEFINITIONS: list[dict] = [
             "required": ["job_id"],
         },
     },
+    {
+        "name": "spawn_teammate",
+        "description": "Spawn an autonomous teammate.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "role": {"type": "string"},
+                "prompt": {"type": "string"},
+            },
+            "required": ["name", "role", "prompt"],
+        },
+    },
+    {
+        "name": "send_message",
+        "description": "Send message to a teammate.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "to": {"type": "string"},
+                "content": {"type": "string"},
+            },
+            "required": ["to", "content"],
+        },
+    },
+    {
+        "name": "check_inbox",
+        "description": "Check inbox for messages and protocol responses.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
+        "name": "request_shutdown",
+        "description": "Request a teammate to shut down.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"teammate": {"type": "string"}},
+            "required": ["teammate"],
+        },
+    },
+    {
+        "name": "request_plan",
+        "description": "Ask a teammate to submit a plan.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "teammate": {"type": "string"},
+                "task": {"type": "string"},
+            },
+            "required": ["teammate", "task"],
+        },
+    },
+    {
+        "name": "review_plan",
+        "description": "Approve or reject a submitted plan.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "request_id": {"type": "string"},
+                "approve": {"type": "boolean"},
+                "feedback": {"type": "string"},
+            },
+            "required": ["request_id", "approve"],
+        },
+    },
 ]
 
 
@@ -253,6 +329,12 @@ TOOL_HANDLERS: dict[str, Callable] = {
     "schedule_cron": run_schedule_cron,
     "list_crons": run_list_crons,
     "cancel_cron": run_cancel_cron,
+    "spawn_teammate": run_spawn_teammate,
+    "send_message": run_send_message,
+    "check_inbox": run_check_inbox,
+    "request_shutdown": run_request_shutdown,
+    "request_plan": run_request_plan,
+    "review_plan": run_review_plan,
 }
 
 BUILTIN_TOOLS = TOOL_DEFINITIONS
