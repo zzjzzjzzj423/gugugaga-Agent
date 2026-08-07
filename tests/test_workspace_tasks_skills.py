@@ -110,7 +110,7 @@ def test_system_prompt_rebuilds_from_live_workspace_skills_and_memory(
     assert "Relevant memories:\nPrefer pathlib." not in first
     assert "Relevant memories:\nPrefer pathlib." in second
     assert "stale" not in second
-    assert "compact" not in second
+    assert "compact" in second
     assert "schedule_cron" not in second
     assert "spawn_teammate" not in second
     assert "create_worktree" not in second
@@ -131,6 +131,7 @@ def test_fixed_foundation_registry_has_one_handler_per_definition():
         "todo_write",
         "task",
         "load_skill",
+        "compact",
         "create_task",
         "list_tasks",
         "get_task",

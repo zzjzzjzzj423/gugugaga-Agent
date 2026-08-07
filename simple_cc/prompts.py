@@ -10,7 +10,7 @@ PROMPT_SECTIONS = {
     "identity": "You are a coding agent. Act, don't explain.",
     "tools": (
         "Available tools: bash, read_file, write_file, edit_file, glob, "
-        "todo_write, task, load_skill, "
+        "todo_write, task, load_skill, compact, "
         "create_task, list_tasks, get_task, claim_task, complete_task."
     ),
     "memory": "Relevant memories are injected below when available.",

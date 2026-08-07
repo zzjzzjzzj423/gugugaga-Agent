@@ -26,6 +26,11 @@ def call_tool_handler(handler, args: dict, name: str) -> str:
         return f"Error: {error}"
 
 
+def run_compact(focus: str = "") -> str:
+    """Signal the special message-mutating branch in the agent loop."""
+    return "[Compaction requested.]"
+
+
 TOOL_DEFINITIONS: list[dict] = [
     {
         "name": "bash",
@@ -133,6 +138,17 @@ TOOL_DEFINITIONS: list[dict] = [
         },
     },
     {
+        "name": "compact",
+        "description": (
+            "Summarize earlier conversation and continue with compacted context."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"focus": {"type": "string"}},
+            "required": [],
+        },
+    },
+    {
         "name": "create_task",
         "description": "Create a task.",
         "input_schema": {
@@ -195,6 +211,7 @@ TOOL_HANDLERS: dict[str, Callable] = {
     "todo_write": run_todo_write,
     "task": spawn_subagent,
     "load_skill": load_skill,
+    "compact": run_compact,
     "create_task": run_create_task,
     "list_tasks": run_list_tasks,
     "get_task": run_get_task,
@@ -364,4 +381,3 @@ class WorkspaceTools:
             obj({"pattern": {"type": "string"}}, ["pattern"]),
             self.glob,
         )
-
