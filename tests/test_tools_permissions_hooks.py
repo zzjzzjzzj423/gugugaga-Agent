@@ -32,6 +32,13 @@ def test_dangerous_commands_require_approval():
             assert policy.decide(ToolCall("1", tool, {"command": command})) is PermissionDecision.ASK
 
 
+def test_all_shell_commands_require_explicit_approval():
+    policy = PermissionPolicy()
+    for tool in ("bash", "background_run"):
+        call = ToolCall("1", tool, {"command": "python -c \"print('hello')\""})
+        assert policy.decide(call) is PermissionDecision.ASK
+
+
 def test_hook_manager_preserves_registration_order():
     hooks = HookManager()
     calls = []

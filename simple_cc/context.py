@@ -54,8 +54,12 @@ class MemoryStore:
                 hits.append((score, text))
         return "\n\n".join(text for _, text in sorted(hits, reverse=True)[:limit]) or "No matching memories."
 
-    def index_text(self, limit: int = 20) -> str:
-        return "\n".join(path.stem for path in sorted(self.directory.glob("*.md"))[:limit]) or "No memories."
+    def index_text(self, limit: int = 20, max_chars: int = 4_000) -> str:
+        entries = []
+        for path in sorted(self.directory.glob("*.md"))[:limit]:
+            body = path.read_text(encoding="utf-8").strip().replace("\n", " ")
+            entries.append(f"- {path.stem}: {body[:240]}")
+        return ("\n".join(entries)[:max_chars] if entries else "No memories.")
 
 
 class ContextManager:
@@ -78,14 +82,38 @@ class ContextManager:
             result.append(item)
         return result
 
+    def needs_compaction(self, messages: list[dict]) -> bool:
+        already_compacted = bool(
+            messages
+            and messages[0].get("role") == "user"
+            and str(messages[0].get("content", "")).startswith("<compacted>")
+        )
+        return len(messages) > self.max_messages and not already_compacted
+
+    def _complete_tail(self, messages: list[dict]) -> list[dict]:
+        start = max(0, len(messages) - self.max_messages)
+        while start > 0 and messages[start].get("role") == "tool":
+            start -= 1
+        if (
+            start > 0
+            and messages[start].get("role") == "assistant"
+            and messages[start].get("tool_calls")
+            and messages[start - 1].get("role") == "user"
+        ):
+            start -= 1
+        return messages[start:]
+
     def compact(self, messages: list[dict], summary: str | None = None, force: bool = False) -> list[dict]:
         if len(messages) <= self.max_messages and not force:
             return self.apply_output_budget(messages)
         stamp = f"{int(time.time())}_{uuid.uuid4().hex[:6]}"
         (self.transcripts_dir / f"{stamp}.json").write_text(json.dumps(messages, ensure_ascii=False, indent=2), encoding="utf-8")
-        kept = messages[-self.max_messages :]
+        kept = self._complete_tail(messages)
         prefix = {"role": "user", "content": f"<compacted>{summary or 'Earlier conversation archived.'}</compacted>"}
         return [prefix, *self.apply_output_budget(kept)]
 
-    def prepare(self, messages: list[dict]) -> list[dict]:
-        return self.compact(messages)
+    def prepare(self, messages: list[dict], summarizer=None) -> list[dict]:
+        if not self.needs_compaction(messages):
+            return self.apply_output_budget(messages)
+        summary = summarizer(messages) if summarizer else "Earlier conversation archived."
+        return self.compact(messages, summary)

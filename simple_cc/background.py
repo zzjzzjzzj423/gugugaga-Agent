@@ -82,9 +82,24 @@ def validate_cron(expression: str) -> str | None:
 
 def cron_matches(expression: str, value: datetime) -> bool:
     fields = expression.split()
-    values = (value.minute, value.hour, value.day, value.month, (value.weekday() + 1) % 7)
-    ranges = ((0, 59), (0, 23), (1, 31), (1, 12), (0, 6))
-    return len(fields) == 5 and all(_field_matches(field, number, *bounds) for field, number, bounds in zip(fields, values, ranges))
+    if len(fields) != 5:
+        return False
+    minute, hour, day_of_month, month, day_of_week = fields
+    if not _field_matches(minute, value.minute, 0, 59):
+        return False
+    if not _field_matches(hour, value.hour, 0, 23):
+        return False
+    if not _field_matches(month, value.month, 1, 12):
+        return False
+    dom_ok = _field_matches(day_of_month, value.day, 1, 31)
+    dow_ok = _field_matches(day_of_week, (value.weekday() + 1) % 7, 0, 6)
+    if day_of_month == "*" and day_of_week == "*":
+        return True
+    if day_of_month == "*":
+        return dow_ok
+    if day_of_week == "*":
+        return dom_ok
+    return dom_ok or dow_ok
 
 
 class CronScheduler:
@@ -149,6 +164,10 @@ class CronScheduler:
             items, self._queue = self._queue, []
             return items
 
+    def has_pending(self) -> bool:
+        with self._lock:
+            return bool(self._queue)
+
     def start(self):
         if self._thread and self._thread.is_alive():
             return
@@ -161,4 +180,3 @@ class CronScheduler:
 
     def stop(self):
         self._stop.set()
-

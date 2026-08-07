@@ -27,6 +27,27 @@ def test_large_tool_output_is_persisted(tmp_path):
     assert "outputs" in compacted[0]["content"]
 
 
+def test_compaction_keeps_assistant_tool_group_with_all_results(tmp_path):
+    manager = ContextManager(
+        tmp_path / "outputs", tmp_path / "transcripts", max_messages=3
+    )
+    messages = [
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "a", "arguments": "{}"}},
+            {"id": "c2", "type": "function", "function": {"name": "b", "arguments": "{}"}},
+        ]},
+        {"role": "tool", "tool_call_id": "c1", "content": "one"},
+        {"role": "tool", "tool_call_id": "c2", "content": "two"},
+        {"role": "assistant", "content": "done"},
+    ]
+    compacted = manager.compact(messages, "summary")
+    kept = compacted[1:]
+    assert kept[0]["role"] == "user"
+    assert kept[1]["role"] == "assistant"
+    assert [m.get("tool_call_id") for m in kept if m["role"] == "tool"] == ["c1", "c2"]
+
+
 def test_prompt_assembler_includes_named_runtime_sections():
     prompt = PromptAssembler().build({
         "identity": "alice (reviewer)",

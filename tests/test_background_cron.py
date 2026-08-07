@@ -31,6 +31,12 @@ def test_cron_validation_and_matching():
     assert not cron_matches("*/5 * * * *", datetime(2026, 8, 7, 10, 16))
 
 
+def test_cron_day_of_month_and_week_use_standard_or_semantics():
+    expression = "0 10 1 * 5"
+    assert cron_matches(expression, datetime(2026, 8, 7, 10, 0))  # Friday
+    assert cron_matches(expression, datetime(2026, 8, 1, 10, 0))  # first day
+
+
 def test_one_shot_cron_removed_after_drain(tmp_path):
     scheduler = CronScheduler(tmp_path / "cron.json")
     job = scheduler.schedule("* * * * *", "run tests", recurring=False)

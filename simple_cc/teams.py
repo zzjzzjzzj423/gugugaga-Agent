@@ -163,6 +163,8 @@ class TeamManager:
                             plan = runtime.run_turn(f"Create a concise plan for: {message['content']}")
                             request = self.protocols.request("plan_approval", name, "lead", plan)
                             self.mailbox.send(name, "lead", plan, "plan_approval_request", {"request_id": request.id})
+                        elif kind == "permission_response":
+                            continue
                         else:
                             answer = runtime.run_turn(message["content"])
                             self.mailbox.send(name, "lead", answer, "message")
@@ -172,7 +174,6 @@ class TeamManager:
                     if task:
                         idle_started = time.time()
                         answer = runtime.run_turn(f"Complete task {task.id}: {task.subject}\n{task.description}")
-                        self.tasks.complete(task.id)
                         self.mailbox.send(name, "lead", answer, "task_result", {"task_id": task.id})
                     with self._lock:
                         self.members[name]["status"] = "idle"
@@ -215,6 +216,20 @@ class TeamManager:
             {"request_id": request.id, "tool_call_id": call.id},
         )
         return request.id
+
+    def await_permission(
+        self, teammate: str, call: ToolCall, timeout: float = 60.0
+    ) -> bool:
+        request_id = self.request_permission(teammate, call)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            status = self.protocols.get(request_id).status
+            if status == "approved":
+                return True
+            if status == "rejected":
+                return False
+            time.sleep(min(self.poll_seconds, 0.1))
+        return False
 
     def review_permission(
         self, request_id: str, approve: bool, feedback: str = ""

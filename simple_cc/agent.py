@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import threading
 from typing import Any, Callable
 
 from .background import BackgroundManager, CronScheduler
@@ -44,8 +46,9 @@ class AgentRuntime:
         self.max_rounds = max_rounds
         self.max_tokens = max_tokens
         self.messages: list[dict[str, Any]] = []
+        self._run_lock = threading.RLock()
 
-    def _drain_notifications(self) -> None:
+    def _drain_notifications(self) -> bool:
         self.cron.fire_due()
         notifications = [*self.cron.drain(), *self.background.drain()]
         for source in self.notification_sources:
@@ -55,17 +58,41 @@ class AgentRuntime:
                 "role": "user",
                 "content": "<notifications>\n" + "\n".join(notifications) + "\n</notifications>",
             })
+            return True
+        return False
+
+    def _summarize(self, messages: list[dict[str, Any]]) -> str:
+        transcript = json.dumps(messages, ensure_ascii=False, default=str)
+        if len(transcript) > 30_000:
+            transcript = transcript[:15_000] + "\n...[middle omitted]...\n" + transcript[-15_000:]
+        try:
+            response = self.provider.complete(
+                "Summarize this coding-agent history. Preserve goals, decisions, files changed, pending tasks, and errors.",
+                [{"role": "user", "content": transcript}],
+                [],
+                min(self.max_tokens, 2048),
+            )
+            return response.content or "Earlier conversation archived."
+        except Exception:
+            return "Earlier conversation archived after summary generation failed."
 
     def run_turn(self, query: str) -> str:
-        self.hooks.trigger(HookEvent.USER_PROMPT_SUBMIT, query=query)
-        self.messages.append({"role": "user", "content": query})
-        return self.run_messages()
+        with self._run_lock:
+            self.hooks.trigger(HookEvent.USER_PROMPT_SUBMIT, query=query)
+            self.messages.append({"role": "user", "content": query})
+            return self.run_messages()
+
+    def run_pending(self) -> str | None:
+        with self._run_lock:
+            if not self._drain_notifications():
+                return None
+            return self.run_messages()
 
     def run_messages(self) -> str:
         attempted_reactive_compact = False
         for _ in range(self.max_rounds):
             self._drain_notifications()
-            self.messages = self.context.prepare(self.messages)
+            self.messages = self.context.prepare(self.messages, self._summarize)
             system = self.prompts.build(self.state_builder())
             try:
                 response = self.provider.complete(
@@ -75,7 +102,7 @@ class AgentRuntime:
                 if attempted_reactive_compact:
                     raise
                 self.messages = self.context.compact(
-                    self.messages, "Earlier messages compacted after a context-length error."
+                    self.messages, self._summarize(self.messages), force=True
                 )
                 attempted_reactive_compact = True
                 continue
@@ -86,8 +113,14 @@ class AgentRuntime:
                 return response.content
 
             for call in response.tool_calls:
-                self.hooks.trigger(HookEvent.PRE_TOOL_USE, call=call)
-                if not self.permissions.approve(call, self.approval_callback):
+                hook_results = self.hooks.trigger(HookEvent.PRE_TOOL_USE, call=call)
+                blocked = next(
+                    (str(result) for result in hook_results if result not in (None, False, "")),
+                    "",
+                )
+                if blocked:
+                    output = blocked
+                elif not self.permissions.approve(call, self.approval_callback):
                     output = f"Permission denied for tool '{call.name}'. Choose a safer approach."
                 elif call.name == "compact":
                     self.messages = self.context.compact(

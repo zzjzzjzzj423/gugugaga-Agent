@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from enum import Enum
 from typing import Callable
 
@@ -14,23 +13,16 @@ class PermissionDecision(str, Enum):
 
 
 class PermissionPolicy:
-    _dangerous = (
-        r"\brm\s+-[^\n]*r[^\n]*f\b",
-        r"\bgit\s+(reset\s+--hard|clean\s+-|checkout\s+--|restore\s+--source)",
-        r"\b(sudo|shutdown|reboot|format|diskpart)\b",
-        r"\b(del|rmdir|remove-item)\b[^\n]*(/s|-recurse)",
-        r">\s*(/dev/|[A-Za-z]:\\Windows)",
-    )
-
     def decide(self, call: ToolCall) -> PermissionDecision:
         if call.name not in {"bash", "background_run"}:
             return PermissionDecision.ALLOW
         command = str(call.arguments.get("command", ""))
         if "\x00" in command:
             return PermissionDecision.DENY
-        if any(re.search(pattern, command, re.IGNORECASE) for pattern in self._dangerous):
-            return PermissionDecision.ASK
-        return PermissionDecision.ALLOW
+        # A shell can invoke arbitrary interpreters and redirect to absolute paths.
+        # Regex classification cannot prove workspace containment, so every shell
+        # command requires an explicit decision from the lead.
+        return PermissionDecision.ASK
 
     def approve(self, call: ToolCall, callback: Callable[[ToolCall], bool] | None) -> bool:
         decision = self.decide(call)

@@ -1,4 +1,6 @@
 import json
+import time
+import threading
 
 import pytest
 
@@ -71,3 +73,38 @@ def test_teammate_permission_request_routes_to_lead(tmp_path):
     assert message["type"] == "permission_request"
     assert message["metadata"]["request_id"] == request_id
     assert protocols.get(request_id).type == "permission"
+
+
+def test_teammate_permission_wait_resumes_after_lead_approval(tmp_path):
+    manager = TeamManager(
+        Mailbox(tmp_path / "mailboxes"), TaskStore(tmp_path / "tasks"), ProtocolStore(),
+        runtime_factory=lambda name, role: DummyRuntime(name), poll_seconds=0.01,
+    )
+    result = []
+    thread = threading.Thread(target=lambda: result.append(manager.await_permission(
+        "alice", ToolCall("call_1", "bash", {"command": "python -V"}), timeout=1
+    )))
+    thread.start()
+    deadline = time.time() + 1
+    while time.time() < deadline and not manager.mailbox.peek("lead"):
+        time.sleep(0.01)
+    request = manager.mailbox.drain("lead")[0]
+    manager.review_permission(request["metadata"]["request_id"], True)
+    thread.join(timeout=1)
+    assert result == [True]
+
+
+def test_autonomous_text_answer_does_not_auto_complete_task(tmp_path):
+    tasks = TaskStore(tmp_path / "tasks")
+    task = tasks.create("verify build")
+    manager = TeamManager(
+        Mailbox(tmp_path / "mailboxes"), tasks, ProtocolStore(),
+        runtime_factory=lambda name, role: DummyRuntime(name),
+        poll_seconds=0.01, idle_timeout=0.08,
+    )
+    manager.spawn("alice", "tester", "start")
+    deadline = time.time() + 1
+    while time.time() < deadline and tasks.get(task.id).status == "pending":
+        time.sleep(0.01)
+    manager.stop_all()
+    assert tasks.get(task.id).status == "in_progress"

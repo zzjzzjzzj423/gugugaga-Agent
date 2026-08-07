@@ -45,7 +45,8 @@ python -m simple_cc --workspace E:\your-project
 
 运行状态保存在目标工作区的 `.simple_cc/`，包括 tasks、memory、mailboxes、
 transcripts、outputs、cron 和 hooks 日志。所有文件工具都会校验路径不能逃出
-目标工作区；危险 Shell 命令会请求 Lead 用户审批，队友不能直接读取 stdin。
+目标工作区。Shell 本身不能由路径正则可靠隔离，因此每一条前台或后台 Shell
+命令都会请求 Lead 明确审批；队友不能直接读取 stdin。
 
 ## 测试
 
@@ -59,4 +60,3 @@ python -m pytest -q
 
 硅基流动接口文档：
 [Function Calling](https://docs.siliconflow.cn/cn/userguide/guides/function-calling)。
-

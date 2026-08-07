@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -93,6 +94,7 @@ def build_runtime(
         registry.register("todo_write", "Replace the session todo list", _schema({"todos": {"type": "array", "items": {"type": "object"}}}, ["todos"]), todos.update)
         registry.register("load_skill", "Load full instructions for a discovered skill", _schema({"name": {"type": "string"}}, ["name"]), skills.load)
         registry.register("remember", "Persist a durable memory", _schema({"title": {"type": "string"}, "content": {"type": "string"}}, ["title", "content"]), memory.remember)
+        registry.register("search_memory", "Search durable memories", _schema({"query": {"type": "string"}, "limit": {"type": "integer"}}, ["query"]), memory.search)
         registry.register("compact", "Compact conversation history now", _schema(), lambda: "Compaction requested")
         registry.register("create_task", "Create a persistent task with dependencies", _schema({"subject": {"type": "string"}, "description": {"type": "string"}, "blocked_by": {"type": "array", "items": {"type": "string"}}}, ["subject"]), lambda subject, description="", blocked_by=None: json.dumps(asdict(tasks.create(subject, description, blocked_by)), ensure_ascii=False))
         registry.register("list_tasks", "List persistent tasks", _schema(), task_list_text)
@@ -130,8 +132,9 @@ def build_runtime(
             }
 
         def teammate_approval(call: ToolCall) -> bool:
-            team.request_permission(name, call)
-            return False
+            return team.await_permission(
+                name, call, timeout=settings.idle_timeout_seconds
+            )
 
         return AgentRuntime(
             provider=provider,
@@ -180,6 +183,9 @@ def handle_command(command: str, app: SimpleCCApp) -> tuple[bool, str]:
 
 
 def _approval_prompt(call: ToolCall) -> bool:
+    if threading.current_thread() is not threading.main_thread():
+        print(f"\n[permission deferred] Run this request in the foreground to approve: {call.name}")
+        return False
     print(f"\nPermission required: {call.name} {json.dumps(call.arguments, ensure_ascii=False)}")
     return input("Allow? [y/N] ").strip().lower() in {"y", "yes"}
 
@@ -194,6 +200,23 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     print(f"Simple CC | model={settings.model} | workspace={settings.workspace}")
     print("Type /help for commands.")
+    wake_stop = threading.Event()
+
+    def wake_loop():
+        while not wake_stop.wait(0.2):
+            if (
+                app.cron.has_pending()
+                or app.background.has_pending()
+                or app.team.mailbox.peek("lead")
+            ):
+                try:
+                    answer = app.runtime.run_pending()
+                    if answer:
+                        print(f"\n[async] {answer}\nsimple-cc> ", end="", flush=True)
+                except Exception as error:
+                    print(f"\n[async error] {type(error).__name__}: {error}")
+
+    threading.Thread(target=wake_loop, name="simple-cc-wakeup", daemon=True).start()
     try:
         while True:
             try:
@@ -213,6 +236,7 @@ def main(argv: list[str] | None = None) -> int:
             except Exception as error:
                 print(f"Agent error: {type(error).__name__}: {error}")
     finally:
+        wake_stop.set()
         app.close()
     return 0
 

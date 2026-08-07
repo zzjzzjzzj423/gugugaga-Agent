@@ -19,8 +19,8 @@ import modules from `learn-claude-code` at runtime.
 - The agent can call built-in coding tools and continue the model/tool loop.
 - All S01-S17 capabilities listed below are present in the integrated runtime.
 - File operations cannot escape the selected workspace.
-- Sensitive commands require approval; child agents route approval through the
-  lead instead of prompting independently.
+- Every foreground or background shell command requires explicit lead approval;
+  child agents route approval through the lead instead of prompting independently.
 - Persistent state is stored below `<workspace>/.simple_cc/`.
 - Unit and integration tests run without a real SiliconFlow API key.
 
@@ -168,13 +168,14 @@ pending, unowned, and all dependencies are complete.
 ## Permissions and Hooks
 
 - All filesystem paths are resolved and checked against the selected workspace.
-- Read-only commands and workspace reads run without prompting.
-- Destructive shell patterns, privilege escalation, broad deletion, and risky
-  Git operations require lead approval.
+- Workspace file reads run without prompting. Every shell command requires lead
+  approval because an arbitrary interpreter or absolute-path redirect cannot be
+  proven workspace-contained by command-pattern matching.
 - Background jobs pass through the same permission path before a thread starts.
 - A denied operation becomes a normal tool result so the model can recover.
-- Teammates send permission requests to the lead mailbox; they never read from
-  stdin.
+- Teammates suspend requested shell calls, correlate a permission response from
+  the lead, and execute the original call once only after approval; they never
+  read from stdin.
 - Built-in hooks implement permission gating, audit logging, large-output
   warnings, user-prompt logging, and stop statistics.
 
@@ -248,4 +249,3 @@ Tests use a scripted fake provider and never require network access.
 - Web UI or HTTP server.
 - Cross-process distributed coordination.
 - Streaming partial model/tool-call deltas.
-
