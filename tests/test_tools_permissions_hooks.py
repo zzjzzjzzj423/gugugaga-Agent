@@ -27,8 +27,9 @@ def test_registry_executes_registered_handler():
 
 def test_dangerous_commands_require_approval():
     policy = PermissionPolicy()
-    for command in ("rm -rf build", "git reset --hard", "sudo apt update"):
-        assert policy.decide(ToolCall("1", "bash", {"command": command})) is PermissionDecision.ASK
+    for tool in ("bash", "background_run"):
+        for command in ("rm -rf build", "git reset --hard", "sudo apt update"):
+            assert policy.decide(ToolCall("1", tool, {"command": command})) is PermissionDecision.ASK
 
 
 def test_hook_manager_preserves_registration_order():
@@ -38,4 +39,3 @@ def test_hook_manager_preserves_registration_order():
     hooks.register(HookEvent.PRE_TOOL_USE, lambda **_: calls.append("second"))
     hooks.trigger(HookEvent.PRE_TOOL_USE, call=None)
     assert calls == ["first", "second"]
-

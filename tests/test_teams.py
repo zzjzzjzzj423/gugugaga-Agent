@@ -3,6 +3,7 @@ import json
 import pytest
 
 from simple_cc.planning import TaskStore
+from simple_cc.models import ToolCall
 from simple_cc.teams import Mailbox, ProtocolError, ProtocolStore, TeamManager
 
 
@@ -55,3 +56,18 @@ def test_graceful_shutdown_request_is_correlated(tmp_path):
     message = manager.mailbox.drain("alice")[0]
     assert message["type"] == "shutdown_request"
     assert message["metadata"]["request_id"] == request_id
+
+
+def test_teammate_permission_request_routes_to_lead(tmp_path):
+    protocols = ProtocolStore()
+    manager = TeamManager(
+        Mailbox(tmp_path / "mailboxes"), TaskStore(tmp_path / "tasks"), protocols,
+        runtime_factory=lambda name, role: DummyRuntime(name),
+    )
+    request_id = manager.request_permission(
+        "alice", ToolCall("call_1", "bash", {"command": "git reset --hard"})
+    )
+    message = manager.mailbox.drain("lead")[0]
+    assert message["type"] == "permission_request"
+    assert message["metadata"]["request_id"] == request_id
+    assert protocols.get(request_id).type == "permission"

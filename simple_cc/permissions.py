@@ -23,7 +23,7 @@ class PermissionPolicy:
     )
 
     def decide(self, call: ToolCall) -> PermissionDecision:
-        if call.name != "bash":
+        if call.name not in {"bash", "background_run"}:
             return PermissionDecision.ALLOW
         command = str(call.arguments.get("command", ""))
         if "\x00" in command:
@@ -39,4 +39,3 @@ class PermissionPolicy:
         if decision is PermissionDecision.DENY or callback is None:
             return False
         return bool(callback(call))
-

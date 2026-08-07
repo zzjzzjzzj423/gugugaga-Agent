@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from .models import ToolCall
 from .planning import Task, TaskStore
 
 
@@ -201,6 +202,35 @@ class TeamManager:
         self.mailbox.send("lead", teammate, task, "request_plan")
         return f"Requested plan from {teammate}"
 
+    def request_permission(self, teammate: str, call: ToolCall) -> str:
+        payload = json.dumps(
+            {"tool": call.name, "arguments": call.arguments}, ensure_ascii=False
+        )
+        request = self.protocols.request("permission", teammate, "lead", payload)
+        self.mailbox.send(
+            teammate,
+            "lead",
+            payload,
+            "permission_request",
+            {"request_id": request.id, "tool_call_id": call.id},
+        )
+        return request.id
+
+    def review_permission(
+        self, request_id: str, approve: bool, feedback: str = ""
+    ) -> str:
+        request = self.protocols.resolve(
+            request_id, "permission_response", approve, feedback
+        )
+        self.mailbox.send(
+            "lead",
+            request.sender,
+            feedback or request.status,
+            "permission_response",
+            {"request_id": request.id, "approve": approve},
+        )
+        return f"Permission {request.status}: {request.id}"
+
     def review_plan(self, request_id: str, approve: bool, feedback: str = "") -> str:
         request = self.protocols.resolve(request_id, "plan_approval_response", approve, feedback)
         self.mailbox.send("lead", request.sender, feedback or request.status, "plan_approval_response", {"request_id": request.id, "approve": approve})
@@ -216,4 +246,3 @@ class TeamManager:
         with self._lock:
             for item in self.members.values():
                 item["stop"].set()
-

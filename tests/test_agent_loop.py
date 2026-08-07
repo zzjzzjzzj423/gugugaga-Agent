@@ -60,3 +60,14 @@ def test_context_error_compacts_once_then_retries(tmp_path):
     assert runtime.run_turn("continue") == "Recovered"
     assert len(provider.requests) == 2
 
+
+def test_compact_tool_forces_transcript_archive(tmp_path):
+    provider = ScriptedProvider([
+        ModelResponse("", [ToolCall("c1", "compact", {})], "tool_calls"),
+        ModelResponse("Compacted", [], "stop"),
+    ])
+    runtime = make_runtime(tmp_path, provider)
+    runtime.registry.register("compact", "Compact", {"type": "object"}, lambda: "requested")
+    runtime.messages.extend({"role": "user", "content": str(i)} for i in range(5))
+    assert runtime.run_turn("compact now") == "Compacted"
+    assert list((tmp_path / ".simple_cc/transcripts").glob("*.json"))

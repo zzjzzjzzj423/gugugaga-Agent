@@ -29,9 +29,10 @@ def test_large_tool_output_is_persisted(tmp_path):
 
 def test_prompt_assembler_includes_named_runtime_sections():
     prompt = PromptAssembler().build({
+        "identity": "alice (reviewer)",
         "workspace": "C:/repo", "tools": "bash, read_file", "skills": "review",
         "memory": "Use pathlib", "tasks": "task_1", "team": "alice: idle",
     })
     for heading in ("Workspace", "Tools", "Skills", "Memory", "Tasks", "Team", "Safety"):
         assert f"## {heading}" in prompt
-
+    assert "alice (reviewer)" in prompt

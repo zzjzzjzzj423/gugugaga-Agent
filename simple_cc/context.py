@@ -78,8 +78,8 @@ class ContextManager:
             result.append(item)
         return result
 
-    def compact(self, messages: list[dict], summary: str | None = None) -> list[dict]:
-        if len(messages) <= self.max_messages:
+    def compact(self, messages: list[dict], summary: str | None = None, force: bool = False) -> list[dict]:
+        if len(messages) <= self.max_messages and not force:
             return self.apply_output_budget(messages)
         stamp = f"{int(time.time())}_{uuid.uuid4().hex[:6]}"
         (self.transcripts_dir / f"{stamp}.json").write_text(json.dumps(messages, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -89,4 +89,3 @@ class ContextManager:
 
     def prepare(self, messages: list[dict]) -> list[dict]:
         return self.compact(messages)
-

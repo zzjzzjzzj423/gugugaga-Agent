@@ -4,7 +4,7 @@ from __future__ import annotations
 class PromptAssembler:
     def build(self, state: dict) -> str:
         sections = [
-            ("Identity", "You are Simple CC, a pragmatic coding agent. Use tools to inspect and modify the selected workspace."),
+            ("Identity", f"You are {state.get('identity', 'Simple CC')}, a pragmatic coding agent. Use tools to inspect and modify the selected workspace."),
             ("Workspace", str(state.get("workspace", ""))),
             ("Tools", str(state.get("tools", ""))),
             ("Skills", str(state.get("skills", "No skills discovered."))),
@@ -14,4 +14,3 @@ class PromptAssembler:
             ("Safety", "Stay inside the workspace. Respect permission denials. Verify changes before claiming success."),
         ]
         return "\n\n".join(f"## {title}\n{body}" for title, body in sections)
-

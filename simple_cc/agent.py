@@ -89,6 +89,13 @@ class AgentRuntime:
                 self.hooks.trigger(HookEvent.PRE_TOOL_USE, call=call)
                 if not self.permissions.approve(call, self.approval_callback):
                     output = f"Permission denied for tool '{call.name}'. Choose a safer approach."
+                elif call.name == "compact":
+                    self.messages = self.context.compact(
+                        self.messages,
+                        "Conversation compacted by explicit tool request.",
+                        force=True,
+                    )
+                    output = "Conversation compacted and transcript archived."
                 else:
                     output = self.registry.execute(call.name, call.arguments)
                 self.hooks.trigger(HookEvent.POST_TOOL_USE, call=call, output=output)
@@ -108,4 +115,3 @@ class SubagentRunner:
     def run(self, prompt: str, agent_type: str = "general-purpose") -> str:
         runtime = self.runtime_factory(agent_type)
         return runtime.run_turn(prompt)
-
