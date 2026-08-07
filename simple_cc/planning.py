@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+
+
+_TASK_ID_PATTERN = re.compile(r"task_[0-9]+_[0-9a-f]{6}\Z", re.ASCII)
 
 
 def _atomic_write(path: Path, data: str) -> None:
@@ -53,6 +57,8 @@ class TaskStore:
         self._lock = threading.RLock()
 
     def _path(self, task_id: str) -> Path:
+        if not isinstance(task_id, str) or not _TASK_ID_PATTERN.fullmatch(task_id):
+            raise ValueError(f"invalid task id: {task_id}")
         return self.directory / f"{task_id}.json"
 
     def _save(self, task: Task) -> None:
@@ -60,15 +66,20 @@ class TaskStore:
 
     def create(self, subject: str, description: str = "", blocked_by: list[str] | None = None) -> Task:
         with self._lock:
+            for dependency_id in blocked_by or []:
+                self._path(dependency_id)
             task = Task(f"task_{int(time.time())}_{uuid.uuid4().hex[:6]}", subject, description, blocked_by=blocked_by or [])
             self._save(task)
             return task
 
     def get(self, task_id: str) -> Task:
-        return Task(**json.loads(self._path(task_id).read_text(encoding="utf-8")))
+        task = Task(**json.loads(self._path(task_id).read_text(encoding="utf-8")))
+        if task.id != task_id:
+            raise ValueError(f"task id mismatch: expected {task_id}, got {task.id}")
+        return task
 
     def list(self) -> list[Task]:
-        return [Task(**json.loads(path.read_text(encoding="utf-8"))) for path in sorted(self.directory.glob("task_*.json"))]
+        return [Task(**json.loads(path.read_text(encoding="utf-8"))) for path in sorted(self.directory.glob("task_*.json")) if _TASK_ID_PATTERN.fullmatch(path.stem)]
 
     def can_start(self, task: Task) -> bool:
         return all(self._path(dep).exists() and self.get(dep).status == "completed" for dep in task.blocked_by)
@@ -94,4 +105,3 @@ class TaskStore:
             unblocked = [t.id for t in self.list() if t.status == "pending" and task.id in t.blocked_by and self.can_start(t)]
             suffix = f"; unblocked: {', '.join(unblocked)}" if unblocked else ""
             return f"Completed {task.id}{suffix}"
-

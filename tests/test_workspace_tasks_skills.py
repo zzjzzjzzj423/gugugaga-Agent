@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 import simple_cc.config as config
 import simple_cc.skills as skills
 import simple_cc.tasks as tasks
@@ -52,6 +54,85 @@ def test_task_dependency_claim_gate_is_durable(tmp_path, monkeypatch):
     assert tasks.complete_task(dependency.id).startswith("Completed")
     assert tasks.claim_task(dependent.id).startswith("Claimed")
     assert tasks.load_task(dependent.id).status == "in_progress"
+
+
+@pytest.mark.parametrize(
+    "malicious_id",
+    [
+        "../outside",
+        r"..\outside",
+        "/tmp/outside",
+        r"C:\outside\task",
+        r"C:outside",
+        r"\\server\share\task",
+        "task_123_0001/child",
+        r"task_123_0001\child",
+        "task_123_0001:stream",
+        "task-not-generated",
+    ],
+)
+def test_task_ids_cannot_escape_selected_tasks_directory(
+    tmp_path, monkeypatch, malicious_id
+):
+    tasks_dir = tmp_path / ".tasks"
+    tasks_dir.mkdir()
+    outside = tmp_path / "outside.json"
+    outside.write_text("sentinel", encoding="utf-8")
+    monkeypatch.setattr(config, "TASKS_DIR", tasks_dir)
+
+    with pytest.raises(ValueError, match="invalid task id"):
+        tasks._task_path(malicious_id)
+    with pytest.raises(ValueError, match="invalid task id"):
+        tasks.get_task_json(malicious_id)
+    with pytest.raises(ValueError, match="invalid task id"):
+        tasks.claim_task(malicious_id)
+    with pytest.raises(ValueError, match="invalid task id"):
+        tasks.complete_task(malicious_id)
+    with pytest.raises(ValueError, match="invalid task id"):
+        tasks.save_task(
+            tasks.Task(
+                malicious_id,
+                "escape",
+                "",
+                "pending",
+                None,
+                [],
+            )
+        )
+
+    assert outside.read_text(encoding="utf-8") == "sentinel"
+    assert list(tasks_dir.iterdir()) == []
+
+
+def test_public_task_handlers_reject_non_generated_ids_without_io(
+    tmp_path, monkeypatch
+):
+    tasks_dir = tmp_path / ".tasks"
+    tasks_dir.mkdir()
+    outside = tmp_path / "outside.json"
+    outside.write_text("sentinel", encoding="utf-8")
+    monkeypatch.setattr(config, "TASKS_DIR", tasks_dir)
+
+    for handler in (
+        tasks.run_get_task,
+        tasks.run_claim_task,
+        tasks.run_complete_task,
+    ):
+        assert handler("../outside") == "Error: invalid task id: ../outside"
+
+    assert outside.read_text(encoding="utf-8") == "sentinel"
+    assert list(tasks_dir.iterdir()) == []
+
+
+def test_generated_task_id_is_the_only_accepted_task_path_shape(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(config, "TASKS_DIR", tmp_path / ".tasks")
+    task = tasks.create_task("safe")
+
+    assert task.id.startswith("task_")
+    assert tasks._task_path(task.id).parent == config.TASKS_DIR
+    assert tasks.load_task(task.id) == task
 
 
 def test_skill_metadata_is_read_only_from_frontmatter(tmp_path, monkeypatch):

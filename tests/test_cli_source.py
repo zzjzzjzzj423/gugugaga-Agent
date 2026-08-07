@@ -409,6 +409,80 @@ def test_cli_exit_stops_and_joins_source_teammates(
             captured["thread"].join(timeout=2)
 
 
+class BlockingLateWriteProvider:
+    def __init__(self):
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.requests = []
+
+    def create(self, messages, system, tools, max_tokens, model=None):
+        self.requests.append(copy.deepcopy(messages))
+        self.entered.set()
+        assert self.release.wait(timeout=3)
+        return ProviderResponse(
+            content=[
+                ToolUseBlock(
+                    id="toolu_cli_late_write",
+                    name="write_file",
+                    input={"path": "cli-late-write.txt", "content": "too late"},
+                )
+            ],
+            stop_reason="tool_use",
+        )
+
+
+@pytest.mark.parametrize("exit_input", ["q", KeyboardInterrupt()])
+def test_cli_exit_during_provider_call_discards_late_tool_response(
+    tmp_path, monkeypatch, exit_input
+):
+    configure_env(monkeypatch)
+    provider = BlockingLateWriteProvider()
+    original_build = cli.build_runtime
+    captured = {}
+
+    def build(settings, approval_callback=None, provider_override=None):
+        del provider_override
+        app = original_build(
+            settings,
+            approval_callback=approval_callback,
+            provider=provider,
+        )
+        assert teams.spawn_teammate_thread(
+            "late-cli-worker", "developer", "Wait before writing"
+        ).startswith("Teammate")
+        captured["app"] = app
+        return app
+
+    def exit_during_provider(_prompt):
+        assert provider.entered.wait(timeout=1)
+
+        def release_after_shutdown():
+            assert teams._teammate_stop_event.wait(timeout=2)
+            provider.release.set()
+
+        captured["releaser"] = threading.Thread(target=release_after_shutdown)
+        captured["releaser"].start()
+        if isinstance(exit_input, BaseException):
+            raise exit_input
+        return exit_input
+
+    monkeypatch.setattr(cli, "build_runtime", build)
+    monkeypatch.setattr("builtins.input", exit_during_provider)
+
+    try:
+        assert cli.main(["--workspace", str(tmp_path)]) == 0
+        captured["releaser"].join(timeout=2)
+        assert not captured["releaser"].is_alive()
+        assert not (tmp_path / "cli-late-write.txt").exists()
+        assert len(provider.requests) == 1
+        assert captured["app"]._close_outcome.stopped
+        assert captured["app"]._close_outcome.live_threads == ()
+    finally:
+        provider.release.set()
+        if captured.get("app"):
+            captured["app"].close()
+
+
 def test_missing_process_model_is_not_rehydrated_from_repository_dotenv(
     tmp_path, monkeypatch
 ):

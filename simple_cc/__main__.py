@@ -4,6 +4,7 @@ import argparse
 import json
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from . import config
 from . import context as context_module
 from . import subagents
 from .agent import SourceRuntime, agent_lock, agent_loop
+from .background import initialize_background_tasks, shutdown_background_tasks
 from .config import Settings
 from .context import block_type, update_context
 from .cron import (
@@ -45,6 +47,12 @@ PROMPT = "\033[36msimple-cc >> \033[0m"
 CLI_ACTIVE = False
 
 
+@dataclass(frozen=True)
+class ApplicationCloseOutcome:
+    stopped: bool
+    live_threads: tuple[str, ...]
+
+
 def terminal_print(text: str):
     if threading.current_thread() is threading.main_thread() or not CLI_ACTIVE:
         print(text)
@@ -66,20 +74,41 @@ class SimpleCCApp:
     stop_event: threading.Event = field(default_factory=threading.Event)
     autorun_thread: threading.Thread | None = None
     _closed: bool = False
+    _close_outcome: ApplicationCloseOutcome | None = None
+    _close_lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False
+    )
 
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self.stop_event.set()
-        stop_all_teammates()
-        shutdown_cron()
-        if (
-            self.autorun_thread is not None
-            and self.autorun_thread is not threading.current_thread()
-            and self.autorun_thread.is_alive()
-        ):
-            self.autorun_thread.join(timeout=2)
+    def close(self, timeout: float = 5.0) -> ApplicationCloseOutcome:
+        with self._close_lock:
+            if self._closed:
+                return self._close_outcome
+            self._closed = True
+            deadline = time.monotonic() + max(0.0, timeout)
+
+            def remaining() -> float:
+                return max(0.0, deadline - time.monotonic())
+
+            self.stop_event.set()
+            background_outcome = shutdown_background_tasks(remaining())
+            teammate_outcome = stop_all_teammates(remaining())
+            cron_stopped = shutdown_cron(remaining())
+            if (
+                self.autorun_thread is not None
+                and self.autorun_thread is not threading.current_thread()
+                and self.autorun_thread.is_alive()
+            ):
+                self.autorun_thread.join(timeout=remaining())
+            live = [
+                *(f"background:{job_id}" for job_id in background_outcome.live_job_ids),
+                *(f"teammate:{name}" for name in teammate_outcome.live_names),
+            ]
+            if not cron_stopped:
+                live.append("simple-cc-cron-scheduler")
+            if self.autorun_thread is not None and self.autorun_thread.is_alive():
+                live.append(self.autorun_thread.name)
+            self._close_outcome = ApplicationCloseOutcome(not live, tuple(live))
+            return self._close_outcome
 
 
 def build_runtime(
@@ -98,13 +127,15 @@ def build_runtime(
     context_module.client = provider
     subagents.client = provider
     subagents.MODEL = settings.model
-    set_team_provider(provider)
+    permissions = PermissionPolicy()
+    initialize_background_tasks()
+    set_team_provider(provider, permissions, approval_callback)
     initialize_cron()
     return SimpleCCApp(
         settings=settings,
         runtime=SourceRuntime(
             provider,
-            PermissionPolicy(),
+            permissions,
             approval_callback,
         ),
     )

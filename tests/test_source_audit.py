@@ -10,6 +10,8 @@ import tokenize
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from simple_cc import agent, config
 from simple_cc.config import Settings
 from simple_cc.provider import SiliconFlowProvider
@@ -133,6 +135,88 @@ def _first_column_symbols(markdown: str) -> set[str]:
         first_column = line.split("|", 2)[1]
         symbols.update(re.findall(r"`([^`]+)`", first_column))
     return symbols
+
+
+def _module_symbol_claims(source: str) -> set[str]:
+    claims = _top_level_names(source)
+    for node in ast.parse(source).body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        claims.add(node.name)
+        for child in ast.walk(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                claims.add(f"{node.name}.{child.name}")
+            if isinstance(child, (ast.Assign, ast.AnnAssign)):
+                targets = (
+                    child.targets if isinstance(child, ast.Assign) else [child.target]
+                )
+                for target in targets:
+                    if isinstance(target, ast.Name):
+                        claims.add(f"{node.name}.{target.id}")
+                    elif (
+                        isinstance(target, ast.Attribute)
+                        and isinstance(target.value, ast.Name)
+                        and target.value.id == "self"
+                    ):
+                        claims.add(f"{node.name}.{target.attr}")
+    return claims
+
+
+def _retained_mapping_rows(source_map: str) -> list[tuple[str, str]]:
+    retained = source_map.split("## Provider contract", 1)[0]
+    rows = []
+    for line in retained.splitlines():
+        if not line.startswith("|"):
+            continue
+        columns = [column.strip() for column in line.strip("|").split("|")]
+        if len(columns) != 3 or columns[0] in {
+            "S20 source item(s)",
+            "---",
+        }:
+            continue
+        rows.append((columns[0], columns[1]))
+    return rows
+
+
+def _validate_retained_mapping_rows(
+    source_map: str, source_names: set[str], project_root: Path
+) -> None:
+    module_claims: dict[str, set[str]] = {}
+    for source_cell, target_cell in _retained_mapping_rows(source_map):
+        module_names = re.findall(r"([A-Za-z_][A-Za-z0-9_]*\.py)", target_cell)
+        assert module_names, f"mapping row has no target module: {source_cell}"
+        row_claims: set[str] = set()
+        for module_name in module_names:
+            module_path = project_root / "simple_cc" / module_name
+            assert module_path.is_file(), (
+                f"mapping row target module does not exist: {module_name}"
+            )
+            claims = module_claims.setdefault(
+                module_name,
+                _module_symbol_claims(module_path.read_text(encoding="utf-8")),
+            )
+            row_claims.update(claims)
+
+        explicit_symbol_claims = [
+            claim.removesuffix("(...)")
+            for claim in re.findall(r"`([^`]+)`", target_cell)
+            if ".py" not in claim
+        ]
+        for claim in explicit_symbol_claims:
+            assert claim in row_claims, (
+                f"mapping row target symbol does not exist in {module_names}: "
+                f"{claim}"
+            )
+
+        for source_name in set(re.findall(r"`([^`]+)`", source_cell)) & source_names:
+            qualified_match = any(
+                claim.rsplit(".", 1)[-1] == source_name
+                for claim in explicit_symbol_claims
+            )
+            assert source_name in row_claims or qualified_match, (
+                f"mapping row maps {source_name} to {module_names}, but that "
+                "symbol is not present in the claimed row target"
+            )
 
 
 def _implementation_findings(path: Path, source: str) -> list[str]:
@@ -262,6 +346,19 @@ def test_source_map_pins_baseline_and_classifies_every_top_level_source_block():
     assert documented_excluded == EXCLUDED_SOURCE_SYMBOLS
     assert documented_retained.isdisjoint(documented_excluded)
     assert documented_retained <= target_names
+    _validate_retained_mapping_rows(source_map, source_names, PROJECT_ROOT)
+
+
+def test_source_map_row_audit_rejects_symbol_found_only_in_another_module():
+    wrong_row = (
+        "| S20 source item(s) | Target module / symbol | Status |\n"
+        "| --- | --- | --- |\n"
+        "| `create_task` | `teams.py` | retained |\n"
+        "\n## Provider contract\n"
+    )
+
+    with pytest.raises(AssertionError, match="create_task.*claimed row target"):
+        _validate_retained_mapping_rows(wrong_row, {"create_task"}, PROJECT_ROOT)
 
 
 def test_fixed_s01_s17_tool_definitions_and_handlers_are_a_bijection():

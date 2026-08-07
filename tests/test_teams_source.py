@@ -8,6 +8,7 @@ import pytest
 
 from simple_cc import config, tasks
 import simple_cc.teams as teams
+from simple_cc.permissions import PermissionPolicy
 from simple_cc.provider import ProviderResponse, TextBlock, ToolUseBlock
 
 
@@ -72,6 +73,49 @@ def test_message_bus_delivers_each_mailbox_in_fifo_order_once():
     assert delivered[1]["type"] == "status"
     assert delivered[1]["metadata"] == {"sequence": 2}
     assert bus.read_inbox("alice") == []
+
+
+@pytest.mark.parametrize(
+    "malicious_name",
+    [
+        "../outside",
+        r"..\outside",
+        "/tmp/outside",
+        r"C:\outside\mailbox",
+        r"C:outside",
+        r"\\server\share\mailbox",
+        "alice/bob",
+        r"alice\bob",
+        "alice:stream",
+        ".",
+        "..",
+        "alice name",
+    ],
+)
+def test_message_bus_rejects_unsafe_mailbox_names_without_external_io(
+    tmp_path, malicious_name
+):
+    bus = teams.MessageBus()
+    outside = tmp_path / "outside.jsonl"
+    outside.write_text('{"sentinel": true}\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid agent name"):
+        bus.send("lead", malicious_name, "escape")
+    with pytest.raises(ValueError, match="invalid agent name"):
+        bus.send(malicious_name, "lead", "escape")
+    with pytest.raises(ValueError, match="invalid agent name"):
+        bus.read_inbox(malicious_name)
+
+    assert outside.read_text(encoding="utf-8") == '{"sentinel": true}\n'
+    assert not config.MAILBOX_DIR.exists()
+
+
+def test_message_bus_accepts_only_simple_identifier_mailbox_names():
+    bus = teams.MessageBus()
+
+    bus.send("lead", "alice-1_test", "safe")
+
+    assert bus.read_inbox("alice-1_test")[0]["content"] == "safe"
 
 
 def test_protocol_response_rejects_wrong_type_and_request_id():
@@ -282,6 +326,145 @@ def test_teammate_uses_content_block_provider_in_selected_shared_workspace(
     assert teams.consume_lead_inbox()[-1]["content"] == (
         "Shared-workspace write complete."
     )
+
+
+def test_teammate_dispatch_uses_lead_permission_and_hook_boundary(
+    monkeypatch,
+):
+    require_source_team_api()
+    (config.WORKDIR / "input.txt").write_text("source", encoding="utf-8")
+    provider = ScriptedContentBlockProvider()
+    provider.responses = [
+        ProviderResponse(
+            content=[
+                ToolUseBlock(
+                    id="toolu_bash",
+                    name="bash",
+                    input={"command": "echo denied> bash-marker.txt"},
+                ),
+                ToolUseBlock(
+                    id="toolu_write",
+                    name="write_file",
+                    input={"path": "write-marker.txt", "content": "denied"},
+                ),
+                ToolUseBlock(
+                    id="toolu_read",
+                    name="read_file",
+                    input={"path": "input.txt"},
+                ),
+            ],
+            stop_reason="tool_use",
+        ),
+        ProviderResponse(
+            content=[TextBlock(text="Used the permitted read only.")],
+            stop_reason="end_turn",
+        ),
+    ]
+    events: list[str] = []
+
+    def hooks(event, block, *args):
+        events.append(f"{event}:{block.name}")
+        if event == "PreToolUse" and block.name == "write_file":
+            return "Permission denied by teammate test hook"
+        return None
+
+    def approve(call):
+        events.append(f"approval:{call.name}")
+        return False
+
+    monkeypatch.setattr(teams, "trigger_hooks", hooks, raising=False)
+    teams.set_team_provider(provider, PermissionPolicy(), approve)
+    monkeypatch.setattr(teams, "IDLE_POLL_INTERVAL", 1)
+    monkeypatch.setattr(teams, "IDLE_TIMEOUT", 1)
+
+    assert teams.spawn_teammate_thread(
+        "secure-alice", "developer", "Use the requested tools"
+    ).startswith("Teammate")
+    deadline = time.monotonic() + 3
+    while "secure-alice" in teams.active_teammates and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert "secure-alice" not in teams.active_teammates
+    assert not (config.WORKDIR / "bash-marker.txt").exists()
+    assert not (config.WORKDIR / "write-marker.txt").exists()
+    assert provider.requests[1]["messages"][-1]["content"] == [
+        {
+            "type": "tool_result",
+            "tool_use_id": "toolu_bash",
+            "content": (
+                "Permission denied for tool 'bash'. Choose a safer approach."
+            ),
+        },
+        {
+            "type": "tool_result",
+            "tool_use_id": "toolu_write",
+            "content": "Permission denied by teammate test hook",
+        },
+        {
+            "type": "tool_result",
+            "tool_use_id": "toolu_read",
+            "content": "source",
+        },
+    ]
+    assert events == [
+        "PreToolUse:bash",
+        "approval:bash",
+        "PreToolUse:write_file",
+        "PreToolUse:read_file",
+        "PostToolUse:read_file",
+    ]
+
+
+class LateWriteProvider:
+    def __init__(self):
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.requests: list[dict] = []
+
+    def create(self, messages, system, tools, max_tokens, model=None):
+        self.requests.append({"messages": list(messages), "system": system})
+        self.entered.set()
+        assert self.release.wait(timeout=3)
+        return ProviderResponse(
+            content=[
+                ToolUseBlock(
+                    id="toolu_late_write",
+                    name="write_file",
+                    input={"path": "late-write.txt", "content": "too late"},
+                )
+            ],
+            stop_reason="tool_use",
+        )
+
+
+def test_app_close_discards_late_teammate_provider_tool_response(monkeypatch):
+    require_source_team_api()
+    from simple_cc.__main__ import build_runtime
+    from simple_cc.config import Settings
+
+    monkeypatch.setenv("SILICONFLOW_API_KEY", "test-key")
+    monkeypatch.setenv("SILICONFLOW_MODEL", "test-model")
+    provider = LateWriteProvider()
+    app = build_runtime(Settings.from_env(config.WORKDIR), provider=provider)
+    assert teams.spawn_teammate_thread(
+        "late-alice", "developer", "Wait before writing"
+    ).startswith("Teammate")
+    assert provider.entered.wait(timeout=1)
+    close_results = []
+    closer = threading.Thread(
+        target=lambda: close_results.append(app.close(timeout=2))
+    )
+    closer.start()
+    assert teams._teammate_stop_event.wait(timeout=1)
+
+    provider.release.set()
+    closer.join(timeout=3)
+
+    assert not closer.is_alive()
+    assert close_results[0].stopped
+    assert close_results[0].live_threads == ()
+    assert not (config.WORKDIR / "late-write.txt").exists()
+    assert len(provider.requests) == 1
 
 
 def test_runtime_bootstrap_installs_provider_before_source_spawn_handler(

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import inspect
 import threading
+import time
 import uuid
+from dataclasses import dataclass
 from typing import Callable
 
 from .hooks import trigger_hooks
@@ -12,7 +15,49 @@ from .tools import call_tool_handler
 _bg_counter = 0
 background_tasks: dict[str, dict] = {}
 background_results: dict[str, str] = {}
-background_lock = threading.Lock()
+background_lock = threading.RLock()
+_background_accepting = True
+
+
+@dataclass(frozen=True)
+class BackgroundShutdownOutcome:
+    stopped: bool
+    live_job_ids: tuple[str, ...]
+
+
+def initialize_background_tasks() -> None:
+    global _bg_counter, _background_accepting
+    with background_lock:
+        live = [
+            job_id
+            for job_id, task in background_tasks.items()
+            if task.get("thread") is not None and task["thread"].is_alive()
+        ]
+        if live:
+            raise RuntimeError(
+                "cannot initialize while background jobs are live: "
+                + ", ".join(live)
+            )
+        background_tasks.clear()
+        background_results.clear()
+        _bg_counter = 0
+        _background_accepting = True
+
+
+def _call_background_handler(handler, args: dict, name: str, cancel_event):
+    if handler is not None:
+        try:
+            parameters = inspect.signature(handler).parameters.values()
+            supports_cancel = any(
+                parameter.name == "cancel_event"
+                or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+        except (TypeError, ValueError):
+            supports_cancel = False
+        if supports_cancel:
+            args = {**args, "cancel_event": cancel_event}
+    return call_tool_handler(handler, args, name)
 
 
 def is_slow_operation(tool_name: str, tool_input: dict) -> bool:
@@ -45,27 +90,72 @@ def should_run_background(tool_name: str, tool_input: dict) -> bool:
 
 def start_background_task(block, handlers: dict) -> str:
     global _bg_counter
-    _bg_counter += 1
-    bg_id = f"bg_{_bg_counter:04d}"
     command = block.input.get("command", block.name)
+    cancel_event = threading.Event()
 
     def worker():
         handler = handlers.get(block.name)
-        result = call_tool_handler(handler, block.input, block.name)
-        trigger_hooks("PostToolUse", block, result)
+        try:
+            result = _call_background_handler(
+                handler, block.input, block.name, cancel_event
+            )
+        except Exception as error:
+            result = f"Error: {type(error).__name__}: {error}"
         with background_lock:
-            background_tasks[bg_id]["status"] = "completed"
+            task = background_tasks[bg_id]
+            if cancel_event.is_set():
+                task["status"] = "cancelled"
+                return
+            trigger_hooks("PostToolUse", block, result)
+            task["status"] = "completed"
             background_results[bg_id] = str(result)
 
     with background_lock:
+        if not _background_accepting:
+            raise RuntimeError("background task manager is not accepting new jobs")
+        _bg_counter += 1
+        bg_id = f"bg_{_bg_counter:04d}"
+        thread = threading.Thread(
+            target=worker,
+            name=f"simple-cc-background-{bg_id}",
+            daemon=True,
+        )
         background_tasks[bg_id] = {
             "tool_use_id": block.id,
             "command": command,
             "status": "running",
+            "cancel_event": cancel_event,
+            "thread": thread,
         }
-    threading.Thread(target=worker, daemon=True).start()
+        thread.start()
     print(f"  \033[33m[background] {bg_id}: {str(command)[:60]}\033[0m")
     return bg_id
+
+
+def shutdown_background_tasks(timeout: float = 2.0) -> BackgroundShutdownOutcome:
+    global _background_accepting
+    with background_lock:
+        _background_accepting = False
+        jobs = list(background_tasks.items())
+        for _, task in jobs:
+            task["cancel_event"].set()
+    deadline = time.monotonic() + max(0.0, timeout)
+    for _, task in jobs:
+        thread = task.get("thread")
+        if (
+            thread is None
+            or thread is threading.current_thread()
+            or not thread.is_alive()
+        ):
+            continue
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+    with background_lock:
+        live = tuple(
+            job_id
+            for job_id, task in background_tasks.items()
+            if task.get("thread") is not None and task["thread"].is_alive()
+        )
+    return BackgroundShutdownOutcome(not live, live)
 
 
 def dispatch_background_task(block, handlers: dict) -> str | None:

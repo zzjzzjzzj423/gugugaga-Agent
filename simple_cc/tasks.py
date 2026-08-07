@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import json
 import random
+import re
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -13,6 +14,7 @@ from . import config
 
 CURRENT_TODOS: list[dict] = []
 _task_claim_lock = threading.RLock()
+_TASK_ID_PATTERN = re.compile(r"task_[0-9]+_[0-9]{4}\Z", re.ASCII)
 
 
 @dataclass
@@ -26,6 +28,8 @@ class Task:
 
 
 def _task_path(task_id: str) -> Path:
+    if not isinstance(task_id, str) or not _TASK_ID_PATTERN.fullmatch(task_id):
+        raise ValueError(f"invalid task id: {task_id}")
     return config.TASKS_DIR / f"{task_id}.json"
 
 
@@ -34,6 +38,8 @@ def create_task(
     description: str = "",
     blockedBy: list[str] | None = None,
 ) -> Task:
+    for dependency_id in blockedBy or []:
+        _task_path(dependency_id)
     task = Task(
         id=f"task_{int(time.time())}_{random.randint(0, 9999):04d}",
         subject=subject,
@@ -47,18 +53,23 @@ def create_task(
 
 
 def save_task(task: Task):
+    path = _task_path(task.id)
     config.TASKS_DIR.mkdir(parents=True, exist_ok=True)
-    _task_path(task.id).write_text(json.dumps(asdict(task), indent=2))
+    path.write_text(json.dumps(asdict(task), indent=2))
 
 
 def load_task(task_id: str) -> Task:
-    return Task(**json.loads(_task_path(task_id).read_text()))
+    task = Task(**json.loads(_task_path(task_id).read_text()))
+    if task.id != task_id:
+        raise ValueError(f"task id mismatch: expected {task_id}, got {task.id}")
+    return task
 
 
 def list_tasks() -> list[Task]:
     return [
         Task(**json.loads(path.read_text()))
         for path in sorted(config.TASKS_DIR.glob("task_*.json"))
+        if _TASK_ID_PATTERN.fullmatch(path.stem)
     ]
 
 
@@ -192,12 +203,16 @@ def run_get_task(task_id: str) -> str:
         return get_task_json(task_id)
     except FileNotFoundError:
         return f"Error: task {task_id} not found"
+    except ValueError as error:
+        return f"Error: {error}"
 
 def run_claim_task(task_id: str) -> str:
     try:
         return claim_task(task_id, owner="agent")
     except FileNotFoundError:
         return f"Error: task {task_id} not found"
+    except ValueError as error:
+        return f"Error: {error}"
 
 
 def run_complete_task(task_id: str) -> str:
@@ -205,3 +220,5 @@ def run_complete_task(task_id: str) -> str:
         return complete_task(task_id)
     except FileNotFoundError:
         return f"Error: task {task_id} not found"
+    except ValueError as error:
+        return f"Error: {error}"

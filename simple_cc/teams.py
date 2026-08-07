@@ -11,7 +11,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import config
+from .hooks import trigger_hooks
 from .models import ToolCall
+from .permissions import PermissionPolicy
 from .planning import Task, TaskStore
 from .tasks import can_start, claim_task, complete_task, list_tasks
 from .workspace import run_bash, run_read, run_write
@@ -20,6 +22,13 @@ from .workspace import run_bash, run_read, run_write
 # S15-S17 source-compatible team communication. Paths are resolved from
 # config at call time so every teammate sees the selected shared workspace.
 _mailbox_lock = threading.RLock()
+_AGENT_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
+
+
+def _validate_agent_name(name: str) -> str:
+    if not isinstance(name, str) or not _AGENT_NAME_PATTERN.fullmatch(name):
+        raise ValueError(f"invalid agent name: {name}")
+    return name
 
 
 class MessageBus:
@@ -31,6 +40,8 @@ class MessageBus:
         msg_type: str = "message",
         metadata: dict | None = None,
     ):
+        _validate_agent_name(from_agent)
+        _validate_agent_name(to_agent)
         msg = {
             "from": from_agent,
             "to": to_agent,
@@ -45,6 +56,7 @@ class MessageBus:
             handle.write(json.dumps(msg, ensure_ascii=False) + "\n")
 
     def read_inbox(self, agent: str) -> list[dict]:
+        _validate_agent_name(agent)
         inbox = config.MAILBOX_DIR / f"{agent}.jsonl"
         with _mailbox_lock:
             if not inbox.exists():
@@ -63,6 +75,13 @@ active_teammates: dict[str, bool] = {}
 _teammate_lock = threading.RLock()
 _teammate_threads: dict[str, threading.Thread] = {}
 _teammate_stop_event = threading.Event()
+_team_accepting = False
+
+
+@dataclass(frozen=True)
+class TeammateShutdownOutcome:
+    stopped: bool
+    live_names: tuple[str, ...]
 
 
 @dataclass
@@ -215,20 +234,55 @@ def idle_poll(
 
 
 _team_provider: Any | None = None
+_team_permissions = PermissionPolicy()
+_team_approval_callback: Callable[[ToolCall], bool] | None = None
 
 
-def set_team_provider(provider: Any | None) -> None:
-    global _team_provider
+def set_team_provider(
+    provider: Any | None,
+    permissions: PermissionPolicy | None = None,
+    approval_callback: Callable[[ToolCall], bool] | None = None,
+) -> None:
+    global _team_provider, _team_permissions, _team_approval_callback
+    global _team_accepting
     _team_provider = provider
+    _team_permissions = permissions or PermissionPolicy()
+    _team_approval_callback = approval_callback
     with _teammate_lock:
+        _team_accepting = provider is not None
         if provider is not None and not _teammate_threads:
             _teammate_stop_event.clear()
 
 
+def _dispatch_teammate_tool(block, handlers: dict[str, Callable]) -> str:
+    from .tools import call_tool_handler
+
+    blocked = trigger_hooks("PreToolUse", block)
+    if blocked:
+        return str(blocked)
+    call = ToolCall(block.id, block.name, block.input)
+    if not _team_permissions.approve(call, _team_approval_callback):
+        return (
+            f"Permission denied for tool '{block.name}'. "
+            "Choose a safer approach."
+        )
+    output = call_tool_handler(
+        handlers.get(block.name), block.input, block.name
+    )
+    trigger_hooks("PostToolUse", block, output)
+    return str(output)
+
+
 def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
+    try:
+        _validate_agent_name(name)
+    except ValueError as error:
+        return f"Error: {error}"
     if _team_provider is None:
         return "Error: teammate provider is not configured"
     with _teammate_lock:
+        if not _team_accepting:
+            return "Error: teammate manager is not accepting new teammates"
         if name in active_teammates:
             return f"Teammate '{name}' already exists"
         if not _teammate_threads:
@@ -271,8 +325,6 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
         return False
 
     def run():
-        from .tools import call_tool_handler
-
         messages = [{"role": "user", "content": prompt}]
         sub_tools = [
             {
@@ -380,6 +432,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
             "list_tasks": list_task_lines,
             "claim_task": lambda task_id: claim_task(task_id, owner=name),
             "complete_task": complete_task,
+            "submit_plan": lambda plan: _teammate_submit_plan(name, plan),
         }
 
         try:
@@ -439,6 +492,9 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                         )
                     except Exception:
                         break
+                    if _teammate_stop_event.is_set():
+                        should_shutdown = True
+                        break
                     messages.append(
                         {"role": "assistant", "content": response.content}
                     )
@@ -451,19 +507,16 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                     for block in response.content:
                         if getattr(block, "type", None) != "tool_use":
                             continue
-                        if block.name == "submit_plan":
-                            output = _teammate_submit_plan(
-                                name, block.input.get("plan", "")
-                            )
+                        if _teammate_stop_event.is_set():
+                            should_shutdown = True
+                            break
+                        output = _dispatch_teammate_tool(block, sub_handlers)
+                        if block.name == "submit_plan" and output.startswith(
+                            "Plan submitted ("
+                        ):
                             match = re.search(r"\((req_\d+)\)", output)
                             protocol_ctx["waiting_plan"] = (
                                 match.group(1) if match else output
-                            )
-                        else:
-                            output = call_tool_handler(
-                                sub_handlers.get(block.name),
-                                block.input,
-                                block.name,
                             )
                         results.append(
                             {
@@ -474,6 +527,8 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                         )
                         if protocol_ctx["waiting_plan"]:
                             break
+                    if should_shutdown:
+                        break
                     messages.append({"role": "user", "content": results})
                     if protocol_ctx["waiting_plan"]:
                         break
@@ -519,8 +574,11 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
     return f"Teammate '{name}' spawned as {role}"
 
 
-def stop_all_teammates(timeout: float = 5.0) -> None:
+def stop_all_teammates(timeout: float = 5.0) -> TeammateShutdownOutcome:
     """Cancel and join all source-faithful teammate threads."""
+    global _team_accepting
+    with _teammate_lock:
+        _team_accepting = False
     _teammate_stop_event.set()
     with _teammate_lock:
         threads = list(_teammate_threads.items())
@@ -534,9 +592,16 @@ def stop_all_teammates(timeout: float = 5.0) -> None:
             if not thread.is_alive():
                 _teammate_threads.pop(name, None)
                 active_teammates.pop(name, None)
+        live = tuple(
+            name
+            for name, thread in _teammate_threads.items()
+            if thread.is_alive()
+        )
+    return TeammateShutdownOutcome(not live, live)
 
 
 def _teammate_submit_plan(from_name: str, plan: str) -> str:
+    _validate_agent_name(from_name)
     state = _create_protocol_request(
         "plan_approval", from_name, "lead", plan
     )
@@ -551,6 +616,10 @@ def _teammate_submit_plan(from_name: str, plan: str) -> str:
 
 
 def run_request_shutdown(teammate: str) -> str:
+    try:
+        _validate_agent_name(teammate)
+    except ValueError as error:
+        return f"Error: {error}"
     state = _create_protocol_request("shutdown", "lead", teammate, "")
     BUS.send(
         "lead",
@@ -563,6 +632,10 @@ def run_request_shutdown(teammate: str) -> str:
 
 
 def run_request_plan(teammate: str, task: str) -> str:
+    try:
+        _validate_agent_name(teammate)
+    except ValueError as error:
+        return f"Error: {error}"
     BUS.send("lead", teammate, f"Submit plan for: {task}", "message")
     return f"Asked {teammate} to submit a plan"
 
@@ -590,6 +663,10 @@ def run_spawn_teammate(name: str, role: str, prompt: str) -> str:
 
 
 def run_send_message(to: str, content: str) -> str:
+    try:
+        _validate_agent_name(to)
+    except ValueError as error:
+        return f"Error: {error}"
     BUS.send("lead", to, content)
     return f"Sent to {to}"
 
@@ -620,10 +697,7 @@ class Mailbox:
         self._lock = threading.RLock()
 
     def _path(self, name: str) -> Path:
-        safe = "".join(c for c in name if c.isalnum() or c in "_-.")
-        if not safe or safe != name:
-            raise ValueError(f"invalid agent name: {name}")
-        return self.directory / f"{safe}.jsonl"
+        return self.directory / f"{_validate_agent_name(name)}.jsonl"
 
     def send(
         self,

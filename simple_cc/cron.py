@@ -249,7 +249,7 @@ def initialize_cron() -> threading.Thread:
         return thread
 
 
-def shutdown_cron(timeout: float = 2.0) -> None:
+def shutdown_cron(timeout: float = 2.0) -> bool:
     global _cron_thread
 
     with _cron_lifecycle_lock:
@@ -262,8 +262,10 @@ def shutdown_cron(timeout: float = 2.0) -> None:
     ):
         thread.join(timeout=timeout)
     with _cron_lifecycle_lock:
-        if _cron_thread is thread:
+        stopped = thread is None or not thread.is_alive()
+        if _cron_thread is thread and stopped:
             _cron_thread = None
+    return stopped
 
 
 class CronScheduler:

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import glob as g
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 from . import config
@@ -18,22 +20,48 @@ def safe_path(p: str, cwd: Path = None) -> Path:
 
 
 def run_bash(
-    command: str, cwd: Path = None, run_in_background: bool = False
+    command: str,
+    cwd: Path = None,
+    run_in_background: bool = False,
+    cancel_event: threading.Event | None = None,
 ) -> str:
     # run_in_background is consumed by the dispatcher; direct execution ignores it.
+    process = None
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             command,
             shell=True,
             cwd=cwd or config.WORKDIR,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=120,
         )
-        output = (result.stdout + result.stderr).strip()
+        deadline = time.monotonic() + 120
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                # Terminating a shell cannot guarantee that every descendant has
+                # exited on every platform; shutdown reports the worker live until
+                # this process wait actually completes.
+                process.terminate()
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=1)
+                return "Error: Cancelled"
+            try:
+                stdout, stderr = process.communicate(timeout=0.1)
+                break
+            except subprocess.TimeoutExpired:
+                if time.monotonic() >= deadline:
+                    process.kill()
+                    process.wait(timeout=1)
+                    return "Error: Timeout (120s)"
+        output = (stdout + stderr).strip()
         return output[:50000] if output else "(no output)"
-    except subprocess.TimeoutExpired:
-        return "Error: Timeout (120s)"
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
 
 
 def run_read(

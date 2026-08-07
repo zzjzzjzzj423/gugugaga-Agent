@@ -26,6 +26,8 @@ def isolated_scheduling_state(tmp_path):
             background.background_tasks.clear()
             background.background_results.clear()
             background._bg_counter = 0
+    if hasattr(background, "initialize_background_tasks"):
+        background.initialize_background_tasks()
 
     try:
         cron = _cron_module()
@@ -39,6 +41,8 @@ def isolated_scheduling_state(tmp_path):
 
     yield cron
 
+    if hasattr(background, "shutdown_background_tasks"):
+        background.shutdown_background_tasks(timeout=2)
     if hasattr(background, "background_lock"):
         with background.background_lock:
             background.background_tasks.clear()
@@ -116,6 +120,89 @@ def test_background_dispatch_leaves_fast_requests_for_foreground_execution(
         is None
     )
     assert background.background_tasks == {}
+
+
+def test_background_shutdown_cancels_cooperative_job_and_rejects_new_work(
+    isolated_scheduling_state, monkeypatch
+):
+    entered = Event()
+    marker = config.WORKDIR / "post-close.txt"
+    post_hooks: list[str] = []
+
+    def cooperative_handler(
+        command: str,
+        run_in_background: bool = False,
+        cancel_event: Event | None = None,
+    ) -> str:
+        del command, run_in_background
+        entered.set()
+        assert cancel_event is not None
+        cancel_event.wait(timeout=2)
+        if not cancel_event.is_set():
+            marker.write_text("late side effect", encoding="utf-8")
+        return "cancelled"
+
+    monkeypatch.setattr(
+        background,
+        "trigger_hooks",
+        lambda event, block, output: post_hooks.append(event),
+    )
+    background.initialize_background_tasks()
+    block = ToolUseBlock(
+        id="toolu_cancel",
+        name="bash",
+        input={"command": "python long-running.py"},
+    )
+    background_id = background.start_background_task(
+        block, {"bash": cooperative_handler}
+    )
+    assert entered.wait(timeout=1)
+
+    outcome = background.shutdown_background_tasks(timeout=1)
+
+    assert outcome.stopped
+    assert outcome.live_job_ids == ()
+    assert background.background_tasks[background_id]["status"] == "cancelled"
+    assert not marker.exists()
+    assert post_hooks == []
+    assert background.collect_background_results() == []
+    with pytest.raises(RuntimeError, match="not accepting new jobs"):
+        background.start_background_task(block, {"bash": cooperative_handler})
+
+
+def test_background_shutdown_reports_uncooperative_live_thread(
+    isolated_scheduling_state,
+):
+    entered = Event()
+    release = Event()
+
+    def uncooperative_handler(command: str) -> str:
+        del command
+        entered.set()
+        release.wait(timeout=2)
+        return "eventually finished"
+
+    background.initialize_background_tasks()
+    block = ToolUseBlock(
+        id="toolu_blocked",
+        name="bash",
+        input={"command": "python blocked.py"},
+    )
+    background_id = background.start_background_task(
+        block, {"bash": uncooperative_handler}
+    )
+    assert entered.wait(timeout=1)
+
+    timed_out = background.shutdown_background_tasks(timeout=0.01)
+
+    assert not timed_out.stopped
+    assert timed_out.live_job_ids == (background_id,)
+    assert background.background_tasks[background_id]["thread"].is_alive()
+
+    release.set()
+    completed = background.shutdown_background_tasks(timeout=1)
+    assert completed.stopped
+    assert completed.live_job_ids == ()
 
 
 def test_literal_five_field_cron_validation_and_standard_matching(
