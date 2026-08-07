@@ -72,18 +72,15 @@ def test_slow_bash_returns_immediately_then_delivers_one_completion(
     assert background.is_slow_operation(block.name, block.input)
     assert background.should_run_background(block.name, block.input)
 
-    background_id = background.start_background_task(
+    placeholder = background.dispatch_background_task(
         block, {"bash": bash_handler}
-    )
-    placeholder = (
-        f"[Background task {background_id} started] "
-        "Result will arrive as a task_notification."
     )
 
     assert placeholder == (
         "[Background task bg_0001 started] "
         "Result will arrive as a task_notification."
     )
+    background_id = "bg_0001"
     assert entered.wait(timeout=1)
     assert background.background_tasks[background_id]["status"] == "running"
     assert background.collect_background_results() == []
@@ -103,6 +100,22 @@ def test_slow_bash_returns_immediately_then_delivers_one_completion(
         "</task_notification>"
     ]
     assert background.collect_background_results() == []
+
+
+def test_background_dispatch_leaves_fast_requests_for_foreground_execution(
+    isolated_scheduling_state,
+):
+    block = ToolUseBlock(
+        id="toolu_fast",
+        name="bash",
+        input={"command": "pwd"},
+    )
+
+    assert (
+        background.dispatch_background_task(block, {"bash": lambda: ""})
+        is None
+    )
+    assert background.background_tasks == {}
 
 
 def test_literal_five_field_cron_validation_and_standard_matching(
@@ -157,6 +170,84 @@ def test_durable_jobs_save_and_reload_below_selected_workspace(
     cron.load_durable_jobs()
 
     assert cron.scheduled_jobs == {durable_job.id: durable_job}
+
+
+def test_loading_workspace_replaces_all_workspace_scoped_cron_state(
+    isolated_scheduling_state, monkeypatch
+):
+    cron = _cron_module()
+    workspace_a = config.WORKDIR / "workspace-a"
+    workspace_b = config.WORKDIR / "workspace-b"
+    workspace_a.mkdir()
+    workspace_b.mkdir()
+
+    config.configure_workspace(workspace_a)
+    config.DURABLE_PATH.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "cron_a",
+                    "cron": "17 4 2 3 1",
+                    "prompt": "workspace A prompt",
+                    "recurring": True,
+                    "durable": True,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    cron.load_durable_jobs()
+    cron.cron_queue.append(cron.scheduled_jobs["cron_a"])
+
+    config.configure_workspace(workspace_b)
+    config.DURABLE_PATH.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "cron_b",
+                    "cron": "18 4 2 3 1",
+                    "prompt": "workspace B prompt",
+                    "recurring": True,
+                    "durable": True,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    cron.load_durable_jobs()
+
+    assert list(cron.scheduled_jobs) == ["cron_b"]
+    assert cron.consume_cron_queue() == []
+
+    class FixedDateTime:
+        @classmethod
+        def now(cls):
+            return datetime(2026, 3, 2, 4, 17)
+
+    sleeps = 0
+
+    def stop_after_one_cycle(_seconds):
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps == 2:
+            raise StopIteration
+
+    monkeypatch.setattr(cron, "datetime", FixedDateTime)
+    monkeypatch.setattr(cron.time, "sleep", stop_after_one_cycle)
+    with pytest.raises(StopIteration):
+        cron.cron_scheduler_loop()
+
+    assert cron.consume_cron_queue() == []
+    cron.save_durable_jobs()
+    assert json.loads(config.DURABLE_PATH.read_text(encoding="utf-8")) == [
+        {
+            "id": "cron_b",
+            "cron": "18 4 2 3 1",
+            "prompt": "workspace B prompt",
+            "recurring": True,
+            "durable": True,
+        }
+    ]
 
 
 def test_scheduler_removes_exhausted_durable_job_and_handlers_are_fixed(

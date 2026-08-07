@@ -68,6 +68,16 @@ def start_background_task(block, handlers: dict) -> str:
     return bg_id
 
 
+def dispatch_background_task(block, handlers: dict) -> str | None:
+    if not should_run_background(block.name, block.input):
+        return None
+    bg_id = start_background_task(block, handlers)
+    return (
+        f"[Background task {bg_id} started] "
+        "Result will arrive as a task_notification."
+    )
+
+
 def collect_background_results() -> list[str]:
     with background_lock:
         ready = [

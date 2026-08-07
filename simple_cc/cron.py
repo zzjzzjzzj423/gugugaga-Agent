@@ -117,15 +117,20 @@ def save_durable_jobs():
 
 
 def load_durable_jobs():
-    if not config.DURABLE_PATH.exists():
-        return
-    try:
-        for item in json.loads(config.DURABLE_PATH.read_text()):
-            job = CronJob(**item)
-            if not validate_cron(job.cron):
-                scheduled_jobs[job.id] = job
-    except Exception:
-        pass
+    loaded: dict[str, CronJob] = {}
+    with cron_lock:
+        if config.DURABLE_PATH.exists():
+            try:
+                for item in json.loads(config.DURABLE_PATH.read_text()):
+                    job = CronJob(**item)
+                    if not validate_cron(job.cron):
+                        loaded[job.id] = job
+            except Exception:
+                pass
+        scheduled_jobs.clear()
+        scheduled_jobs.update(loaded)
+        cron_queue.clear()
+        _last_fired.clear()
 
 
 def schedule_job(

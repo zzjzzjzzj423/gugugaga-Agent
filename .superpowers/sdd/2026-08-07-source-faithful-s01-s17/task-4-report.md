@@ -217,3 +217,130 @@ collection logic, and notification formatting.
 - Compatibility adapters remain temporarily necessary for the approved
   pre-migration runtime. They are isolated from fixed S20 handler ownership and
   can be retired only when later tasks replace that runtime surface.
+
+## Fix Round 1: Independent Review Findings
+
+Independent review found two Important issues in commit `fb92234`:
+
+1. `load_durable_jobs()` merged a newly selected workspace into the process
+   globals, so jobs and queued prompts from workspace A survived after loading
+   workspace B and could be fired or persisted into B.
+2. The background test constructed the immediate placeholder inside the test,
+   so it did not prove that production exposed the S20 agent-loop result.
+
+### Finding 1 RED/GREEN
+
+The regression configures workspace A and loads a literal A job, queues that
+job, then configures workspace B and loads a literal B job without clearing any
+cron globals. It verifies B-only scheduled state, an empty inherited queue, no
+A firing at A's matching time, and B-only JSON after saving.
+
+RED command:
+
+```text
+python -m pytest \
+  tests/test_background_cron_source.py::test_loading_workspace_replaces_all_workspace_scoped_cron_state \
+  -v
+```
+
+Expected RED:
+
+```text
+1 failed in 0.60s
+assert ['cron_a', 'cron_b'] == ['cron_b']
+```
+
+Root cause: `config.DURABLE_PATH` selected B, but `load_durable_jobs()` only
+assigned loaded entries into the existing module-global dictionary. It also
+left `cron_queue` and `_last_fired` owned by A.
+
+Fix: deserialize the selected durable file into replacement state while
+holding `cron_lock`, then atomically replace `scheduled_jobs` and clear the
+workspace-scoped queue/fire markers. A missing, invalid, or empty selected file
+now replaces old workspace state with empty state instead of retaining it.
+
+GREEN:
+
+```text
+1 passed in 0.47s
+```
+
+### Finding 2 RED/GREEN
+
+The original test was changed to call a wished-for production
+`dispatch_background_task(block, handlers)` surface and assert the real return
+while the Bash handler remained blocked.
+
+Initial RED for both dispatcher branches:
+
+```text
+python -m pytest \
+  tests/test_background_cron_source.py::test_slow_bash_returns_immediately_then_delivers_one_completion \
+  tests/test_background_cron_source.py::test_background_dispatch_leaves_fast_requests_for_foreground_execution \
+  -v
+2 failed in 0.60s
+AttributeError: module 'simple_cc.background' has no attribute 'dispatch_background_task'
+```
+
+Fix: add the minimal Task-6-ready dispatcher. It delegates the policy decision
+to `should_run_background`, delegates execution/state to
+`start_background_task`, returns `None` for foreground work, and returns the
+literal S20 immediate placeholder for background work.
+
+An intermediate helper draft returned an invented XML wrapper. Pinning the
+actual S20 contract first produced the expected focused RED:
+
+```text
+1 failed in 0.56s
+expected: [Background task bg_0001 started] Result will arrive as a task_notification.
+actual:   <background-task id="bg_0001" status="started">...</background-task>
+```
+
+After correcting production to the source literal:
+
+```text
+1 passed in 0.47s
+```
+
+The fast-request branch also passes and proves that the dispatcher neither
+starts a task nor consumes foreground execution.
+
+### Fix-Round Verification
+
+Focused Task 4 file:
+
+```text
+python -m pytest tests/test_background_cron_source.py -v
+6 passed in 0.51s
+```
+
+Related background/cron, compatibility, workspace/task/skill, permissions,
+hooks, and fixed-registry tests:
+
+```text
+python -m pytest tests/test_background_cron.py \
+  tests/test_background_cron_source.py \
+  tests/test_workspace_tasks_skills.py \
+  tests/test_tools_permissions_hooks.py -v
+22 passed in 0.56s
+```
+
+Full suite:
+
+```text
+python -m pytest -q
+1 failed, 67 passed in 0.87s
+```
+
+The only failure remains the unchanged known dotenv baseline
+`tests/test_config_provider.py::test_settings_requires_model`.
+
+Additional review:
+
+- `python -m compileall -q simple_cc tests/test_background_cron_source.py`:
+  pass.
+- `git diff --check`: pass before staging.
+- `provider.py`: unchanged.
+- Cron handlers remain a fixed one-definition/one-handler bijection.
+- No worktree, MCP, S18, or S19 behavior entered the fix.
+- User `.env.example`, `.idea/`, and plan paths remain untouched.
