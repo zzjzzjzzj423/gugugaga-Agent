@@ -150,9 +150,18 @@ def _status_code(error: Exception) -> int | None:
     )
 
 
-def _is_context_error(error: Exception) -> bool:
+def is_context_length_error(error: Exception) -> bool:
     text = str(error).lower()
-    return any(token in text for token in ("context length", "too long", "maximum context"))
+    return isinstance(error, ContextLengthError) or any(
+        token in text
+        for token in (
+            "context length",
+            "context_length_exceeded",
+            "maximum context",
+            "max_context_window",
+            "prompt is too long",
+        )
+    )
 
 
 class SiliconFlowProvider(ChatProvider):
@@ -191,7 +200,7 @@ class SiliconFlowProvider(ChatProvider):
                 content.extend(_tool_use_block(call) for call in (message.tool_calls or []))
                 return ProviderResponse(content=content, stop_reason=_stop_reason(choice.finish_reason))
             except Exception as error:
-                if _is_context_error(error):
+                if is_context_length_error(error):
                     raise ContextLengthError(str(error)) from error
                 last_error = error
                 status = _status_code(error)

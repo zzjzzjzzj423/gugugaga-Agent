@@ -61,6 +61,8 @@ class MessageBus:
 BUS = MessageBus()
 active_teammates: dict[str, bool] = {}
 _teammate_lock = threading.RLock()
+_teammate_threads: dict[str, threading.Thread] = {}
+_teammate_stop_event = threading.Event()
 
 
 @dataclass
@@ -163,10 +165,13 @@ def idle_poll(
     messages: list,
     name: str,
     role: str,
+    stop_event: threading.Event | None = None,
 ) -> str:
     del role
+    stop_event = stop_event or threading.Event()
     for _ in range(IDLE_TIMEOUT // IDLE_POLL_INTERVAL):
-        time.sleep(IDLE_POLL_INTERVAL)
+        if stop_event.is_set():
+            return "shutdown"
         inbox = BUS.read_inbox(agent_name)
         if inbox:
             for msg in inbox:
@@ -204,6 +209,8 @@ def idle_poll(
                     }
                 )
                 return "work"
+        if stop_event.wait(IDLE_POLL_INTERVAL):
+            return "shutdown"
     return "timeout"
 
 
@@ -213,6 +220,9 @@ _team_provider: Any | None = None
 def set_team_provider(provider: Any | None) -> None:
     global _team_provider
     _team_provider = provider
+    with _teammate_lock:
+        if provider is not None and not _teammate_threads:
+            _teammate_stop_event.clear()
 
 
 def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
@@ -221,6 +231,8 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
     with _teammate_lock:
         if name in active_teammates:
             return f"Teammate '{name}' already exists"
+        if not _teammate_threads:
+            _teammate_stop_event.clear()
         active_teammates[name] = True
 
     protocol_ctx = {"waiting_plan": None}
@@ -371,7 +383,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
         }
 
         try:
-            while True:
+            while not _teammate_stop_event.is_set():
                 if len(messages) <= 3:
                     messages.insert(
                         0,
@@ -385,6 +397,9 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                     )
                 should_shutdown = False
                 for _ in range(10):
+                    if _teammate_stop_event.is_set():
+                        should_shutdown = True
+                        break
                     inbox = BUS.read_inbox(name)
                     for msg in inbox:
                         if handle_inbox_message(name, msg, messages):
@@ -393,7 +408,9 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                     if should_shutdown:
                         break
                     if protocol_ctx["waiting_plan"]:
-                        time.sleep(IDLE_POLL_INTERVAL)
+                        if _teammate_stop_event.wait(IDLE_POLL_INTERVAL):
+                            should_shutdown = True
+                            break
                         continue
                     if inbox:
                         non_protocol = [
@@ -464,7 +481,13 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                     break
                 if protocol_ctx["waiting_plan"]:
                     continue
-                idle_result = idle_poll(name, messages, name, role)
+                idle_result = idle_poll(
+                    name,
+                    messages,
+                    name,
+                    role,
+                    _teammate_stop_event,
+                )
                 if idle_result in ("shutdown", "timeout"):
                     break
 
@@ -485,9 +508,32 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
         finally:
             with _teammate_lock:
                 active_teammates.pop(name, None)
+                _teammate_threads.pop(name, None)
 
-    threading.Thread(target=run, name=f"teammate-{name}", daemon=True).start()
+    thread = threading.Thread(
+        target=run, name=f"teammate-{name}", daemon=True
+    )
+    with _teammate_lock:
+        _teammate_threads[name] = thread
+    thread.start()
     return f"Teammate '{name}' spawned as {role}"
+
+
+def stop_all_teammates(timeout: float = 5.0) -> None:
+    """Cancel and join all source-faithful teammate threads."""
+    _teammate_stop_event.set()
+    with _teammate_lock:
+        threads = list(_teammate_threads.items())
+    deadline = time.monotonic() + timeout
+    for _, thread in threads:
+        if thread is threading.current_thread() or not thread.is_alive():
+            continue
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+    with _teammate_lock:
+        for name, thread in list(_teammate_threads.items()):
+            if not thread.is_alive():
+                _teammate_threads.pop(name, None)
+                active_teammates.pop(name, None)
 
 
 def _teammate_submit_plan(from_name: str, plan: str) -> str:

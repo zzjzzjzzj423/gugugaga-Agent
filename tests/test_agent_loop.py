@@ -36,8 +36,16 @@ def test_tool_call_result_returns_to_model(tmp_path):
     runtime = make_runtime(tmp_path, provider)
     assert runtime.run_turn("create hello.txt") == "Created hello.txt"
     assert (tmp_path / "hello.txt").read_text() == "hi"
-    assert provider.requests[-1]["messages"][-1]["role"] == "tool"
-    assert provider.requests[-1]["messages"][-1]["tool_call_id"] == "c1"
+    assert provider.requests[-1]["messages"][-1] == {
+        "role": "user",
+        "content": [
+            {
+                "type": "tool_result",
+                "tool_use_id": "c1",
+                "content": "Wrote 2 characters to hello.txt",
+            }
+        ],
+    }
 
 
 def test_denied_command_becomes_tool_result(tmp_path):
@@ -47,7 +55,9 @@ def test_denied_command_becomes_tool_result(tmp_path):
     ])
     runtime = make_runtime(tmp_path, provider, approval=lambda _: False)
     assert "safer" in runtime.run_turn("reset it")
-    assert "denied" in provider.requests[-1]["messages"][-1]["content"].lower()
+    assert "denied" in (
+        provider.requests[-1]["messages"][-1]["content"][0]["content"].lower()
+    )
 
 
 def test_pre_tool_hook_can_block_execution(tmp_path):
@@ -62,7 +72,10 @@ def test_pre_tool_hook_can_block_execution(tmp_path):
     )
     assert "another" in runtime.run_turn("write it")
     assert not (tmp_path / "blocked.txt").exists()
-    assert "Blocked by project hook" in provider.requests[-1]["messages"][-1]["content"]
+    assert (
+        provider.requests[-1]["messages"][-1]["content"][0]["content"]
+        == "Blocked by project hook"
+    )
 
 
 def test_context_error_compacts_once_then_retries(tmp_path):

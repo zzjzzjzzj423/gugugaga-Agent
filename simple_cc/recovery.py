@@ -4,6 +4,7 @@ import random
 import time
 
 from . import config
+from .provider import is_context_length_error
 
 
 class RecoveryState:
@@ -65,9 +66,4 @@ def with_retry(fn, state: RecoveryState):
 
 
 def is_prompt_too_long_error(error: Exception) -> bool:
-    message = str(error).lower()
-    return (
-        ("prompt" in message and "long" in message)
-        or "context_length_exceeded" in message
-        or "max_context_window" in message
-    )
+    return is_context_length_error(error)

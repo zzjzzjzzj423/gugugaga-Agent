@@ -23,7 +23,7 @@ from .context import (
 from .cron import consume_cron_queue
 from .hooks import HookEvent, HookManager
 from .hooks import trigger_hooks
-from .models import ChatProvider, ToolCall
+from .models import ChatProvider, ToolCall, ToolSpec
 from .permissions import PermissionPolicy
 from .prompts import PromptAssembler, assemble_system_prompt
 from .provider import ContextLengthError
@@ -40,6 +40,74 @@ from .tools import (
 client = None
 rounds_since_todo = 0
 agent_lock = threading.Lock()
+
+
+class FixedToolRegistry:
+    """Read-only compatibility view over the fixed S01-S17 tables."""
+
+    def specs(self) -> list[ToolSpec]:
+        return [
+            ToolSpec(
+                definition["name"],
+                definition["description"],
+                definition["input_schema"],
+            )
+            for definition in TOOL_DEFINITIONS
+        ]
+
+    def execute(self, name: str, arguments: dict[str, Any]) -> str:
+        return str(
+            call_tool_handler(TOOL_HANDLERS.get(name), arguments, name)
+        )
+
+
+class SourceRuntime:
+    """Small public wrapper over the retained module-level S20 loop."""
+
+    def __init__(self, provider: ChatProvider):
+        self.provider = provider
+        self.registry = FixedToolRegistry()
+        self.messages: list[dict[str, Any]] = []
+        self.context: dict[str, Any] = update_context({}, [])
+
+    @staticmethod
+    def _turn_text(messages: list[dict[str, Any]], turn_start: int) -> str:
+        texts = []
+        for message in messages[turn_start:]:
+            if message.get("role") != "assistant":
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                block_type = (
+                    block.get("type")
+                    if isinstance(block, dict)
+                    else getattr(block, "type", None)
+                )
+                if block_type == "text":
+                    texts.append(
+                        block.get("text", "")
+                        if isinstance(block, dict)
+                        else block.text
+                    )
+        return "\n".join(texts)
+
+    def state_builder(self) -> dict[str, Any]:
+        return {
+            **update_context(self.context, self.messages),
+            "workspace": str(config.WORKDIR),
+            "tools": ", ".join(spec.name for spec in self.registry.specs()),
+        }
+
+    def run_turn(self, query: str) -> str:
+        trigger_hooks("UserPromptSubmit", query)
+        with agent_lock:
+            turn_start = len(self.messages)
+            self.messages.append({"role": "user", "content": query})
+            agent_loop(self.messages, self.context)
+            self.context = update_context(self.context, self.messages)
+            return self._turn_text(self.messages, turn_start)
 
 
 def call_llm(
@@ -298,6 +366,25 @@ class AgentRuntime:
             if getattr(block, "type", None) == "tool_use"
         ]
 
+    @staticmethod
+    def _content_blocks(content) -> list[dict[str, Any]]:
+        blocks = []
+        for block in content:
+            if isinstance(block, dict):
+                blocks.append(dict(block))
+            elif getattr(block, "type", None) == "text":
+                blocks.append({"type": "text", "text": block.text})
+            elif getattr(block, "type", None) == "tool_use":
+                blocks.append(
+                    {
+                        "type": "tool_use",
+                        "id": block.id,
+                        "name": block.name,
+                        "input": block.input,
+                    }
+                )
+        return blocks
+
     def run_turn(self, query: str) -> str:
         with self._run_lock:
             self.hooks.trigger(HookEvent.USER_PROMPT_SUBMIT, query=query)
@@ -334,27 +421,17 @@ class AgentRuntime:
 
             response_text = self._response_text(response.content)
             response_calls = self._response_calls(response.content)
-            assistant_message: dict[str, Any] = {
-                "role": "assistant",
-                "content": response_text,
-            }
-            if response_calls:
-                assistant_message["tool_calls"] = [
-                    {
-                        "id": call.id,
-                        "type": "function",
-                        "function": {
-                            "name": call.name,
-                            "arguments": json.dumps(call.arguments),
-                        },
-                    }
-                    for call in response_calls
-                ]
-            self.messages.append(assistant_message)
+            self.messages.append(
+                {
+                    "role": "assistant",
+                    "content": self._content_blocks(response.content),
+                }
+            )
             if not response_calls:
                 self.hooks.trigger(HookEvent.STOP, messages=self.messages)
                 return response_text
 
+            results = []
             for call in response_calls:
                 hook_results = self.hooks.trigger(HookEvent.PRE_TOOL_USE, call=call)
                 blocked = next(
@@ -376,12 +453,14 @@ class AgentRuntime:
                 else:
                     output = self.registry.execute(call.name, call.arguments)
                 self.hooks.trigger(HookEvent.POST_TOOL_USE, call=call, output=output)
-                self.messages.append({
-                    "role": "tool",
-                    "tool_call_id": call.id,
-                    "name": call.name,
-                    "content": output,
-                })
+                results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": call.id,
+                        "content": output,
+                    }
+                )
+            self.messages.append({"role": "user", "content": results})
         raise RuntimeError(f"agent exceeded maximum rounds ({self.max_rounds})")
 
 

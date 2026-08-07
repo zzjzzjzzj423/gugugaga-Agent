@@ -26,6 +26,9 @@ scheduled_jobs: dict[str, CronJob] = {}
 cron_queue: list[CronJob] = []
 cron_lock = threading.Lock()
 _last_fired: dict[str, str] = {}
+_cron_lifecycle_lock = threading.RLock()
+_cron_stop_event = threading.Event()
+_cron_thread: threading.Thread | None = None
 
 
 def _cron_field_matches(field: str, value: int) -> bool:
@@ -166,9 +169,12 @@ def cancel_job(job_id: str) -> str:
     return f"Cancelled {job_id}"
 
 
-def cron_scheduler_loop():
+def cron_scheduler_loop(stop_event: threading.Event | None = None):
     while True:
-        time.sleep(1)
+        if stop_event is None:
+            time.sleep(1)
+        elif stop_event.wait(1):
+            return
         now = datetime.now()
         marker = now.strftime("%Y-%m-%d %H:%M")
         with cron_lock:
@@ -222,6 +228,42 @@ def run_list_crons() -> str:
 
 def run_cancel_cron(job_id: str) -> str:
     return cancel_job(job_id)
+
+
+def initialize_cron() -> threading.Thread:
+    """Load and start cron only after the runtime selects its workspace."""
+    global _cron_stop_event, _cron_thread
+
+    shutdown_cron()
+    load_durable_jobs()
+    with _cron_lifecycle_lock:
+        _cron_stop_event = threading.Event()
+        _cron_thread = threading.Thread(
+            target=cron_scheduler_loop,
+            args=(_cron_stop_event,),
+            name="simple-cc-cron-scheduler",
+            daemon=True,
+        )
+        thread = _cron_thread
+        thread.start()
+        return thread
+
+
+def shutdown_cron(timeout: float = 2.0) -> None:
+    global _cron_thread
+
+    with _cron_lifecycle_lock:
+        thread = _cron_thread
+        _cron_stop_event.set()
+    if (
+        thread is not None
+        and thread is not threading.current_thread()
+        and thread.is_alive()
+    ):
+        thread.join(timeout=timeout)
+    with _cron_lifecycle_lock:
+        if _cron_thread is thread:
+            _cron_thread = None
 
 
 class CronScheduler:
@@ -332,7 +374,3 @@ class CronScheduler:
 
     def stop(self):
         self._stop.set()
-
-
-load_durable_jobs()
-threading.Thread(target=cron_scheduler_loop, daemon=True).start()

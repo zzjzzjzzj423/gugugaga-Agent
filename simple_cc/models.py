@@ -25,20 +25,19 @@ class ModelResponse:
     finish_reason: str = "stop"
 
     def as_assistant_message(self) -> dict[str, Any]:
-        message: dict[str, Any] = {"role": "assistant", "content": self.content or ""}
-        if self.tool_calls:
-            message["tool_calls"] = [
-                {
-                    "id": call.id,
-                    "type": "function",
-                    "function": {
-                        "name": call.name,
-                        "arguments": __import__("json").dumps(call.arguments),
-                    },
-                }
-                for call in self.tool_calls
-            ]
-        return message
+        blocks: list[dict[str, Any]] = []
+        if self.content:
+            blocks.append({"type": "text", "text": self.content})
+        blocks.extend(
+            {
+                "type": "tool_use",
+                "id": call.id,
+                "name": call.name,
+                "input": call.arguments,
+            }
+            for call in self.tool_calls
+        )
+        return {"role": "assistant", "content": blocks}
 
 
 class ChatProvider(Protocol):

@@ -5,7 +5,12 @@ import copy
 import pytest
 
 from simple_cc import agent, config, context, subagents, teams, tools
-from simple_cc.provider import ProviderResponse, TextBlock, ToolUseBlock
+from simple_cc.provider import (
+    ContextLengthError,
+    ProviderResponse,
+    TextBlock,
+    ToolUseBlock,
+)
 
 
 class ScriptedProvider:
@@ -140,6 +145,42 @@ def test_prompt_too_long_runs_one_real_reactive_compaction_retry(
         "content": "[Reactive compact]\n\nEarlier goal and constraints.",
     }
     assert len(list((tmp_path / ".transcripts").glob("*.jsonl"))) == 1
+
+
+def test_maximum_context_length_error_retries_once_then_records_second_error(
+    source_loop, tmp_path, monkeypatch
+):
+    provider = ScriptedProvider(
+        [
+            ContextLengthError("maximum context length exceeded"),
+            ContextLengthError("maximum context length exceeded"),
+        ]
+    )
+    install(provider, monkeypatch)
+    monkeypatch.setattr(
+        context, "summarize_history", lambda messages: "Earlier work."
+    )
+    messages = [
+        {"role": "user", "content": f"message-{index}"}
+        for index in range(7)
+    ]
+
+    agent.agent_loop(messages, {})
+
+    assert len(provider.requests) == 2
+    assert len(list((tmp_path / ".transcripts").glob("*.jsonl"))) == 1
+    assert messages[-1] == {
+        "role": "assistant",
+        "content": [
+            {
+                "type": "text",
+                "text": (
+                    "[Error] ContextLengthError: "
+                    "maximum context length exceeded"
+                ),
+            }
+        ],
+    }
 
 
 def test_compact_tool_mutates_history_without_dispatching_placeholder(
