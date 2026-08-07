@@ -1,6 +1,7 @@
 # S20 source map (S01-S17)
 
 Source baseline: `E:\AgentLearnProject\learn-claude-code\s20_comprehensive\code.py`.
+Baseline SHA-256: `9EACF2F2C6F6DBE3B31117008A1A0BE44F52EE29585E5AFA0F4126D8D964D213`.
 
 This map is the audit index for the source-faithful split. Names below are
 retained unless they appear in an exclusion table. A target can use a small
