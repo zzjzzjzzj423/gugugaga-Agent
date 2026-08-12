@@ -21,7 +21,7 @@ from .cron import (
     initialize_cron,
     shutdown_cron,
 )
-from .hooks import trigger_hooks
+from .hooks import set_hook_printer, trigger_hooks
 from .models import ChatProvider, ToolCall
 from .permissions import PermissionPolicy
 from .provider import SiliconFlowProvider
@@ -30,6 +30,9 @@ from .teams import (
     consume_lead_inbox,
     set_team_provider,
     stop_all_teammates,
+    poll_lead_inbox,
+    run_list_permissions,
+    run_review_permission,
 )
 from .tasks import run_list_tasks
 
@@ -71,6 +74,7 @@ def terminal_print(text: str):
 class SimpleCCApp:
     settings: Settings
     runtime: SourceRuntime
+    inbox_thread: threading.Thread | None = None
     stop_event: threading.Event = field(default_factory=threading.Event)
     autorun_thread: threading.Thread | None = None
     _closed: bool = False
@@ -79,35 +83,99 @@ class SimpleCCApp:
         default_factory=threading.Lock, repr=False
     )
 
-    def close(self, timeout: float = 5.0) -> ApplicationCloseOutcome:
+    def close(
+            self,
+            timeout: float = 5.0,
+    ) -> ApplicationCloseOutcome:
         with self._close_lock:
             if self._closed:
                 return self._close_outcome
+
             self._closed = True
-            deadline = time.monotonic() + max(0.0, timeout)
+            deadline = time.monotonic() + max(
+                0.0,
+                timeout,
+            )
 
             def remaining() -> float:
-                return max(0.0, deadline - time.monotonic())
+                return max(
+                    0.0,
+                    deadline - time.monotonic(),
+                )
 
+            # 同时通知 cron autorun 和 Lead inbox poller 停止。
             self.stop_event.set()
-            background_outcome = shutdown_background_tasks(remaining())
-            teammate_outcome = stop_all_teammates(remaining())
+
+            background_outcome = (
+                shutdown_background_tasks(remaining())
+            )
+            teammate_outcome = stop_all_teammates(
+                remaining()
+            )
             cron_stopped = shutdown_cron(remaining())
+
+            # 等待 Lead inbox 轮询线程退出。
             if (
-                self.autorun_thread is not None
-                and self.autorun_thread is not threading.current_thread()
-                and self.autorun_thread.is_alive()
+                    self.inbox_thread is not None
+                    and self.inbox_thread
+                    is not threading.current_thread()
+                    and self.inbox_thread.is_alive()
             ):
-                self.autorun_thread.join(timeout=remaining())
+                self.inbox_thread.join(
+                    timeout=remaining()
+                )
+
+            # 等待 cron 自动执行线程退出。
+            if (
+                    self.autorun_thread is not None
+                    and self.autorun_thread
+                    is not threading.current_thread()
+                    and self.autorun_thread.is_alive()
+            ):
+                self.autorun_thread.join(
+                    timeout=remaining()
+                )
+
             live = [
-                *(f"background:{job_id}" for job_id in background_outcome.live_job_ids),
-                *(f"teammate:{name}" for name in teammate_outcome.live_names),
+                *(
+                    f"background:{job_id}"
+                    for job_id
+                    in background_outcome.live_job_ids
+                ),
+                *(
+                    f"teammate:{name}"
+                    for name
+                    in teammate_outcome.live_names
+                ),
             ]
+
             if not cron_stopped:
-                live.append("simple-cc-cron-scheduler")
-            if self.autorun_thread is not None and self.autorun_thread.is_alive():
-                live.append(self.autorun_thread.name)
-            self._close_outcome = ApplicationCloseOutcome(not live, tuple(live))
+                live.append(
+                    "simple-cc-cron-scheduler"
+                )
+
+            if (
+                    self.autorun_thread is not None
+                    and self.autorun_thread.is_alive()
+            ):
+                live.append(
+                    self.autorun_thread.name
+                )
+
+            if (
+                    self.inbox_thread is not None
+                    and self.inbox_thread.is_alive()
+            ):
+                live.append(
+                    self.inbox_thread.name
+                )
+
+            self._close_outcome = (
+                ApplicationCloseOutcome(
+                    stopped=not live,
+                    live_threads=tuple(live),
+                )
+            )
             return self._close_outcome
 
 
@@ -155,7 +223,10 @@ def handle_command(command: str, app: SimpleCCApp) -> tuple[bool, str]:
     if command in {"/exit", "/quit"}:
         return True, "__exit__"
     if command == "/help":
-        return True, "/help /status /tasks /team /memory /exit"
+        return True, (
+            "/help /status /tasks /team /memory "
+            "/permissions /approve <id> /reject <id> /exit"
+        )
     if command == "/status":
         teammates = ", ".join(sorted(active_teammates)) or "none"
         return True, (
@@ -169,6 +240,36 @@ def handle_command(command: str, app: SimpleCCApp) -> tuple[bool, str]:
         return True, (
             ", ".join(sorted(active_teammates))
             or "No active teammates."
+        )
+    if command == "/permissions":
+        return True, run_list_permissions()
+
+    if command.startswith("/approve "):
+        request_id = command.split(maxsplit=1)[1].strip()
+        if not request_id:
+            return True, "Usage: /approve <request_id>"
+        return True, run_review_permission(
+            request_id,
+            approve=True,
+        )
+
+    if command.startswith("/reject "):
+        parts = command.split(maxsplit=2)
+        if len(parts) < 2:
+            return True, (
+                "Usage: /reject <request_id> [feedback]"
+            )
+
+        request_id = parts[1]
+        feedback = (
+            parts[2]
+            if len(parts) == 3
+            else "Rejected by user."
+        )
+        return True, run_review_permission(
+            request_id,
+            approve=False,
+            feedback=feedback,
         )
     if command == "/memory":
         if not config.MEMORY_INDEX.exists():
@@ -201,6 +302,43 @@ def print_turn_assistants(messages: list, turn_start: int):
                     block["text"] if isinstance(block, dict) else block.text
                 )
 
+def lead_inbox_poll_loop(
+    stop_event: threading.Event,
+):
+    while not stop_event.wait(0.5):
+        messages = poll_lead_inbox(
+            route_protocol=True
+        )
+
+        for message in messages:
+            if message.get("type") != "permission_request":
+                continue
+
+            metadata = message.get("metadata", {})
+            request_id = metadata.get(
+                "request_id",
+                "unknown",
+            )
+
+            try:
+                payload = json.loads(
+                    message.get("content", "{}")
+                )
+            except json.JSONDecodeError:
+                payload = {}
+
+            tool = payload.get("tool", "unknown")
+            arguments = payload.get("arguments", {})
+
+            terminal_print(
+                "\n"
+                f"[Permission {request_id}]\n"
+                f"{message.get('from', 'unknown')} "
+                f"requests {tool}: "
+                f"{json.dumps(arguments, ensure_ascii=False)}\n"
+                f"Approve: /approve {request_id}\n"
+                f"Reject:  /reject {request_id}"
+            )
 
 def cron_autorun_loop(
     history: list,
@@ -243,7 +381,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Configuration error: {error}", file=sys.stderr)
         return 2
     CLI_ACTIVE = True
-    print(f"Simple CC | model={settings.model} | workspace={settings.workspace}")
+    set_hook_printer(terminal_print)
+
+    print(
+        f"Simple CC | model={settings.model} | "
+        f"workspace={settings.workspace}"
+    )
     print("Enter a question, press Enter to send. Type q to quit.\n")
     history = app.runtime.messages
     context = app.runtime.context
@@ -260,6 +403,13 @@ def main(argv: list[str] | None = None) -> int:
         daemon=True,
     )
     app.autorun_thread.start()
+    app.inbox_thread = threading.Thread(
+        target=lead_inbox_poll_loop,
+        args=(app.stop_event,),
+        name="simple-cc-lead-inbox",
+        daemon=True,
+    )
+    app.inbox_thread.start()
     try:
         while True:
             try:
@@ -308,6 +458,7 @@ def main(argv: list[str] | None = None) -> int:
             print()
     finally:
         app.close()
+        set_hook_printer(print)
         CLI_ACTIVE = False
     return 0
 

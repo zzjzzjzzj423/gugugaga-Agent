@@ -8,7 +8,7 @@ from pathlib import Path
 
 from . import config
 from .subagents import extract_text
-
+from .memory import MemoryStore
 
 client = None
 
@@ -38,34 +38,6 @@ class SkillStore:
         item = self._skills.get(name)
         return item[1].read_text(encoding="utf-8") if item else f"Error: unknown skill '{name}'"
 
-
-class MemoryStore:
-    def __init__(self, directory: Path):
-        self.directory = Path(directory)
-        self.directory.mkdir(parents=True, exist_ok=True)
-
-    def remember(self, title: str, content: str) -> str:
-        safe = re.sub(r"[^A-Za-z0-9_-]+", "-", title).strip("-") or uuid.uuid4().hex[:8]
-        path = self.directory / f"{safe}.md"
-        path.write_text(f"# {title}\n\n{content}\n", encoding="utf-8")
-        return f"Remembered {title}"
-
-    def search(self, query: str, limit: int = 5) -> str:
-        terms = query.lower().split()
-        hits = []
-        for path in self.directory.glob("*.md"):
-            text = path.read_text(encoding="utf-8")
-            score = sum(term in text.lower() for term in terms)
-            if score:
-                hits.append((score, text))
-        return "\n\n".join(text for _, text in sorted(hits, reverse=True)[:limit]) or "No matching memories."
-
-    def index_text(self, limit: int = 20, max_chars: int = 4_000) -> str:
-        entries = []
-        for path in sorted(self.directory.glob("*.md"))[:limit]:
-            body = path.read_text(encoding="utf-8").strip().replace("\n", " ")
-            entries.append(f"- {path.stem}: {body[:240]}")
-        return ("\n".join(entries)[:max_chars] if entries else "No memories.")
 
 
 class ContextManager:
@@ -185,51 +157,86 @@ def collect_tool_results(messages: list):
     return found
 
 
+def utf8_size(value: object) -> int:
+    """返回内容使用 UTF-8 编码后的真实字节数。"""
+    return len(str(value).encode("utf-8"))
+
+
 def persist_large_output(tool_use_id: str, output: str) -> str:
-    if len(output) <= config.PERSIST_THRESHOLD:
+    # PERSIST_THRESHOLD 现在按 UTF-8 字节数计算
+    if utf8_size(output) <= config.PERSIST_THRESHOLD:
         return output
+
     config.TOOL_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     path = config.TOOL_RESULTS_DIR / f"{tool_use_id}.txt"
+
     if not path.exists():
-        path.write_text(output)
+        path.write_text(output, encoding="utf-8")
+
     return (
-        f"<persisted-output>\nFull output: {path}\n"
-        f"Preview:\n{output[:2000]}\n</persisted-output>"
+        f"<persisted-output>\n"
+        f"Full output: {path}\n"
+        f"Preview:\n{output[:2000]}\n"
+        f"</persisted-output>"
     )
 
 
-def tool_result_budget(messages: list, max_bytes: int = 200_000) -> list:
+def tool_result_budget(
+    messages: list,
+    max_bytes: int = 200_000,
+) -> list:
     if not messages:
         return messages
+
     last = messages[-1]
     content = last.get("content")
+
     if last.get("role") != "user" or not isinstance(content, list):
         return messages
+
     blocks = [
-        (i, block)
-        for i, block in enumerate(content)
-        if isinstance(block, dict) and block.get("type") == "tool_result"
+        (index, block)
+        for index, block in enumerate(content)
+        if isinstance(block, dict)
+        and block.get("type") == "tool_result"
     ]
-    total = sum(len(str(block.get("content", ""))) for _, block in blocks)
-    if total <= max_bytes:
+
+    # 按 UTF-8 真实字节数统计
+    total_bytes = sum(
+        utf8_size(block.get("content", ""))
+        for _, block in blocks
+    )
+
+    if total_bytes <= max_bytes:
         return messages
-    for _, block in sorted(
+
+    # 优先把占用字节数最大的工具结果写入文件
+    sorted_blocks = sorted(
         blocks,
-        key=lambda pair: len(str(pair[1].get("content", ""))),
+        key=lambda pair: utf8_size(
+            pair[1].get("content", "")
+        ),
         reverse=True,
-    ):
-        if total <= max_bytes:
+    )
+
+    for _, block in sorted_blocks:
+        if total_bytes <= max_bytes:
             break
-        text = str(block.get("content", ""))
+
+        output = str(block.get("content", ""))
+
         block["content"] = persist_large_output(
-            block.get("tool_use_id", "unknown"), text
+            block.get("tool_use_id", "unknown"),
+            output,
         )
-        total = sum(
-            len(str(candidate.get("content", "")))
+
+        # 替换成路径和预览后，重新计算上下文占用
+        total_bytes = sum(
+            utf8_size(candidate.get("content", ""))
             for _, candidate in blocks
         )
-    return messages
 
+    return messages
 
 def snip_compact(messages: list, max_messages: int = 50) -> list:
     if len(messages) <= max_messages:
@@ -370,7 +377,9 @@ def update_context(context: dict, messages: list) -> dict:
 
     memories = ""
     if config.MEMORY_INDEX.exists():
-        memories = config.MEMORY_INDEX.read_text()[:2000]
+        memories = config.MEMORY_INDEX.read_text(encoding="utf-8")[
+            : config.MEMORY_INDEX_MAX_CHARS
+        ]
     return {
         "memories": memories,
         "active_teammates": list(active_teammates.keys()),

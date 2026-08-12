@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import copy
 import json
 import threading
 from typing import Any, Callable
@@ -24,11 +24,12 @@ from .cron import consume_cron_queue
 from .hooks import HookEvent, HookManager
 from .hooks import trigger_hooks
 from .models import ChatProvider, ToolCall, ToolSpec
+from .memory import MemoryStore
 from .permissions import PermissionPolicy
 from .prompts import PromptAssembler, assemble_system_prompt
 from .provider import ContextLengthError
 from .recovery import RecoveryState, is_prompt_too_long_error, with_retry
-from .subagents import has_tool_use
+from .subagents import extract_text, has_tool_use
 from .tools import (
     TOOL_DEFINITIONS,
     TOOL_HANDLERS,
@@ -155,7 +156,25 @@ def agent_loop(
     permissions = permissions or PermissionPolicy()
     state = RecoveryState()
     max_tokens = config.DEFAULT_MAX_TOKENS
+    memory_store = None
+    turn_prompt = ""
+    memory_snapshot = copy.deepcopy(messages)
+    relevant_memories = ""
+    memory_ready = False
 
+    if config.MEMORY_ENABLED and client is not None:
+        memory_store = MemoryStore(
+            config.MEMORY_DIR,
+            provider=client,
+            max_selected=config.MEMORY_MAX_SELECTED,
+            max_injected_chars=config.MEMORY_MAX_INJECTED_CHARS,
+            consolidate_threshold=config.MEMORY_CONSOLIDATE_THRESHOLD,
+            consolidate_target=config.MEMORY_CONSOLIDATE_TARGET,
+            consolidate_cooldown_seconds=(
+                config.MEMORY_CONSOLIDATE_COOLDOWN_SECONDS
+            ),
+        )
+        turn_prompt = memory_store.turn_prompt(messages)
     while True:
         fired = consume_cron_queue()
         for job in fired:
@@ -175,11 +194,37 @@ def agent_loop(
             )
             rounds_since_todo = 0
 
+        if memory_store is not None and not memory_ready:
+            # 这是压缩前快照，供本轮结束后的记忆提取使用。
+            memory_snapshot = copy.deepcopy(messages)
+            try:
+                relevant_memories = memory_store.load_relevant(memory_snapshot)
+            except Exception as error:
+                memory_store._warn(f"load failed: {error}")
+                relevant_memories = ""
+            memory_ready = True
+
         prepare_context(messages)
         context = update_context(context, messages)
 
         try:
-            response = call_llm(messages, context, tools, state, max_tokens)
+            # inject() 会深拷贝 messages，不会污染真实历史记录。
+            request_messages = (
+                memory_store.inject(
+                    messages,
+                    relevant_memories,
+                    target_text=turn_prompt,
+                )
+                if memory_store is not None
+                else messages
+            )
+            response = call_llm(
+                request_messages,
+                context,
+                tools,
+                state,
+                max_tokens,
+            )
         except Exception as error:
             if (
                 is_prompt_too_long_error(error)
@@ -227,6 +272,29 @@ def agent_loop(
         messages.append({"role": "assistant", "content": response.content})
         if not has_tool_use(response.content):
             trigger_hooks("Stop", messages)
+
+            # 只有真人触发且正常完成的回合才提取记忆。
+            # 错误、max_tokens、工具中间轮次、定时任务都不会进入这里保存。
+            if (
+                    memory_store is not None
+                    and turn_prompt
+                    and not turn_prompt.lstrip().startswith(
+                (
+                        "[Scheduled]",
+                        "<reminder>",
+                        "[Compacted]",
+                        "[Reactive compact]",
+                        "<task_notification>",
+                        "<teammate-message>",
+                )
+            )
+            ):
+                memory_store.extract(
+                    memory_snapshot,
+                    extract_text(response.content),
+                )
+                memory_store.consolidate_if_needed()
+
             return
 
         results = []

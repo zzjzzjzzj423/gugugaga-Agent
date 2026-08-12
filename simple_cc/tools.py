@@ -208,9 +208,11 @@ TOOL_DEFINITIONS: list[dict] = [
     {
         "name": "schedule_cron",
         "description": (
-            "Schedule a cron job. cron is 5-field: min hour dom month dow. "
-            "For one-shot reminders, compute the target minute and set "
-            "recurring=false."
+            "Schedule a future agent run. You must use this tool when the user "
+            "asks to execute work after a delay or at a future time; do not "
+            "perform the requested work immediately. cron uses five fields: "
+            "minute hour day-of-month month day-of-week. Compute relative times "
+            "from the current time. For one-shot work set recurring=false."
         ),
         "input_schema": {
             "type": "object",
