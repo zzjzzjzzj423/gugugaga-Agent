@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import config
+from . import config, context
 from .agent import SourceRuntime
 from .background import initialize_background_tasks, shutdown_background_tasks
 from .cron import shutdown_cron
@@ -48,6 +48,7 @@ class BenchmarkSession:
     runtime: SourceRuntime
     workspace: Path
     options: BenchmarkOptions
+    previous_context_client: Any = None
     _closed: bool = False
 
     def close(self, timeout: float = 5.0) -> BenchmarkCloseOutcome:
@@ -61,6 +62,7 @@ class BenchmarkSession:
         live.extend(f"teammate:{item}" for item in teammates.live_names)
         if not cron_stopped:
             live.append("cron")
+        context.client = self.previous_context_client
         return BenchmarkCloseOutcome(not live, tuple(live))
 
 
@@ -137,4 +139,6 @@ def build_benchmark_runtime(
         max_rounds=options.max_rounds,
         memory_enabled=options.memory_enabled,
     )
-    return BenchmarkSession(runtime, workspace, options)
+    previous_context_client = context.client
+    context.client = runtime.tracing_provider
+    return BenchmarkSession(runtime, workspace, options, previous_context_client)

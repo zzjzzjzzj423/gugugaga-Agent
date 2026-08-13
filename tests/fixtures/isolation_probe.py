@@ -15,6 +15,18 @@ def main():
     parser.add_argument("--sleep", type=float, default=0)
     args = parser.parse_args()
     task = json.loads(args.task_input.read_text(encoding="utf-8"))
+    state_names = (
+        ".memory",
+        ".transcripts",
+        ".mailboxes",
+        ".task_outputs",
+        "final_answer.txt",
+        "reference_answer.json",
+        "judge.json",
+    )
+    preexisting_state = [
+        name for name in state_names if (args.workspace / name).exists()
+    ]
     args.workspace.mkdir(parents=True, exist_ok=True)
     other_marker = args.run_dir.parent / "shared-marker.txt"
     visible = other_marker.exists()
@@ -28,6 +40,7 @@ def main():
         "worker_pid": os.getpid(),
         "agent_workspace": str(args.workspace.resolve()),
         "other_marker_visible": visible,
+        "preexisting_state": preexisting_state,
     }
     (args.run_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
 

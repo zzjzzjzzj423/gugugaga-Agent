@@ -203,6 +203,7 @@ class TraceRecorder:
             self._status = "running"
             self._started_monotonic = time.monotonic()
             self._manifest = {
+                **redact_value(metadata, self.secrets),
                 "schema_version": SCHEMA_VERSION,
                 "run_id": self.run_id,
                 "task_id": self._task_id,
@@ -211,7 +212,6 @@ class TraceRecorder:
                 "started_at": _utc_now(),
                 "ended_at": None,
                 "status": "running",
-                **redact_value(metadata, self.secrets),
             }
             try:
                 _atomic_json(self.manifest_path, self._manifest)
@@ -323,9 +323,13 @@ class TraceRecorder:
                 raise ValueError(f"manifest already terminal: {self._status}")
             if self._task_id is None:
                 raise ValueError("run has not started")
+            self.record(
+                "run_finalized",
+                {**(details or {}), "status": status},
+            )
             manifest = {
-                **self._manifest,
                 **redact_value(details or {}, self.secrets),
+                **self._manifest,
                 "ended_at": _utc_now(),
                 "status": status,
             }
@@ -382,6 +386,13 @@ def supervisor_finalize_manifest(
             "started_at": None,
             **redact_value(task_metadata),
         }
+    task_metadata = redact_value(task_metadata)
+    identity = {
+        "schema_version": SCHEMA_VERSION,
+        "run_id": task_metadata.get("run_id", manifest.get("run_id")),
+        "task_id": task_metadata.get("task_id", manifest.get("task_id")),
+    }
     manifest.update(redact_value(details or {}))
+    manifest.update(identity)
     manifest.update({"status": status, "ended_at": _utc_now()})
     _atomic_json(manifest_path, manifest)

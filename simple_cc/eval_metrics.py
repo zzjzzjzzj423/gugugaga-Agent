@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -30,10 +31,20 @@ class RunMetrics:
     core_completion_tokens: int | None
     all_in_prompt_tokens: int | None
     all_in_completion_tokens: int | None
+    cost: float | None
+    cost_currency: str | None
+    pricing_version: str | None
 
 
 def _manifest(run_dir: Path) -> dict[str, Any]:
     return json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+
+
+def read_trajectory(run_dir: Path | str) -> tuple[list[dict[str, Any]], bool]:
+    path = Path(run_dir)
+    if path.is_dir():
+        path = path / "trajectory.jsonl"
+    return read_trace_lines(path)
 
 
 def validate_trace(run_dir: Path | str) -> tuple[bool, list[str]]:
@@ -44,7 +55,7 @@ def validate_trace(run_dir: Path | str) -> tuple[bool, list[str]]:
     except Exception as error:
         return False, [f"manifest: {type(error).__name__}"]
     try:
-        rows, incomplete = read_trace_lines(run_dir / "trajectory.jsonl")
+        rows, incomplete = read_trajectory(run_dir)
     except Exception as error:
         return False, [f"trajectory: {type(error).__name__}"]
     if incomplete:
@@ -72,6 +83,11 @@ def validate_trace(run_dir: Path | str) -> tuple[bool, list[str]]:
         _check_artifacts(run_dir, row.get("payload"), errors)
     if manifest.get("status") not in TERMINAL_STATUSES:
         errors.append("manifest has no terminal status")
+    terminal = [row for row in rows if row.get("event_type") == "run_finalized"]
+    if not terminal:
+        errors.append("trajectory has no terminal event")
+    elif terminal[-1].get("payload", {}).get("status") != manifest.get("status"):
+        errors.append("terminal event status mismatch")
     return not errors, errors
 
 
@@ -117,16 +133,59 @@ def _repeat_rate(values: list[str]) -> float | None:
     return repeats / len(normalized)
 
 
-def derive_metrics(run_dir: Path | str) -> RunMetrics:
+def _calculate_cost(
+    rows: list[dict[str, Any]],
+    manifest: dict[str, Any],
+    pricing: dict[str, Any] | None,
+) -> tuple[float | None, str | None, str | None]:
+    if not isinstance(pricing, dict):
+        return None, None, None
+    version = pricing.get("version")
+    currency = pricing.get("currency")
+    models = pricing.get("models")
+    if not isinstance(version, str) or not version:
+        return None, None, None
+    if not isinstance(currency, str) or not currency:
+        return None, None, version
+    if not isinstance(models, dict):
+        return None, currency, version
+    total = 0.0
+    for row in rows:
+        if row.get("event_type") != "llm_response":
+            continue
+        payload = row.get("payload", {})
+        model = payload.get("model") or manifest.get("model")
+        usage = payload.get("usage", {})
+        prompt = usage.get("prompt_tokens")
+        completion = usage.get("completion_tokens")
+        rate = models.get(model) if model else None
+        if prompt is None or completion is None or not isinstance(rate, dict):
+            return None, currency, version
+        effective_date = rate.get("effective_date")
+        try:
+            date.fromisoformat(effective_date)
+            input_rate = float(rate["input_per_million"])
+            output_rate = float(rate["output_per_million"])
+        except (TypeError, ValueError, KeyError):
+            return None, currency, version
+        total += int(prompt) * input_rate / 1_000_000
+        total += int(completion) * output_rate / 1_000_000
+    return total, currency, version
+
+
+def derive_metrics(
+    run_dir: Path | str, *, pricing: dict[str, Any] | None = None
+) -> RunMetrics:
     run_dir = Path(run_dir)
     valid, _errors = validate_trace(run_dir)
     manifest = _manifest(run_dir)
-    rows, _incomplete = read_trace_lines(run_dir / "trajectory.jsonl")
+    rows, _incomplete = read_trajectory(run_dir)
     llm = [row for row in rows if row.get("event_type") == "llm_response"]
     tool_results = [row for row in rows if row.get("event_type") == "tool_result"]
     searches = [row for row in rows if row.get("event_type") == "search_result"]
     sources = [row for row in rows if row.get("event_type") == "source_registered"]
     rejected = [row for row in rows if row.get("event_type") == "source_rejected"]
+    tool_errors = [row for row in rows if row.get("event_type") == "tool_error"]
     tool_names = [
         row.get("payload", {}).get("tool_name")
         for row in rows
@@ -143,6 +202,7 @@ def derive_metrics(run_dir: Path | str) -> RunMetrics:
     }
     domains.discard(None)
     last_elapsed = rows[-1].get("elapsed_ms") if rows else None
+    cost, currency, pricing_version = _calculate_cost(rows, manifest, pricing)
     return RunMetrics(
         status=manifest.get("status", "unknown"),
         trace_valid=valid,
@@ -152,7 +212,7 @@ def derive_metrics(run_dir: Path | str) -> RunMetrics:
         searches=len(searches),
         fetches=tool_names.count("web_fetch"),
         documents=tool_names.count("pdf_fetch"),
-        tool_failures=sum(
+        tool_failures=len(tool_errors) + sum(
             not row.get("payload", {}).get("success", False) for row in tool_results
         ),
         repeated_query_rate=_repeat_rate(
@@ -179,4 +239,7 @@ def derive_metrics(run_dir: Path | str) -> RunMetrics:
         ),
         all_in_prompt_tokens=_sum_usage(rows, None, "prompt_tokens"),
         all_in_completion_tokens=_sum_usage(rows, None, "completion_tokens"),
+        cost=cost,
+        cost_currency=currency,
+        pricing_version=pricing_version,
     )

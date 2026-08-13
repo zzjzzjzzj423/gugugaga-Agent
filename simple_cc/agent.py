@@ -124,6 +124,7 @@ class SourceRuntime:
         self.context: dict[str, Any] = update_context({}, [])
         self.last_outcome: AgentLoopOutcome | None = None
         self.registered_sources: dict[str, str] = {}
+        self.todo_state = {"rounds_since_todo": 0}
 
     @staticmethod
     def _turn_text(messages: list[dict[str, Any]], turn_start: int) -> str:
@@ -188,6 +189,7 @@ class SourceRuntime:
                         memory_enabled=self.memory_enabled,
                         run_context=run,
                         registered_sources=self.registered_sources,
+                        todo_state=self.todo_state,
                     )
                 self.last_outcome = outcome
                 if outcome.status == "completed":
@@ -218,6 +220,7 @@ class SourceRuntime:
                     handlers=self.tool_handlers,
                     max_rounds=self.max_rounds,
                     memory_enabled=self.memory_enabled,
+                    todo_state=self.todo_state,
                 )
                 self.last_outcome = outcome
             self.context = update_context(self.context, self.messages)
@@ -261,6 +264,7 @@ def agent_loop(
     memory_enabled: bool | None = None,
     run_context: RunContext | None = None,
     registered_sources: dict[str, str] | None = None,
+    todo_state: dict[str, int] | None = None,
 ) -> AgentLoopOutcome:
     global rounds_since_todo
     tools = tools if tools is not None else TOOL_DEFINITIONS
@@ -318,14 +322,22 @@ def agent_loop(
 
         inject_background_notifications(messages)
 
-        if rounds_since_todo >= 3:
+        todo_rounds = (
+            todo_state["rounds_since_todo"]
+            if todo_state is not None
+            else rounds_since_todo
+        )
+        if todo_rounds >= 3:
             messages.append(
                 {
                     "role": "user",
                     "content": "<reminder>Update your todos.</reminder>",
                 }
             )
-            rounds_since_todo = 0
+            if todo_state is not None:
+                todo_state["rounds_since_todo"] = 0
+            else:
+                rounds_since_todo = 0
 
         if memory_store is not None and not memory_ready:
             # 这是压缩前快照，供本轮结束后的记忆提取使用。
@@ -477,6 +489,16 @@ def agent_loop(
                             "required_cutoff": run_context.cutoff,
                             "supplied_cutoff": block.input.get("cutoff"),
                             "error": str(error),
+                        },
+                        span_id=span_id,
+                        agent_id=run_context.agent_id,
+                    )
+                    run_context.recorder.record(
+                        "tool_result",
+                        {
+                            "success": False,
+                            "error_code": "cutoff_mismatch",
+                            "message": str(error),
                         },
                         span_id=span_id,
                         agent_id=run_context.agent_id,
@@ -642,25 +664,14 @@ def agent_loop(
                     agent_id=run_context.agent_id,
                 )
             started = time.monotonic()
+            tool_error = None
             try:
                 with bind_tool_capture(capture):
                     output = call_tool_handler(
                         handler, arguments, block.name, capture=capture
                     )
             except Exception as error:
-                if run_context is not None:
-                    run_context.recorder.record(
-                        "tool_error",
-                        {
-                            "exception_class": type(error).__name__,
-                            "message": str(error),
-                            "latency_ms": round(
-                                (time.monotonic() - started) * 1000, 3
-                            ),
-                        },
-                        span_id=span_id,
-                        agent_id=run_context.agent_id,
-                    )
+                tool_error = error
                 output = f"Error: {type(error).__name__}: {error}"
             if run_context is not None:
                 output_ref = run_context.recorder.store_artifact(
@@ -673,37 +684,56 @@ def agent_loop(
                     if str(output).lstrip().startswith(("{", "["))
                     else ".txt",
                 )
-                run_context.recorder.record(
-                    "tool_result",
-                    {
-                        "success": not str(output).startswith("Error:"),
-                        "latency_ms": round(
-                            (time.monotonic() - started) * 1000, 3
-                        ),
-                        "output_artifact": output_ref.as_dict(),
-                        "raw_artifacts": [
-                            item.as_dict() for item in (capture.artifacts if capture else [])
-                        ],
-                    },
-                    span_id=span_id,
-                    agent_id=run_context.agent_id,
-                )
-                record_research_evidence(
-                    run_context,
-                    block.name,
-                    str(output),
-                    output_artifact=output_ref,
-                    raw_artifacts=capture.artifacts if capture else [],
-                    span_id=span_id,
-                    registered_sources=registered_sources,
-                )
+                terminal_payload = {
+                    "latency_ms": round(
+                        (time.monotonic() - started) * 1000, 3
+                    ),
+                    "output_artifact": output_ref.as_dict(),
+                    "raw_artifacts": [
+                        item.as_dict()
+                        for item in (capture.artifacts if capture else [])
+                    ],
+                }
+                if tool_error is not None:
+                    run_context.recorder.record(
+                        "tool_error",
+                        {
+                            **terminal_payload,
+                            "exception_class": type(tool_error).__name__,
+                            "message": str(tool_error),
+                        },
+                        span_id=span_id,
+                        agent_id=run_context.agent_id,
+                    )
+                else:
+                    run_context.recorder.record(
+                        "tool_result",
+                        {**terminal_payload, "success": True},
+                        span_id=span_id,
+                        agent_id=run_context.agent_id,
+                    )
+                    record_research_evidence(
+                        run_context,
+                        block.name,
+                        str(output),
+                        output_artifact=output_ref,
+                        raw_artifacts=capture.artifacts if capture else [],
+                        span_id=span_id,
+                        registered_sources=registered_sources,
+                    )
             trigger_hooks("PostToolUse", block, output)
             print(str(output)[:300])
 
             if block.name == "todo_write":
-                rounds_since_todo = 0
+                if todo_state is not None:
+                    todo_state["rounds_since_todo"] = 0
+                else:
+                    rounds_since_todo = 0
             else:
-                rounds_since_todo += 1
+                if todo_state is not None:
+                    todo_state["rounds_since_todo"] += 1
+                else:
+                    rounds_since_todo += 1
 
             results.append(
                 {

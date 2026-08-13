@@ -5,6 +5,7 @@ import json
 import pytest
 
 from simple_cc.trace import (
+    SCHEMA_VERSION,
     TraceRecorder,
     TraceWriteError,
     read_trace_lines,
@@ -110,3 +111,51 @@ def test_record_failure_is_fail_closed(tmp_path, monkeypatch):
     monkeypatch.setattr(recorder, "_append_line", fail)
     with pytest.raises(TraceWriteError, match="disk unavailable"):
         recorder.record("tool_started", {"name": "x"})
+
+
+def test_manifest_identity_and_running_status_cannot_be_overridden(tmp_path):
+    recorder = TraceRecorder(tmp_path / "run", run_id="actual-run")
+    recorder.start_run(
+        task_id="actual-task",
+        question="q",
+        cutoff=None,
+        metadata={
+            "run_id": "forged-run",
+            "task_id": "forged-task",
+            "status": "completed",
+            "schema_version": "forged",
+        },
+    )
+
+    manifest = json.loads(recorder.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["run_id"] == "actual-run"
+    assert manifest["task_id"] == "actual-task"
+    assert manifest["status"] == "running"
+    assert manifest["schema_version"] == SCHEMA_VERSION
+
+    recorder.finalize(
+        "failed",
+        {
+            "run_id": "forged-final-run",
+            "task_id": "forged-final-task",
+            "schema_version": "forged-final",
+        },
+    )
+    manifest = json.loads(recorder.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["run_id"] == "actual-run"
+    assert manifest["task_id"] == "actual-task"
+    assert manifest["schema_version"] == SCHEMA_VERSION
+
+
+def test_supervisor_details_cannot_override_parent_owned_identity(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    supervisor_finalize_manifest(
+        run_dir,
+        "trace_invalid",
+        {"run_id": "actual-run", "task_id": "actual-task"},
+        {"run_id": "forged-run", "task_id": "forged-task"},
+    )
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["run_id"] == "actual-run"
+    assert manifest["task_id"] == "actual-task"

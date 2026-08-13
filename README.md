@@ -65,6 +65,52 @@ python -m compileall simple_cc
 python -m simple_cc --help
 ```
 
+## 金融 Agent benchmark 评测
+
+数据集使用 JSONL，每行至少包含 `task_id`、`question`，可选字段包括
+`cutoff`、`benchmark` 和 `task_type`。以下命令分别运行 20 题试验集和
+400 题公开集：
+
+```powershell
+python -m eval.run_benchmark --dataset eval/data/financegym_20.jsonl --workers 2
+python -m eval.run_benchmark --dataset eval/data/benchmark_400_public.jsonl --workers 4 --resume
+```
+
+每道题由一个全新的 Python 进程执行，并使用独立且初始为空的 workspace。
+benchmark 默认关闭 memory、cron、team、subagent 和交互式授权；文件工具不能
+越出 workspace，shell 因没有人工授权回调而拒绝执行。上一题的对话、搜索结果、
+缓存、工作文件、后台任务、答案和评测文件都不会注入下一题。
+
+默认输出位于 `eval/runs`，目录结构如下：
+
+```text
+eval/runs/<run_id>/
+├── task_input.json
+├── manifest.json
+├── trajectory.jsonl
+├── final_answer.txt          # 只有成功完成时存在
+├── artifacts/                # 按 SHA-256 命名并去重
+└── agent_workspace/          # Agent 唯一可见的文件工作区
+```
+
+`trajectory.jsonl` 是即时 `fsync` 的追加式事件流，记录模型请求/响应、Token、
+重试次数、模型及工具时延、工具输入输出、cutoff 决策、来源注册和最终引用关联。
+较大的请求、响应、抓取正文和 PDF 放入 `artifacts/`，事件只保存相对路径、
+SHA-256、媒体类型和字节数。若任一成功模型调用没有返回 usage，相应核心或全量
+Token 指标为 `null`，不会把未知值当作 0。
+
+终态包括 `completed`、`failed`、`max_rounds`、`cancelled`、`timed_out`、
+`worker_crashed` 和 `trace_invalid`。只有 Agent 正常结束、资源清理完成、最终答案
+落盘且 manifest 原子更新后才是 `completed`。超时由父进程终止整个子进程树；
+崩溃和超时不会生成成功答案。使用 `--resume` 时，已完成题目会跳过；未完成题目
+会创建新的 `run_id` 和目录，并在 `task_input.json`/manifest 中记录
+`retry_of_run_id`，不会覆盖旧尝试。
+
+PIT 模式固定披露为 `non_strict_live_web`。`cutoff` 会被强制注入搜索、网页抓取
+和 PDF 工具，冲突的 cutoff 会被拒绝，明确晚于 cutoff 的正文不会进入模型可见
+artifact。但是搜索引擎的 `before:` 仅是实时搜索提示，不能证明网页在历史时点
+已经可见，因此这不是冻结语料或严格历史回放，不能宣称为 strict PIT。
+
 ## 对话内网页检索
 
 `simple_cc` 在原有对话循环中提供 `web_search` 和 `web_fetch`。不需要单独

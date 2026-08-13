@@ -33,6 +33,7 @@ def test_runner_launches_fresh_process_and_workspace_per_task(tmp_path):
     assert len({item["worker_pid"] for item in manifests}) == 2
     assert len({item["agent_workspace"] for item in manifests}) == 2
     assert not any(item["other_marker_visible"] for item in manifests)
+    assert not any(item["preexisting_state"] for item in manifests)
 
 
 def test_runner_timeout_never_becomes_completed(tmp_path):
@@ -48,6 +49,21 @@ def test_runner_timeout_never_becomes_completed(tmp_path):
     assert results[0].manifest["status"] == "timed_out"
 
 
+def test_trace_writer_exit_code_is_classified_as_trace_invalid(tmp_path):
+    result = run_benchmark(
+        RunnerOptions(
+            _dataset(tmp_path, 1),
+            tmp_path / "runs",
+            workers=1,
+            timeout_seconds=10,
+        ),
+        worker_command=[sys.executable, "-c", "raise SystemExit(2)"],
+    )[0]
+
+    assert result.exit_code == 2
+    assert result.manifest["status"] == "trace_invalid"
+
+
 def test_resume_skips_completed_and_retry_links_incomplete(tmp_path):
     output = tmp_path / "runs"
     options = RunnerOptions(_dataset(tmp_path, 1), output, workers=1, timeout_seconds=10)
@@ -61,3 +77,32 @@ def test_resume_skips_completed_and_retry_links_incomplete(tmp_path):
     )[0]
     assert resumed.run_id == first.run_id
     assert resumed.skipped is True
+
+
+def test_resume_retries_failed_run_without_overwriting_prior_attempt(tmp_path):
+    output = tmp_path / "runs"
+    dataset = _dataset(tmp_path, 1)
+    failed = run_benchmark(
+        RunnerOptions(dataset, output, workers=1, timeout_seconds=0.1),
+        worker_command=[
+            sys.executable,
+            "tests/fixtures/isolation_probe.py",
+            "--sleep",
+            "2",
+        ],
+    )[0]
+    retried = run_benchmark(
+        RunnerOptions(
+            dataset, output, workers=1, timeout_seconds=10, resume=True
+        ),
+        worker_command=[sys.executable, "tests/fixtures/isolation_probe.py"],
+    )[0]
+    task_input = json.loads(
+        (retried.run_dir / "task_input.json").read_text(encoding="utf-8")
+    )
+
+    assert failed.manifest["status"] == "timed_out"
+    assert retried.manifest["status"] == "completed"
+    assert retried.run_id != failed.run_id
+    assert task_input["retry_of_run_id"] == failed.run_id
+    assert (failed.run_dir / "manifest.json").exists()

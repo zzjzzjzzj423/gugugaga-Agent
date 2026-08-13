@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import pytest
 
+from simple_cc import context
 from simple_cc.benchmark import (
     BenchmarkOptions,
     build_benchmark_runtime,
     validate_clean_workspace,
 )
 from simple_cc.models import ModelResponse
+from simple_cc.models import ToolCall
 from simple_cc.trace import TraceRecorder
 from tests.fakes import ScriptedProvider
+from simple_cc.workspace import run_glob, run_read
 
 
 def test_validate_clean_workspace_rejects_dirty_or_outside_paths(tmp_path):
@@ -57,6 +60,31 @@ def test_benchmark_runtime_filters_stateful_tools_and_disables_memory(tmp_path):
         )
         assert session.runtime.memory_enabled is False
         assert session.runtime.approval_callback is None
+        assert context.client is session.runtime.tracing_provider
     finally:
         outcome = session.close()
     assert outcome.stopped is True
+
+
+def test_benchmark_file_tools_cannot_read_evaluation_files_and_shell_is_denied(
+    tmp_path
+):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "reference_answer.json").write_text("secret", encoding="utf-8")
+    workspace = run_dir / "agent_workspace"
+    recorder = TraceRecorder(run_dir, run_id="run-1")
+    recorder.start_run(task_id="task-1", question="q", cutoff=None, metadata={})
+    session = build_benchmark_runtime(
+        run_dir=run_dir,
+        workspace=workspace,
+        provider=ScriptedProvider([ModelResponse("done")]),
+        recorder=recorder,
+    )
+    try:
+        assert run_read("../reference_answer.json").startswith("Error:")
+        assert "reference_answer" not in run_glob("../*")
+        shell_call = ToolCall("shell-1", "bash", {"command": "dir .."})
+        assert session.runtime.permissions.approve(shell_call, None) is False
+    finally:
+        session.close()

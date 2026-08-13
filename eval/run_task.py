@@ -232,7 +232,7 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     task = load_task_input(args.task_input)
-    settings = Settings.from_env(args.workspace)
+    settings = Settings.from_env(args.workspace, create_dirs=False)
     provider = SiliconFlowProvider(settings)
     return execute_task(
         task,

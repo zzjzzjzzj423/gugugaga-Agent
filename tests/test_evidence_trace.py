@@ -12,7 +12,7 @@ from simple_cc.evidence import (
     prepare_research_arguments,
 )
 from simple_cc.models import ModelResponse, ToolCall
-from simple_cc.trace import TraceRecorder
+from simple_cc.trace import TraceRecorder, read_trace_lines
 from tests.fakes import ScriptedProvider
 
 
@@ -114,3 +114,99 @@ def test_source_runtime_traces_tool_and_injects_cutoff(tmp_path, monkeypatch):
     assert "tool_started" in event_types
     assert "tool_result" in event_types
     assert event_types[-1] == "final_answer"
+
+
+def test_tool_exception_has_exactly_one_terminal_trace_event(tmp_path):
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                "",
+                [ToolCall("tool-1", "explode", {})],
+                "tool_calls",
+            ),
+            ModelResponse("done", [], "stop"),
+        ]
+    )
+
+    def explode():
+        raise RuntimeError("boom")
+
+    recorder = TraceRecorder(tmp_path / "run", run_id="run-error")
+    recorder.start_run(
+        task_id="task-error", question="test", cutoff=None, metadata={}
+    )
+    runtime = agent.SourceRuntime(
+        provider,
+        recorder=recorder,
+        tool_definitions=[
+            {
+                "name": "explode",
+                "description": "fail",
+                "input_schema": {"type": "object", "properties": {}},
+            }
+        ],
+        tool_handlers={"explode": explode},
+        memory_enabled=False,
+    )
+    runtime.run_turn("test", task_id="task-error", cutoff=None)
+
+    rows, incomplete = read_trace_lines(recorder.trajectory_path)
+    terminal = [
+        row["event_type"]
+        for row in rows
+        if row.get("span_id")
+        and row["event_type"] in {"tool_error", "tool_result"}
+    ]
+    assert incomplete is False
+    assert terminal == ["tool_error"]
+
+
+def test_cutoff_mismatch_is_a_failed_terminal_tool_result(tmp_path):
+    called = False
+
+    def fetch(**arguments):
+        nonlocal called
+        called = True
+        return "should not run"
+
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                "",
+                [
+                    ToolCall(
+                        "fetch-1",
+                        "web_fetch",
+                        {
+                            "url": "https://example.com/report",
+                            "cutoff": "2025-05-02",
+                        },
+                    )
+                ],
+                "tool_calls",
+            ),
+            ModelResponse("done", [], "stop"),
+        ]
+    )
+    recorder = TraceRecorder(tmp_path / "run", run_id="run-cutoff")
+    recorder.start_run(
+        task_id="task-cutoff", question="test", cutoff="2025-05-01", metadata={}
+    )
+    runtime = agent.SourceRuntime(
+        provider,
+        recorder=recorder,
+        tool_definitions=[
+            {"name": "web_fetch", "description": "fetch", "input_schema": {}}
+        ],
+        tool_handlers={"web_fetch": fetch},
+        memory_enabled=False,
+    )
+
+    runtime.run_turn("test", task_id="task-cutoff", cutoff="2025-05-01")
+    rows, _ = read_trace_lines(recorder.trajectory_path)
+    results = [row for row in rows if row["event_type"] == "tool_result"]
+
+    assert called is False
+    assert len(results) == 1
+    assert results[0]["payload"]["success"] is False
+    assert results[0]["payload"]["error_code"] == "cutoff_mismatch"

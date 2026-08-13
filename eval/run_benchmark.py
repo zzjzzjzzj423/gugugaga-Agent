@@ -195,9 +195,12 @@ def launch_assignment(
             except Exception:
                 current = None
         if not current or current.get("status") == "running":
+            failure_status = (
+                "trace_invalid" if process.returncode == 2 else "worker_crashed"
+            )
             supervisor_finalize_manifest(
                 assignment.run_dir,
-                "worker_crashed",
+                failure_status,
                 {"run_id": assignment.run_id, "task_id": assignment.task["task_id"]},
                 {"worker_pid": process.pid, "exit_code": process.returncode},
             )

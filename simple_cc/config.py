@@ -88,10 +88,15 @@ class Settings:
 
     @classmethod
     def from_env(
-        cls, workspace: Path | str, model_override: str | None = None
+        cls,
+        workspace: Path | str,
+        model_override: str | None = None,
+        *,
+        create_dirs: bool = True,
     ) -> "Settings":
         workspace_path = Path(workspace).expanduser().resolve()
-        workspace_path.mkdir(parents=True, exist_ok=True)
+        if create_dirs:
+            workspace_path.mkdir(parents=True, exist_ok=True)
         api_key = os.getenv("SILICONFLOW_API_KEY", "").strip()
         model = (model_override or os.getenv("SILICONFLOW_MODEL", "")).strip()
         if not api_key:
@@ -107,9 +112,10 @@ class Settings:
             "outputs_dir": state / "outputs",
             "skills_dir": state / "skills",
         }
-        state.mkdir(parents=True, exist_ok=True)
-        for path in paths.values():
-            path.mkdir(parents=True, exist_ok=True)
+        if create_dirs:
+            state.mkdir(parents=True, exist_ok=True)
+            for path in paths.values():
+                path.mkdir(parents=True, exist_ok=True)
         return cls(
             workspace=workspace_path,
             state_dir=state,
