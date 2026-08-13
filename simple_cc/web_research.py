@@ -10,6 +10,8 @@ from html import unescape
 from typing import Any
 from urllib.parse import urljoin, urlsplit
 
+from .telemetry import capture_tool_artifact
+
 
 SEARCH_LIMIT_DEFAULT = 5
 SEARCH_LIMIT_MAX = 10
@@ -380,7 +382,14 @@ def web_fetch(url: str, cutoff: str | None = None) -> str:
             }
         )
 
+    capture_tool_artifact(
+        html,
+        media_type=content_type.split(";", 1)[0],
+        source=final_url,
+        suffix=".txt" if content_type.startswith("text/plain") else ".html",
+    )
     content = _extract_content(html, content_type)
+    original_content_chars = len(content)
     truncated = len(content) > MAX_CONTENT_CHARS
     content = content[:MAX_CONTENT_CHARS]
     date_status = "verified" if published_at is not None else "unknown"
@@ -394,6 +403,8 @@ def web_fetch(url: str, cutoff: str | None = None) -> str:
         "date_status": date_status,
         "pit_mode": PIT_MODE,
         "content": content,
+        "content_chars_original": original_content_chars,
+        "content_chars_visible": len(content),
         "truncated": truncated,
     }
     if published_at is None:

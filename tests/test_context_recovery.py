@@ -220,3 +220,21 @@ def test_compact_tool_has_a_fixed_dispatch_placeholder_for_agent_loop_handling()
     assert TOOL_HANDLERS["compact"](focus="preserve test failures") == (
         "[Compaction requested.]"
     )
+def test_prepare_context_reports_proactive_compaction(tmp_path, monkeypatch):
+    from simple_cc import config, context
+
+    old_workspace = config.WORKDIR
+    config.configure_workspace(tmp_path)
+    monkeypatch.setattr(config, "CONTEXT_LIMIT", 10)
+    monkeypatch.setattr(context, "summarize_history", lambda messages: "summary")
+    reports = []
+    messages = [{"role": "user", "content": "x" * 100}]
+    try:
+        context.prepare_context(messages, on_compaction=reports.append)
+    finally:
+        config.configure_workspace(old_workspace)
+
+    assert reports[0].method == "proactive"
+    assert reports[0].original_message_count == 1
+    assert reports[0].retained_message_count == 1
+    assert reports[0].transcript_path.endswith(".jsonl")

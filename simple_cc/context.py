@@ -4,13 +4,25 @@ import json
 import re
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from . import config
 from .subagents import extract_text
 from .memory import MemoryStore
 
 client = None
+
+
+@dataclass(frozen=True)
+class CompactionReport:
+    method: str
+    original_message_count: int
+    retained_message_count: int
+    original_chars: int
+    retained_chars: int
+    transcript_path: str
 
 
 class SkillStore:
@@ -305,14 +317,39 @@ def summarize_history(messages: list) -> str:
     return extract_text(response.content) or "(empty summary)"
 
 
-def compact_history(messages: list) -> list:
+def compact_history(
+    messages: list,
+    *,
+    on_compaction: Callable[[CompactionReport], None] | None = None,
+    method: str = "manual",
+) -> list:
+    original_count = len(messages)
+    original_chars = estimate_size(messages)
     transcript = write_transcript(messages)
     print(f"  \033[36m[compact] transcript saved: {transcript}\033[0m")
     summary = summarize_history(messages)
-    return [{"role": "user", "content": f"[Compacted]\n\n{summary}"}]
+    retained = [{"role": "user", "content": f"[Compacted]\n\n{summary}"}]
+    if on_compaction is not None:
+        on_compaction(
+            CompactionReport(
+                method,
+                original_count,
+                len(retained),
+                original_chars,
+                estimate_size(retained),
+                str(transcript),
+            )
+        )
+    return retained
 
 
-def reactive_compact(messages: list) -> list:
+def reactive_compact(
+    messages: list,
+    *,
+    on_compaction: Callable[[CompactionReport], None] | None = None,
+) -> list:
+    original_count = len(messages)
+    original_chars = estimate_size(messages)
     transcript = write_transcript(messages)
     print(
         f"  \033[31m[reactive compact] transcript saved: {transcript}\033[0m"
@@ -331,19 +368,37 @@ def reactive_compact(messages: list) -> list:
         summary = (
             "Earlier conversation was trimmed after a prompt-too-long error."
         )
-    return [
+    retained = [
         {"role": "user", "content": f"[Reactive compact]\n\n{summary}"},
         *messages[tail_start:],
     ]
+    if on_compaction is not None:
+        on_compaction(
+            CompactionReport(
+                "reactive",
+                original_count,
+                len(retained),
+                original_chars,
+                estimate_size(retained),
+                str(transcript),
+            )
+        )
+    return retained
 
 
-def prepare_context(messages: list) -> list:
+def prepare_context(
+    messages: list,
+    *,
+    on_compaction: Callable[[CompactionReport], None] | None = None,
+) -> list:
     """Run every model turn through S20's layered context budget."""
     messages[:] = tool_result_budget(messages)
     messages[:] = snip_compact(messages)
     messages[:] = micro_compact(messages)
     if estimate_size(messages) > config.CONTEXT_LIMIT:
-        messages[:] = compact_history(messages)
+        messages[:] = compact_history(
+            messages, on_compaction=on_compaction, method="proactive"
+        )
     return messages
 
 

@@ -8,6 +8,7 @@ from typing import Any
 from urllib.parse import urljoin
 
 from . import web_research
+from .telemetry import capture_tool_artifact
 
 
 PDF_PAGE_COUNT_DEFAULT = 10
@@ -252,6 +253,18 @@ def pdf_fetch(
                 url=final_url,
                 total_pages=total_pages,
             )
+        capture_tool_artifact(
+            data,
+            media_type="application/pdf",
+            source=final_url,
+            suffix=".pdf",
+        )
+        capture_tool_artifact(
+            pages,
+            media_type="application/json",
+            source=f"{final_url}#pages={start_page}-{end_page}",
+            suffix=".json",
+        )
         payload: dict[str, Any] = {
             "ok": True,
             "operation": "pdf_fetch",

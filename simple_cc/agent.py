@@ -2,6 +2,9 @@ from __future__ import annotations
 import copy
 import json
 import threading
+import time
+import uuid
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from . import config
@@ -25,11 +28,19 @@ from .hooks import HookEvent, HookManager
 from .hooks import trigger_hooks
 from .models import ChatProvider, ToolCall, ToolSpec
 from .memory import MemoryStore
-from .permissions import PermissionPolicy
+from .permissions import PermissionDecision, PermissionPolicy
 from .prompts import PromptAssembler, assemble_system_prompt
 from .provider import ContextLengthError
 from .recovery import RecoveryState, is_prompt_too_long_error, with_retry
 from .subagents import extract_text, has_tool_use
+from .evidence import (
+    CutoffMismatch,
+    link_final_answer_sources,
+    prepare_research_arguments,
+    record_research_evidence,
+)
+from .telemetry import ToolCapture, TracingProvider, bind_tool_capture
+from .trace import RunContext, TraceRecorder, bind_run_context
 from .tools import (
     TOOL_DEFINITIONS,
     TOOL_HANDLERS,
@@ -46,6 +57,14 @@ agent_lock = threading.Lock()
 class FixedToolRegistry:
     """Read-only compatibility view over the fixed S01-S17 tables."""
 
+    def __init__(
+        self,
+        definitions: list[dict[str, Any]] | None = None,
+        handlers: dict[str, Callable] | None = None,
+    ):
+        self.definitions = definitions if definitions is not None else TOOL_DEFINITIONS
+        self.handlers = handlers if handlers is not None else TOOL_HANDLERS
+
     def specs(self) -> list[ToolSpec]:
         return [
             ToolSpec(
@@ -53,13 +72,21 @@ class FixedToolRegistry:
                 definition["description"],
                 definition["input_schema"],
             )
-            for definition in TOOL_DEFINITIONS
+            for definition in self.definitions
         ]
 
     def execute(self, name: str, arguments: dict[str, Any]) -> str:
         return str(
-            call_tool_handler(TOOL_HANDLERS.get(name), arguments, name)
+            call_tool_handler(self.handlers.get(name), arguments, name)
         )
+
+
+@dataclass(frozen=True)
+class AgentLoopOutcome:
+    status: str
+    final_text: str
+    failure_class: str | None = None
+    failure_message: str | None = None
 
 
 class SourceRuntime:
@@ -70,13 +97,32 @@ class SourceRuntime:
         provider: ChatProvider,
         permissions: PermissionPolicy | None = None,
         approval_callback: Callable[[ToolCall], bool] | None = None,
+        *,
+        recorder: TraceRecorder | None = None,
+        tool_definitions: list[dict[str, Any]] | None = None,
+        tool_handlers: dict[str, Callable] | None = None,
+        max_rounds: int = 40,
+        memory_enabled: bool | None = None,
     ):
-        self.provider = provider
+        self.provider = TracingProvider(provider)
         self.permissions = permissions or PermissionPolicy()
         self.approval_callback = approval_callback
-        self.registry = FixedToolRegistry()
+        self.recorder = recorder
+        self.tool_definitions = (
+            tool_definitions if tool_definitions is not None else TOOL_DEFINITIONS
+        )
+        self.tool_handlers = (
+            tool_handlers if tool_handlers is not None else TOOL_HANDLERS
+        )
+        self.max_rounds = max_rounds
+        self.memory_enabled = (
+            config.MEMORY_ENABLED if memory_enabled is None else memory_enabled
+        )
+        self.registry = FixedToolRegistry(self.tool_definitions, self.tool_handlers)
         self.messages: list[dict[str, Any]] = []
         self.context: dict[str, Any] = update_context({}, [])
+        self.last_outcome: AgentLoopOutcome | None = None
+        self.registered_sources: dict[str, str] = {}
 
     @staticmethod
     def _turn_text(messages: list[dict[str, Any]], turn_start: int) -> str:
@@ -108,17 +154,71 @@ class SourceRuntime:
             "tools": ", ".join(spec.name for spec in self.registry.specs()),
         }
 
-    def run_turn(self, query: str) -> str:
+    def run_turn(
+        self,
+        query: str,
+        *,
+        task_id: str | None = None,
+        cutoff: str | None = None,
+        run_metadata: dict[str, Any] | None = None,
+    ) -> str:
+        del run_metadata
         trigger_hooks("UserPromptSubmit", query)
         with agent_lock:
             turn_start = len(self.messages)
             self.messages.append({"role": "user", "content": query})
-            agent_loop(
-                self.messages,
-                self.context,
-                self.permissions,
-                self.approval_callback,
-            )
+            if self.recorder is not None and task_id is not None:
+                run = RunContext(
+                    self.recorder,
+                    self.recorder.run_id,
+                    task_id,
+                    cutoff,
+                )
+                with bind_run_context(run):
+                    outcome = agent_loop(
+                        self.messages,
+                        self.context,
+                        self.permissions,
+                        self.approval_callback,
+                        provider=self.provider,
+                        tools=self.tool_definitions,
+                        handlers=self.tool_handlers,
+                        max_rounds=self.max_rounds,
+                        memory_enabled=self.memory_enabled,
+                        run_context=run,
+                        registered_sources=self.registered_sources,
+                    )
+                self.last_outcome = outcome
+                if outcome.status == "completed":
+                    linkage = link_final_answer_sources(
+                        outcome.final_text, self.registered_sources
+                    )
+                    self.recorder.record(
+                        "final_answer",
+                        {"text": outcome.final_text, **linkage},
+                    )
+                else:
+                    self.recorder.record(
+                        "run_failed",
+                        {
+                            "status": outcome.status,
+                            "failure_class": outcome.failure_class,
+                            "message": outcome.failure_message,
+                        },
+                    )
+            else:
+                outcome = agent_loop(
+                    self.messages,
+                    self.context,
+                    self.permissions,
+                    self.approval_callback,
+                    provider=self.provider,
+                    tools=self.tool_definitions,
+                    handlers=self.tool_handlers,
+                    max_rounds=self.max_rounds,
+                    memory_enabled=self.memory_enabled,
+                )
+                self.last_outcome = outcome
             self.context = update_context(self.context, self.messages)
             return self._turn_text(self.messages, turn_start)
 
@@ -129,12 +229,14 @@ def call_llm(
     tools: list,
     state: RecoveryState,
     max_tokens: int,
+    provider: ChatProvider | None = None,
 ):
-    if client is None:
+    selected_provider = provider or client
+    if selected_provider is None:
         raise RuntimeError("Agent provider is not configured")
     system = assemble_system_prompt(context)
     return with_retry(
-        lambda: client.create(
+        lambda: selected_provider.create(
             model=state.current_model or None,
             system=system,
             messages=messages,
@@ -150,10 +252,40 @@ def agent_loop(
     context: dict,
     permissions: PermissionPolicy | None = None,
     approval_callback: Callable[[ToolCall], bool] | None = None,
-):
+    *,
+    provider: ChatProvider | None = None,
+    tools: list[dict[str, Any]] | None = None,
+    handlers: dict[str, Callable] | None = None,
+    max_rounds: int = 40,
+    memory_enabled: bool | None = None,
+    run_context: RunContext | None = None,
+    registered_sources: dict[str, str] | None = None,
+) -> AgentLoopOutcome:
     global rounds_since_todo
-    tools, handlers = TOOL_DEFINITIONS, TOOL_HANDLERS
+    tools = tools if tools is not None else TOOL_DEFINITIONS
+    handlers = handlers if handlers is not None else TOOL_HANDLERS
     permissions = permissions or PermissionPolicy()
+    selected_provider = provider or client
+    memory_enabled = (
+        config.MEMORY_ENABLED if memory_enabled is None else memory_enabled
+    )
+    registered_sources = registered_sources if registered_sources is not None else {}
+
+    def record_compaction(report) -> None:
+        if run_context is None:
+            return
+        run_context.recorder.record(
+            "context_compaction",
+            {
+                "method": report.method,
+                "original_message_count": report.original_message_count,
+                "retained_message_count": report.retained_message_count,
+                "original_chars": report.original_chars,
+                "retained_chars": report.retained_chars,
+                "transcript_path": report.transcript_path,
+            },
+            agent_id=run_context.agent_id,
+        )
     state = RecoveryState()
     max_tokens = config.DEFAULT_MAX_TOKENS
     memory_store = None
@@ -162,10 +294,10 @@ def agent_loop(
     relevant_memories = ""
     memory_ready = False
 
-    if config.MEMORY_ENABLED and client is not None:
+    if memory_enabled and selected_provider is not None:
         memory_store = MemoryStore(
             config.MEMORY_DIR,
-            provider=client,
+            provider=selected_provider,
             max_selected=config.MEMORY_MAX_SELECTED,
             max_injected_chars=config.MEMORY_MAX_INJECTED_CHARS,
             consolidate_threshold=config.MEMORY_CONSOLIDATE_THRESHOLD,
@@ -175,7 +307,7 @@ def agent_loop(
             ),
         )
         turn_prompt = memory_store.turn_prompt(messages)
-    while True:
+    for _round_index in range(max_rounds):
         fired = consume_cron_queue()
         for job in fired:
             messages.append(
@@ -204,7 +336,7 @@ def agent_loop(
                 relevant_memories = ""
             memory_ready = True
 
-        prepare_context(messages)
+        prepare_context(messages, on_compaction=record_compaction)
         context = update_context(context, messages)
 
         try:
@@ -224,13 +356,16 @@ def agent_loop(
                 tools,
                 state,
                 max_tokens,
+                selected_provider,
             )
         except Exception as error:
             if (
                 is_prompt_too_long_error(error)
                 and not state.has_attempted_reactive_compact
             ):
-                messages[:] = reactive_compact(messages)
+                messages[:] = reactive_compact(
+                    messages, on_compaction=record_compaction
+                )
                 state.has_attempted_reactive_compact = True
                 continue
             messages.append(
@@ -246,7 +381,9 @@ def agent_loop(
                     ],
                 }
             )
-            return
+            return AgentLoopOutcome(
+                "failed", "", type(error).__name__, str(error)
+            )
 
         if response.stop_reason == "max_tokens":
             if not state.has_escalated:
@@ -265,7 +402,12 @@ def agent_loop(
                 )
                 state.recovery_count += 1
                 continue
-            return
+            return AgentLoopOutcome(
+                "failed",
+                extract_text(response.content),
+                "max_tokens",
+                "model exhausted maximum-token recovery",
+            )
 
         max_tokens = config.DEFAULT_MAX_TOKENS
         state.has_escalated = False
@@ -295,7 +437,7 @@ def agent_loop(
                 )
                 memory_store.consolidate_if_needed()
 
-            return
+            return AgentLoopOutcome("completed", extract_text(response.content))
 
         results = []
         compacted_now = False
@@ -304,8 +446,76 @@ def agent_loop(
                 continue
             print(f"\033[36m> {block.name}\033[0m")
 
+            span_id = f"tool_{uuid.uuid4().hex}"
+            if run_context is not None:
+                run_context.recorder.record(
+                    "tool_requested",
+                    {
+                        "tool_call_id": block.id,
+                        "tool_name": block.name,
+                        "arguments": block.input,
+                    },
+                    span_id=span_id,
+                    agent_id=run_context.agent_id,
+                )
+
+            try:
+                prepared = prepare_research_arguments(
+                    block.name,
+                    block.input,
+                    required_cutoff=(
+                        run_context.cutoff if run_context is not None else None
+                    ),
+                )
+            except CutoffMismatch as error:
+                if run_context is not None:
+                    run_context.recorder.record(
+                        "cutoff_validation",
+                        {
+                            "decision": "rejected",
+                            "required_cutoff": run_context.cutoff,
+                            "supplied_cutoff": block.input.get("cutoff"),
+                            "error": str(error),
+                        },
+                        span_id=span_id,
+                        agent_id=run_context.agent_id,
+                    )
+                results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": json.dumps(
+                            {
+                                "ok": False,
+                                "error": {
+                                    "code": "cutoff_mismatch",
+                                    "message": str(error),
+                                },
+                            }
+                        ),
+                    }
+                )
+                continue
+            arguments = prepared.arguments
+            if run_context is not None:
+                run_context.recorder.record(
+                    "cutoff_validation",
+                    {
+                        "decision": prepared.decision,
+                        "required_cutoff": run_context.cutoff,
+                        "supplied_cutoff": prepared.supplied_cutoff,
+                        "normalized_cutoff": arguments.get("cutoff"),
+                    },
+                    span_id=span_id,
+                    agent_id=run_context.agent_id,
+                )
+
             if block.name == "compact":
-                messages[:] = compact_history(messages)
+                messages[:] = compact_history(
+                    messages,
+                    on_compaction=record_compaction,
+                    method="manual",
+                )
                 messages.append(
                     {
                         "role": "user",
@@ -319,6 +529,19 @@ def agent_loop(
 
             blocked = trigger_hooks("PreToolUse", block)
             if blocked:
+                if run_context is not None:
+                    run_context.recorder.record(
+                        "permission_decision",
+                        {"decision": "deny", "reason": "pre_tool_hook"},
+                        span_id=span_id,
+                        agent_id=run_context.agent_id,
+                    )
+                    run_context.recorder.record(
+                        "tool_result",
+                        {"success": False, "output": str(blocked)},
+                        span_id=span_id,
+                        agent_id=run_context.agent_id,
+                    )
                 results.append(
                     {
                         "type": "tool_result",
@@ -328,8 +551,26 @@ def agent_loop(
                 )
                 continue
 
-            call = ToolCall(block.id, block.name, block.input)
+            call = ToolCall(block.id, block.name, arguments)
+            permission_decision = permissions.decide(call)
             if not permissions.approve(call, approval_callback):
+                if run_context is not None:
+                    run_context.recorder.record(
+                        "permission_decision",
+                        {
+                            "decision": "deny",
+                            "policy_decision": permission_decision.value,
+                            "human_approval": approval_callback is not None,
+                        },
+                        span_id=span_id,
+                        agent_id=run_context.agent_id,
+                    )
+                    run_context.recorder.record(
+                        "tool_result",
+                        {"success": False, "error_code": "permission_denied"},
+                        span_id=span_id,
+                        agent_id=run_context.agent_id,
+                    )
                 results.append(
                     {
                         "type": "tool_result",
@@ -342,7 +583,21 @@ def agent_loop(
                 )
                 continue
 
-            if should_run_background(block.name, block.input):
+            if run_context is not None:
+                run_context.recorder.record(
+                    "permission_decision",
+                    {
+                        "decision": "allow",
+                        "policy_decision": permission_decision.value,
+                        "human_approval": (
+                            permission_decision is PermissionDecision.ASK
+                        ),
+                    },
+                    span_id=span_id,
+                    agent_id=run_context.agent_id,
+                )
+
+            if should_run_background(block.name, arguments):
                 background_id = start_background_task(block, handlers)
                 output = (
                     f"[Background task {background_id} started] "
@@ -355,10 +610,92 @@ def agent_loop(
                         "content": output,
                     }
                 )
+                if run_context is not None:
+                    run_context.recorder.record(
+                        "tool_result",
+                        {
+                            "success": True,
+                            "background_id": background_id,
+                            "output": output,
+                        },
+                        span_id=span_id,
+                        agent_id=run_context.agent_id,
+                    )
                 continue
 
             handler = handlers.get(block.name)
-            output = call_tool_handler(handler, block.input, block.name)
+            capture = (
+                ToolCapture(run_context.recorder, span_id)
+                if run_context is not None
+                else None
+            )
+            if run_context is not None:
+                run_context.recorder.record(
+                    "tool_started",
+                    {
+                        "tool_call_id": block.id,
+                        "tool_name": block.name,
+                        "arguments": arguments,
+                    },
+                    span_id=span_id,
+                    agent_id=run_context.agent_id,
+                )
+            started = time.monotonic()
+            try:
+                with bind_tool_capture(capture):
+                    output = call_tool_handler(
+                        handler, arguments, block.name, capture=capture
+                    )
+            except Exception as error:
+                if run_context is not None:
+                    run_context.recorder.record(
+                        "tool_error",
+                        {
+                            "exception_class": type(error).__name__,
+                            "message": str(error),
+                            "latency_ms": round(
+                                (time.monotonic() - started) * 1000, 3
+                            ),
+                        },
+                        span_id=span_id,
+                        agent_id=run_context.agent_id,
+                    )
+                output = f"Error: {type(error).__name__}: {error}"
+            if run_context is not None:
+                output_ref = run_context.recorder.store_artifact(
+                    str(output),
+                    media_type="application/json"
+                    if str(output).lstrip().startswith(("{", "["))
+                    else "text/plain",
+                    source=f"tool_result:{block.name}",
+                    suffix=".json"
+                    if str(output).lstrip().startswith(("{", "["))
+                    else ".txt",
+                )
+                run_context.recorder.record(
+                    "tool_result",
+                    {
+                        "success": not str(output).startswith("Error:"),
+                        "latency_ms": round(
+                            (time.monotonic() - started) * 1000, 3
+                        ),
+                        "output_artifact": output_ref.as_dict(),
+                        "raw_artifacts": [
+                            item.as_dict() for item in (capture.artifacts if capture else [])
+                        ],
+                    },
+                    span_id=span_id,
+                    agent_id=run_context.agent_id,
+                )
+                record_research_evidence(
+                    run_context,
+                    block.name,
+                    str(output),
+                    output_artifact=output_ref,
+                    raw_artifacts=capture.artifacts if capture else [],
+                    span_id=span_id,
+                    registered_sources=registered_sources,
+                )
             trigger_hooks("PostToolUse", block, output)
             print(str(output)[:300])
 
@@ -381,6 +718,12 @@ def agent_loop(
         messages.append(
             {"role": "user", "content": build_user_content(results)}
         )
+    return AgentLoopOutcome(
+        "max_rounds",
+        "",
+        "max_rounds",
+        f"agent exceeded maximum rounds ({max_rounds})",
+    )
 
 
 class AgentRuntime:

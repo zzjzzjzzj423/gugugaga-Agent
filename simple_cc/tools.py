@@ -28,7 +28,8 @@ from .pdf_research import pdf_fetch
 from .web_research import web_fetch, web_search
 
 
-def call_tool_handler(handler, args: dict, name: str) -> str:
+def call_tool_handler(handler, args: dict, name: str, *, capture=None) -> str:
+    del capture
     if not handler:
         return f"Unknown: {name}"
     try:
