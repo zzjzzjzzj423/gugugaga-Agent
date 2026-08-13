@@ -22,6 +22,7 @@ The current CLI uses `SourceRuntime` and the module-level `agent_loop()` in `sim
 The implementation will:
 
 - create one durable run directory for every benchmark task;
+- execute every benchmark task in a fresh operating-system process with a task-exclusive workspace;
 - append events as model and tool operations happen;
 - preserve events independently of context budgeting, summarization, and compaction;
 - record the final answer, search queries, fetched URLs, fetched contents, document contents, tool inputs and outputs, timestamps, durations, token usage, errors, and permission decisions;
@@ -65,11 +66,31 @@ eval/runs/{run_id}/
     document_0002.pdf
     document_0002.extracted.txt
     tool_0003.json
+  agent_workspace/
+    .simple_cc/
 ```
 
 `run_id` is a collision-resistant UUID. Human-readable timestamps may appear in directory indexes but must not be the only identifier.
 
-### 4.3 New module
+`agent_workspace/` is the only part of the run directory visible to agent file tools. The trace, final answer, artifacts, task dataset, reference answers, rubrics, and judge outputs remain outside that workspace. The benchmark permission policy denies shell execution without an approval callback, so the agent cannot use `bash` to bypass the workspace boundary.
+
+### 4.3 Benchmark process isolation
+
+The parent benchmark runner never executes two tasks through the same imported Simple CC runtime. It starts one fresh Python worker process per task, and each worker handles exactly one task before exiting. Process isolation resets module-level state, including provider bindings, `config` paths, memory stores, cron queues, background-task registries, subagent globals, team registries, hooks, counters, and conversation messages.
+
+Each worker receives a unique absolute `run_dir` and `agent_workspace`. Two workers must never share either path. The parent may run several workers concurrently, but concurrency changes throughput only; it does not change the one-task-per-process rule.
+
+Benchmark defaults are:
+
+- memory disabled;
+- cron and durable scheduled tasks disabled;
+- team tools and cross-task mailboxes disabled;
+- no interactive approval callback, which denies `bash` under the current permission policy;
+- background or subagent work, when explicitly enabled by an experiment configuration, remains owned by that task worker and must finish or be cancelled before the worker reports completion.
+
+The worker records these feature flags in `manifest.json`. A worker that cannot stop its owned asynchronous work is terminated by the parent and classified as failed or cancelled rather than completed. The parent also cleans up the worker process tree so detached descendants cannot survive into the next task.
+
+### 4.4 New module
 
 Create `simple_cc/trace.py` with:
 
@@ -161,6 +182,15 @@ Retries produce separate model-call spans at the agent-call level. Provider-inte
   "pit_mode": "non_strict_live_web",
   "provider": "siliconflow",
   "model": "...",
+  "worker_pid": 12345,
+  "agent_workspace": ".../eval/runs/{run_id}/agent_workspace",
+  "isolation": {
+    "one_task_per_process": true,
+    "memory_enabled": false,
+    "cron_enabled": false,
+    "team_enabled": false,
+    "interactive_approval_enabled": false
+  },
   "max_rounds": 40,
   "prompt_sha256": "...",
   "tool_schema_sha256": "...",
@@ -172,9 +202,9 @@ Retries produce separate model-call spans at the agent-call level. Provider-inte
 }
 ```
 
-On success, `status` becomes `completed`. Expected terminal alternatives are `failed`, `max_rounds`, `cancelled`, and `trace_invalid`.
+On success, `status` becomes `completed`. Expected terminal alternatives are `failed`, `max_rounds`, `cancelled`, `timed_out`, `worker_crashed`, and `trace_invalid`.
 
-Manifest updates use a temporary file and atomic replace so readers never observe partially serialized JSON.
+Manifest updates use a temporary file and atomic replace so readers never observe partially serialized JSON. The worker owns manifest updates while it is alive. After the worker exits, the parent may finalize a still-running manifest as `timed_out` or `worker_crashed`; it must never synthesize `completed`.
 
 ## 7. Runtime integration
 
@@ -361,9 +391,22 @@ The runtime does not log hidden reasoning or raw SDK request headers. Public fin
 
 ## 13. Benchmark runner
 
-Create `eval/run_benchmark.py` to read JSONL tasks and call:
+Create two entry points:
+
+- `eval/run_benchmark.py`: parent coordinator that reads tasks, allocates run directories, controls concurrency, starts workers, enforces wall-clock limits, and collects exit metadata;
+- `eval/run_task.py`: single-task worker that configures one workspace, creates one runtime, executes one question, closes task-owned resources, and exits.
+
+The parent passes task data to the worker through a task-specific input file outside `agent_workspace/`. The benchmark question must not be embedded in a shell command string. Conceptually, the worker performs:
 
 ```python
+config.configure_workspace(agent_workspace)
+runtime = build_benchmark_runtime(
+    workspace=agent_workspace,
+    recorder=recorder,
+    memory_enabled=False,
+    cron_enabled=False,
+    team_enabled=False,
+)
 runtime.run_turn(
     task["question"],
     task_id=task["task_id"],
@@ -375,7 +418,19 @@ runtime.run_turn(
 )
 ```
 
-The runner supports selecting task IDs, limiting task count, choosing the output directory, and resuming by skipping runs already marked `completed`. It never treats an incomplete or `trace_invalid` directory as completed.
+The parent starts a fresh interpreter for every task, for example `python eval/run_task.py --task-input ... --run-dir ... --workspace ...`. A reusable `ProcessPoolExecutor` worker is not sufficient unless it is configured and verified to replace the process after every task.
+
+The runner supports selecting task IDs, limiting task count, choosing the output directory, setting `--workers`, setting a per-task timeout, and resuming by skipping runs already marked `completed`. Initial production runs should default to a conservative worker count, such as two, because model and search-provider rate limits are shared external constraints. It never treats an incomplete or `trace_invalid` directory as completed.
+
+Worker startup validates that:
+
+1. `run_dir` and `agent_workspace` are unique to the task;
+2. `agent_workspace` is a child of `run_dir` but trace and evaluation files are not children of `agent_workspace`;
+3. no prior memory, task, mailbox, transcript, scheduled-task, or tool-output state exists in the workspace;
+4. the worker has exactly one task assignment;
+5. benchmark feature flags match the manifest.
+
+The worker does not delete or reuse a prior workspace. On resume, an already completed run is immutable; an incomplete retry receives a new `run_id`, with `retry_of_run_id` linking it to the prior attempt.
 
 ## 14. Derived metrics
 
@@ -425,7 +480,13 @@ Add focused tests for:
 12. concurrent event ordering;
 13. final-answer and source linkage;
 14. benchmark resume behavior;
-15. recorder failure producing `trace_invalid` rather than a valid scoreable run.
+15. recorder failure producing `trace_invalid` rather than a valid scoreable run;
+16. two concurrent tasks receiving different process IDs and workspace paths;
+17. memory, messages, files, cron jobs, mailboxes, background results, and subagent/team state from task A being unavailable to task B;
+18. trace, reference answer, rubric, and judge files being inaccessible through agent file tools;
+19. worker timeout and abnormal exit never producing `completed`;
+20. worker cleanup stopping task-owned asynchronous work and descendant processes;
+21. retry creating a new run directory linked by `retry_of_run_id` instead of reusing dirty state.
 
 All network tests use fixtures or monkeypatching. No default unit test depends on live web access.
 
@@ -434,6 +495,9 @@ All network tests use fixtures or monkeypatching. No default unit test depends o
 The tracing feature is complete when:
 
 - a normal benchmark task always produces a manifest, trajectory, final answer, and referenced artifacts;
+- every task runs under a unique process ID and task-exclusive `agent_workspace`;
+- no task can observe another task's conversation, memory, files, queues, background results, subagents, mailboxes, transcripts, or evaluation outputs;
+- only `agent_workspace` is visible to agent file tools; gold answers, rubrics, traces, artifacts, and judge outputs are not;
 - killing a run after any completed event leaves every prior line readable and durable;
 - context compaction cannot remove or rewrite prior trace events;
 - every model call reports duration and usage fields, with unavailable values explicitly null;
@@ -452,5 +516,6 @@ The tracing feature is complete when:
 4. tool timing, cutoff enforcement, and source registration;
 5. evidence artifact extraction and deduplication;
 6. PDF `document_fetch` support;
-7. benchmark runner and derived-metric reader;
-8. end-to-end trace and rubric-observability tests.
+7. single-task worker, process-isolated benchmark runner, cleanup, resume, and isolation tests;
+8. derived-metric reader;
+9. end-to-end trace and rubric-observability tests.
