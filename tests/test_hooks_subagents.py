@@ -5,7 +5,8 @@ from types import SimpleNamespace
 import simple_cc.config as config
 import simple_cc.hooks as hooks
 import simple_cc.subagents as subagents
-from simple_cc.provider import ProviderResponse, TextBlock
+from simple_cc.provider import ProviderResponse, TextBlock, ToolUseBlock
+from simple_cc.trace import RunContext, TraceRecorder, bind_run_context, current_run_context
 
 
 def test_hooks_run_in_registration_order_and_stop_on_first_result(monkeypatch):
@@ -79,3 +80,46 @@ def test_scripted_one_shot_subagent_returns_final_summary(monkeypatch):
     ]
     assert provider.requests[0]["model"] == "test-model"
     assert provider.requests[0]["tools"] == subagents.SUB_TOOLS
+
+
+def test_subagent_tool_execution_stays_in_child_trace_context(tmp_path, monkeypatch):
+    class ScriptedProvider:
+        def __init__(self):
+            self.responses = [
+                ProviderResponse(
+                    [ToolUseBlock("read-1", "read_file", {"path": "x"})],
+                    "tool_use",
+                ),
+                ProviderResponse([TextBlock("done")], "end_turn"),
+            ]
+
+        def create(self, *args, **kwargs):
+            return self.responses.pop(0)
+
+    observed = []
+
+    def read_file(**arguments):
+        observed.append(current_run_context().agent_id)
+        return "contents"
+
+    recorder = TraceRecorder(tmp_path / "run", run_id="run-1")
+    recorder.start_run(task_id="task-1", question="q", cutoff=None, metadata={})
+    run = RunContext(recorder, "run-1", "task-1", None)
+    monkeypatch.setattr(subagents, "client", ScriptedProvider())
+    monkeypatch.setitem(subagents.SUB_HANDLERS, "read_file", read_file)
+
+    with bind_run_context(run):
+        assert subagents.spawn_subagent("inspect") == "done"
+
+    rows = [
+        __import__("json").loads(line)
+        for line in recorder.trajectory_path.read_text(encoding="utf-8").splitlines()
+    ]
+    tool_rows = [row for row in rows if row["event_type"].startswith("tool_")]
+    assert observed and observed[0].startswith("subagent:")
+    assert [row["event_type"] for row in tool_rows] == [
+        "tool_requested",
+        "tool_started",
+        "tool_result",
+    ]
+    assert all(row["agent_id"].startswith("subagent:") for row in tool_rows)

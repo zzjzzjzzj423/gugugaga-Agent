@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import json
 
-from simple_cc.eval_metrics import derive_metrics, read_trajectory, validate_trace
+from simple_cc.eval_metrics import (
+    derive_metrics,
+    read_trajectory,
+    validate_completed_run,
+    validate_trace,
+)
 from simple_cc.trace import TraceRecorder
 
 
@@ -128,3 +133,42 @@ def test_cost_requires_complete_dated_versioned_pricing(tmp_path):
     assert priced.cost_currency == "USD"
     assert priced.pricing_version == "2026-08-13"
     assert unpriced.cost is None
+
+
+def test_artifact_validation_rejects_paths_outside_artifact_directory(tmp_path):
+    recorder = TraceRecorder(tmp_path / "run", run_id="run-1")
+    recorder.start_run(task_id="task-1", question="q", cutoff=None, metadata={})
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside", encoding="utf-8")
+    recorder.record(
+        "tool_result",
+        {
+            "output_artifact": {
+                "path": "../outside.txt",
+                "sha256": __import__("hashlib").sha256(b"outside").hexdigest(),
+                "size_bytes": 7,
+            }
+        },
+    )
+    recorder.finalize("failed")
+
+    valid, errors = validate_trace(recorder.run_dir)
+    assert valid is False
+    assert any("outside artifacts" in error for error in errors)
+
+
+def test_completed_validation_requires_matching_answer_and_identity(tmp_path):
+    recorder = TraceRecorder(tmp_path / "run", run_id="run-1")
+    recorder.start_run(task_id="task-1", question="q", cutoff=None, metadata={})
+    recorder.record("final_answer", {"text": "traced answer"})
+    recorder.record("run_completed", {"answer_chars": 13})
+    recorder.finalize("completed")
+    (recorder.run_dir / "final_answer.txt").write_text(
+        "different answer", encoding="utf-8"
+    )
+
+    valid, errors = validate_completed_run(
+        recorder.run_dir, expected_run_id="run-1", expected_task_id="task-1"
+    )
+    assert valid is False
+    assert any("final answer mismatch" in error for error in errors)

@@ -105,10 +105,14 @@ def test_background_thread_inherits_run_context(tmp_path):
         id="tool-1", name="bash", input={"command": "noop"}
     )
     with bind_run_context(run):
-        start_background_task(block, {"bash": handler})
+        start_background_task(block, {"bash": handler}, parent_span_id="tool-parent")
     deadline = time.monotonic() + 2
     while not background_is_quiescent() and time.monotonic() < deadline:
         time.sleep(0.01)
     shutdown_background_tasks()
 
     assert observed == ["run-1"]
+    completed = next(
+        row for row in _rows(recorder) if row["event_type"] == "background_completed"
+    )
+    assert completed["parent_span_id"] == "tool-parent"

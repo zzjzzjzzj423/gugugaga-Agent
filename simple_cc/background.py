@@ -90,7 +90,9 @@ def should_run_background(tool_name: str, tool_input: dict) -> bool:
     )
 
 
-def start_background_task(block, handlers: dict) -> str:
+def start_background_task(
+    block, handlers: dict, *, parent_span_id: str | None = None
+) -> str:
     global _bg_counter
     command = block.input.get("command", block.name)
     cancel_event = threading.Event()
@@ -119,6 +121,7 @@ def start_background_task(block, handlers: dict) -> str:
                                 (time.monotonic() - started) * 1000, 3
                             ),
                         },
+                        parent_span_id=parent_span_id,
                         agent_id=run.agent_id,
                     )
                 return
@@ -136,6 +139,7 @@ def start_background_task(block, handlers: dict) -> str:
                         ),
                         "output": str(result),
                     },
+                    parent_span_id=parent_span_id,
                     agent_id=run.agent_id,
                 )
 

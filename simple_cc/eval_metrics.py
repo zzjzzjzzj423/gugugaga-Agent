@@ -91,11 +91,78 @@ def validate_trace(run_dir: Path | str) -> tuple[bool, list[str]]:
     return not errors, errors
 
 
+def validate_completed_run(
+    run_dir: Path | str,
+    *,
+    expected_run_id: str | None = None,
+    expected_task_id: str | None = None,
+) -> tuple[bool, list[str]]:
+    run_dir = Path(run_dir)
+    valid, errors = validate_trace(run_dir)
+    try:
+        manifest = _manifest(run_dir)
+    except Exception:
+        return False, errors
+    if manifest.get("status") != "completed":
+        errors.append("manifest is not completed")
+    if expected_run_id is not None and manifest.get("run_id") != expected_run_id:
+        errors.append("assignment run_id mismatch")
+    if expected_task_id is not None and manifest.get("task_id") != expected_task_id:
+        errors.append("assignment task_id mismatch")
+    try:
+        rows, incomplete = read_trajectory(run_dir)
+    except Exception:
+        return False, errors
+    if incomplete:
+        return False, errors
+    terminal_indexes = [
+        index
+        for index, row in enumerate(rows)
+        if row.get("event_type") == "run_finalized"
+    ]
+    if len(terminal_indexes) != 1 or terminal_indexes[0] != len(rows) - 1:
+        errors.append("terminal event must be unique and final")
+    answers = [row for row in rows if row.get("event_type") == "final_answer"]
+    if len(answers) != 1:
+        errors.append("completed run must have exactly one final answer event")
+    answer_path = run_dir / "final_answer.txt"
+    if not answer_path.is_file():
+        errors.append("completed run has no final answer file")
+    elif len(answers) == 1:
+        try:
+            answer_text = answer_path.read_text(encoding="utf-8")
+        except Exception as error:
+            errors.append(f"final answer unreadable: {type(error).__name__}")
+        else:
+            if answer_text != answers[0].get("payload", {}).get("text"):
+                errors.append("final answer mismatch")
+    if not any(row.get("event_type") == "run_completed" for row in rows):
+        errors.append("completed run has no run_completed event")
+    return valid and not errors, errors
+
+
 def _check_artifacts(run_dir: Path, value: Any, errors: list[str]) -> None:
     if isinstance(value, dict):
         if {"path", "sha256", "size_bytes"}.issubset(value):
-            path = run_dir / value["path"]
-            if not path.is_file():
+            raw_path = value["path"]
+            artifact_root = (run_dir / "artifacts").resolve()
+            try:
+                relative = Path(raw_path)
+                if relative.is_absolute() or not relative.parts or relative.parts[0] != "artifacts":
+                    raise ValueError
+                path = (run_dir / relative).resolve()
+                path.relative_to(artifact_root)
+                current = run_dir.resolve()
+                for part in relative.parts:
+                    current = current / part
+                    if current.is_symlink():
+                        raise ValueError
+            except (TypeError, ValueError, OSError):
+                errors.append(f"artifact path outside artifacts: {raw_path}")
+                path = None
+            if path is None:
+                pass
+            elif not path.is_file():
                 errors.append(f"artifact missing: {value['path']}")
             else:
                 data = path.read_bytes()

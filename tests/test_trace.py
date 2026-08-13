@@ -51,6 +51,18 @@ def test_artifacts_are_deduplicated_by_sha256(tmp_path):
     assert (tmp_path / "run" / first.path).read_text(encoding="utf-8") == "same"
 
 
+def test_artifact_deduplication_does_not_depend_on_requested_suffix(tmp_path):
+    recorder = TraceRecorder(tmp_path / "run", run_id="run-1")
+    first = recorder.store_artifact(
+        "same", media_type="text/plain", source="one", suffix=".txt"
+    )
+    second = recorder.store_artifact(
+        "same", media_type="application/json", source="two", suffix=".json"
+    )
+    assert first.path == second.path
+    assert len(list(recorder.artifacts_dir.iterdir())) == 1
+
+
 def test_redaction_happens_before_disk_write(tmp_path):
     recorder = TraceRecorder(
         tmp_path / "run", run_id="run-1", secrets=["secret-value"]

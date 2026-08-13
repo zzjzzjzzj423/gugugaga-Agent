@@ -13,7 +13,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from simple_cc.trace import supervisor_finalize_manifest
+from simple_cc.eval_metrics import validate_completed_run
+from simple_cc.trace import (
+    supervisor_finalize_manifest,
+    supervisor_invalidate_manifest,
+)
 
 
 @dataclass(frozen=True)
@@ -99,7 +103,19 @@ def _manifests_for_task(output_dir: Path, task_id: str) -> list[tuple[Path, dict
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except Exception:
-            continue
+            task_input_path = manifest_path.parent / "task_input.json"
+            try:
+                task_input = json.loads(task_input_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if task_input.get("task_id") != task_id:
+                continue
+            supervisor_invalidate_manifest(
+                manifest_path.parent,
+                {"run_id": task_input.get("run_id"), "task_id": task_id},
+                ["manifest is malformed"],
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if manifest.get("task_id") == task_id:
             found.append((manifest_path.parent, manifest))
     found.sort(key=lambda item: item[1].get("started_at") or "")
@@ -211,7 +227,28 @@ def launch_assignment(
             {"run_id": assignment.run_id, "task_id": assignment.task["task_id"]},
             {"worker_pid": process.pid, "exit_code": process.returncode},
         )
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as error:
+        supervisor_invalidate_manifest(
+            assignment.run_dir,
+            {"run_id": assignment.run_id, "task_id": assignment.task["task_id"]},
+            [f"manifest unreadable: {type(error).__name__}"],
+        )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("status") == "completed":
+        valid, errors = validate_completed_run(
+            assignment.run_dir,
+            expected_run_id=assignment.run_id,
+            expected_task_id=assignment.task["task_id"],
+        )
+        if not valid:
+            supervisor_invalidate_manifest(
+                assignment.run_dir,
+                {"run_id": assignment.run_id, "task_id": assignment.task["task_id"]},
+                errors,
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     return RunResult(
         assignment.task["task_id"],
         assignment.run_id,
@@ -232,17 +269,30 @@ def run_benchmark(
         prior = _manifests_for_task(options.output_dir, task["task_id"])
         if options.resume and prior and prior[-1][1].get("status") == "completed":
             run_dir, manifest = prior[-1]
-            results.append(
-                RunResult(
-                    task["task_id"],
-                    manifest["run_id"],
-                    run_dir,
-                    manifest,
-                    0,
-                    True,
-                )
+            valid, errors = validate_completed_run(
+                run_dir,
+                expected_run_id=manifest.get("run_id"),
+                expected_task_id=task["task_id"],
             )
-            continue
+            if valid:
+                results.append(
+                    RunResult(
+                        task["task_id"],
+                        manifest["run_id"],
+                        run_dir,
+                        manifest,
+                        0,
+                        True,
+                    )
+                )
+                continue
+            supervisor_invalidate_manifest(
+                run_dir,
+                {"run_id": manifest.get("run_id"), "task_id": task["task_id"]},
+                errors,
+            )
+            manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+            prior[-1] = (run_dir, manifest)
         retry_of = prior[-1][1].get("run_id") if prior else None
         assignments.append(allocate_run(task, options.output_dir, retry_of))
     with concurrent.futures.ThreadPoolExecutor(

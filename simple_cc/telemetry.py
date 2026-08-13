@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import hashlib
+import json
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -108,6 +110,20 @@ class TracingProvider:
             source="llm_request",
             suffix=".json",
         )
+        prompt_sha256 = hashlib.sha256(system.encode("utf-8")).hexdigest()
+        tool_schema_sha256 = hashlib.sha256(
+            json.dumps(
+                tools,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        run.recorder.set_initial_request_hashes(
+            prompt_sha256=prompt_sha256,
+            tool_schema_sha256=tool_schema_sha256,
+        )
         run.recorder.record(
             "llm_request_started",
             {
@@ -115,6 +131,8 @@ class TracingProvider:
                 "model": model,
                 "max_tokens": max_tokens,
                 "request_artifact": request_ref.as_dict(),
+                "prompt_sha256": prompt_sha256,
+                "tool_schema_sha256": tool_schema_sha256,
             },
             span_id=span_id,
             parent_span_id=call.parent_span_id or run.parent_span_id,

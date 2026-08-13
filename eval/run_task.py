@@ -16,7 +16,11 @@ from simple_cc.benchmark import BenchmarkOptions, build_benchmark_runtime
 from simple_cc.config import Settings
 from simple_cc.models import ChatProvider
 from simple_cc.provider import SiliconFlowProvider
-from simple_cc.trace import TraceRecorder, TraceWriteError
+from simple_cc.trace import (
+    TraceRecorder,
+    TraceWriteError,
+    supervisor_invalidate_manifest,
+)
 from simple_cc.web_research import PIT_MODE
 
 
@@ -38,6 +42,18 @@ def load_task_input(path: Path | str) -> TaskInput:
     )
     if not isinstance(raw, dict):
         raise ValueError("task input must be one JSON object")
+    allowed = {
+        "run_id",
+        "task_id",
+        "question",
+        "cutoff",
+        "benchmark",
+        "task_type",
+        "retry_of_run_id",
+    }
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        raise ValueError(f"unknown task fields: {', '.join(unknown)}")
     required = ("run_id", "task_id", "question", "benchmark", "task_type")
     for key in required:
         if not isinstance(raw.get(key), str) or not raw[key].strip():
@@ -50,6 +66,11 @@ def load_task_input(path: Path | str) -> TaskInput:
             raise ValueError("cutoff must use YYYY-MM-DD") from error
         if parsed.isoformat() != cutoff:
             raise ValueError("cutoff must use YYYY-MM-DD")
+    retry_of = raw.get("retry_of_run_id")
+    if retry_of is not None and (
+        not isinstance(retry_of, str) or not retry_of.strip()
+    ):
+        raise ValueError("retry_of_run_id must be a non-empty string or null")
     return TaskInput(
         raw["run_id"],
         raw["task_id"],
@@ -57,7 +78,7 @@ def load_task_input(path: Path | str) -> TaskInput:
         cutoff,
         raw["benchmark"],
         raw["task_type"],
-        raw.get("retry_of_run_id"),
+        retry_of,
     )
 
 
@@ -125,11 +146,20 @@ def execute_task(
     *,
     model: str,
     max_rounds: int = 40,
+    secrets: tuple[str, ...] | list[str] = (),
 ) -> int:
     run_dir = Path(run_dir).resolve()
     workspace = Path(workspace).resolve()
     options = BenchmarkOptions(max_rounds=max_rounds)
-    recorder = TraceRecorder(run_dir, run_id=task.run_id)
+    provider_secret = getattr(getattr(provider, "settings", None), "api_key", None)
+    all_secrets = tuple(
+        dict.fromkeys(
+            str(item)
+            for item in (*secrets, provider_secret)
+            if item is not None and str(item)
+        )
+    )
+    recorder = TraceRecorder(run_dir, run_id=task.run_id, secrets=all_secrets)
     commit, dirty, warning = _git_metadata()
     metadata = {
         "benchmark": task.benchmark,
@@ -200,11 +230,27 @@ def execute_task(
                 },
             )
             return 1
-        recorder.record("run_completed", {"answer_chars": len(answer)})
-        _atomic_text(run_dir / "final_answer.txt", answer)
+        safe_answer = recorder.redact_text(answer)
+        staged_answer = run_dir / ".final_answer.staged"
+        recorder.record("run_completed", {"answer_chars": len(safe_answer)})
+        _atomic_text(staged_answer, safe_answer)
         recorder.finalize("completed")
+        try:
+            os.replace(staged_answer, run_dir / "final_answer.txt")
+        except Exception as error:
+            supervisor_invalidate_manifest(
+                run_dir,
+                {"run_id": task.run_id, "task_id": task.task_id},
+                [f"final answer publication failed: {type(error).__name__}"],
+            )
+            return 2
         return 0
     except TraceWriteError:
+        for path in (run_dir / ".final_answer.staged", run_dir / "final_answer.txt"):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
         return 2
     except Exception as error:
         try:
@@ -241,7 +287,18 @@ def main(argv: list[str] | None = None) -> int:
         provider,
         model=settings.model,
         max_rounds=settings.max_rounds,
+        secrets=_configured_secrets(settings.api_key),
     )
+
+
+def _configured_secrets(api_key: str) -> tuple[str, ...]:
+    values = [api_key]
+    for key, value in os.environ.items():
+        normalized = key.upper()
+        if any(token in normalized for token in ("API_KEY", "TOKEN", "PASSWORD", "SECRET")):
+            if value and len(value) >= 8:
+                values.append(value)
+    return tuple(dict.fromkeys(values))
 
 
 if __name__ == "__main__":

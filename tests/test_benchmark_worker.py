@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 
 import pytest
 
@@ -8,7 +9,7 @@ from eval.run_task import TaskInput, execute_task, load_task_input, main
 from simple_cc.eval_metrics import derive_metrics, validate_trace
 from simple_cc.models import ModelResponse, ToolCall
 from simple_cc.telemetry import capture_tool_artifact
-from simple_cc.trace import read_trace_lines
+from simple_cc.trace import TraceRecorder, TraceWriteError, read_trace_lines
 from tests.fakes import ScriptedProvider
 
 
@@ -31,6 +32,22 @@ def test_load_task_input_validates_required_fields_and_cutoff(tmp_path):
     assert task.task_id == "task-1"
     path.write_text(path.read_text().replace("2025-05-01", "05/01/2025"))
     with pytest.raises(ValueError, match="cutoff"):
+        load_task_input(path)
+
+    path.write_text(
+        json.dumps(
+            {
+                "run_id": "run-1",
+                "task_id": "task-1",
+                "question": "Research",
+                "benchmark": "test",
+                "task_type": "research",
+                "unexpected": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="unknown task fields"):
         load_task_input(path)
 
 
@@ -221,3 +238,82 @@ def test_offline_worker_search_fetch_answer_trace_is_self_consistent(
     assert metrics.searches == 1
     assert metrics.fetches == 1
     assert metrics.all_in_prompt_tokens is None
+
+
+def test_worker_redacts_configured_secret_everywhere(tmp_path):
+    secret = "sk-test-super-secret-value"
+    provider = ScriptedProvider([ModelResponse(f"answer {secret}")])
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    task = TaskInput(
+        "run-secret", "task-secret", f"question {secret}", None, "test", "research"
+    )
+    exit_code = execute_task(
+        task,
+        run_dir,
+        run_dir / "agent_workspace",
+        provider,
+        model="test-model",
+        secrets=(secret,),
+    )
+
+    assert exit_code == 0
+    for path in [
+        run_dir / "manifest.json",
+        run_dir / "trajectory.jsonl",
+        run_dir / "final_answer.txt",
+        *list((run_dir / "artifacts").iterdir()),
+    ]:
+        assert secret.encode() not in path.read_bytes()
+
+
+def test_manifest_hashes_match_first_captured_request(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    task = TaskInput("run-hash", "task-hash", "q", None, "test", "research")
+    assert execute_task(
+        task,
+        run_dir,
+        run_dir / "agent_workspace",
+        ScriptedProvider([ModelResponse("answer")]),
+        model="test-model",
+    ) == 0
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    rows, _ = read_trace_lines(run_dir / "trajectory.jsonl")
+    request_event = next(row for row in rows if row["event_type"] == "llm_request_started")
+    request_ref = request_event["payload"]["request_artifact"]
+    request = json.loads((run_dir / request_ref["path"]).read_text(encoding="utf-8"))
+    assert manifest["prompt_sha256"] == hashlib.sha256(
+        request["system"].encode("utf-8")
+    ).hexdigest()
+    assert manifest["tool_schema_sha256"] == hashlib.sha256(
+        json.dumps(
+            request["tools"],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def test_trace_finalize_failure_never_publishes_official_answer(tmp_path, monkeypatch):
+    original_finalize = TraceRecorder.finalize
+
+    def fail_completed(self, status, details=None):
+        if status == "completed":
+            raise TraceWriteError("final manifest unavailable")
+        return original_finalize(self, status, details)
+
+    monkeypatch.setattr(TraceRecorder, "finalize", fail_completed)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    exit_code = execute_task(
+        TaskInput("run-1", "task-1", "q", None, "test", "research"),
+        run_dir,
+        run_dir / "agent_workspace",
+        ScriptedProvider([ModelResponse("answer")]),
+        model="test-model",
+    )
+    assert exit_code == 2
+    assert not (run_dir / "final_answer.txt").exists()
+    assert not (run_dir / ".final_answer.staged").exists()

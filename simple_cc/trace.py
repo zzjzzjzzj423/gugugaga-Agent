@@ -202,7 +202,7 @@ class TraceRecorder:
             self._task_id = str(task_id)
             self._status = "running"
             self._started_monotonic = time.monotonic()
-            self._manifest = {
+            self._manifest = redact_value({
                 **redact_value(metadata, self.secrets),
                 "schema_version": SCHEMA_VERSION,
                 "run_id": self.run_id,
@@ -212,7 +212,7 @@ class TraceRecorder:
                 "started_at": _utc_now(),
                 "ended_at": None,
                 "status": "running",
-            }
+            }, self.secrets)
             try:
                 _atomic_json(self.manifest_path, self._manifest)
             except Exception as error:
@@ -245,6 +245,8 @@ class TraceRecorder:
         with self._lock:
             if self._task_id is None:
                 raise TraceWriteError("run has not started")
+            if self._status in TERMINAL_STATUSES:
+                raise TraceWriteError("cannot append to a terminal run")
             self._sequence += 1
             event = {
                 "schema_version": SCHEMA_VERSION,
@@ -291,8 +293,8 @@ class TraceRecorder:
                 separators=(",", ":"),
             ).encode("utf-8")
         digest = hashlib.sha256(data).hexdigest()
-        safe_suffix = suffix if suffix.startswith(".") else f".{suffix}"
-        path = self.artifacts_dir / f"{digest}{safe_suffix}"
+        del source, suffix
+        path = self.artifacts_dir / digest
         with self._lock:
             if not path.exists():
                 fd, temp_name = tempfile.mkstemp(prefix=".artifact.", dir=self.artifacts_dir)
@@ -314,6 +316,28 @@ class TraceRecorder:
             media_type=media_type,
             size_bytes=len(data),
         )
+
+    def redact_text(self, value: str) -> str:
+        return str(redact_value(str(value), self.secrets))
+
+    def set_initial_request_hashes(
+        self, *, prompt_sha256: str, tool_schema_sha256: str
+    ) -> None:
+        with self._lock:
+            if self._status != "running":
+                raise TraceWriteError("cannot update a terminal run")
+            if self._manifest.get("prompt_sha256") not in (None, prompt_sha256):
+                return
+            manifest = {
+                **self._manifest,
+                "prompt_sha256": prompt_sha256,
+                "tool_schema_sha256": tool_schema_sha256,
+            }
+            try:
+                _atomic_json(self.manifest_path, manifest)
+            except Exception as error:
+                raise TraceWriteError(str(error)) from error
+            self._manifest = manifest
 
     def finalize(self, status: str, details: dict[str, Any] | None = None) -> None:
         if status not in TERMINAL_STATUSES:
@@ -374,11 +398,16 @@ def supervisor_finalize_manifest(
     run_dir = Path(run_dir).resolve()
     manifest_path = run_dir / "manifest.json"
     manifest: dict[str, Any] = {}
+    corrupt_ref = None
     if manifest_path.exists():
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            corrupt_ref = _preserve_corrupt_manifest(run_dir, manifest_path)
+            manifest = {}
         if manifest.get("status") in TERMINAL_STATUSES:
             return
-        if manifest.get("status") != "running":
+        if manifest.get("status") != "running" and corrupt_ref is None:
             raise ValueError("supervisor found invalid manifest status")
     else:
         manifest = {
@@ -394,5 +423,65 @@ def supervisor_finalize_manifest(
     }
     manifest.update(redact_value(details or {}))
     manifest.update(identity)
+    if corrupt_ref is not None:
+        manifest["corrupt_manifest_artifact"] = corrupt_ref.as_dict()
     manifest.update({"status": status, "ended_at": _utc_now()})
+    _atomic_json(manifest_path, manifest)
+
+
+def _preserve_corrupt_manifest(run_dir: Path, manifest_path: Path) -> ArtifactRef:
+    data = manifest_path.read_bytes()
+    digest = hashlib.sha256(data).hexdigest()
+    artifacts = run_dir / "artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    target = artifacts / f"corrupt-manifest-{digest}"
+    if not target.exists():
+        fd, temporary = tempfile.mkstemp(prefix=".corrupt-manifest.", dir=artifacts)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, target)
+        except Exception:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
+    return ArtifactRef(
+        target.relative_to(run_dir).as_posix(),
+        digest,
+        "application/octet-stream",
+        len(data),
+    )
+
+
+def supervisor_invalidate_manifest(
+    run_dir: Path | str,
+    task_metadata: dict[str, Any],
+    errors: list[str],
+) -> None:
+    run_dir = Path(run_dir).resolve()
+    manifest_path = run_dir / "manifest.json"
+    previous: dict[str, Any] = {}
+    corrupt_ref = None
+    if manifest_path.exists():
+        try:
+            previous = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            corrupt_ref = _preserve_corrupt_manifest(run_dir, manifest_path)
+    task_metadata = redact_value(task_metadata)
+    manifest = {
+        **previous,
+        "schema_version": SCHEMA_VERSION,
+        "run_id": task_metadata.get("run_id", previous.get("run_id")),
+        "task_id": task_metadata.get("task_id", previous.get("task_id")),
+        "previous_status": previous.get("status"),
+        "status": "trace_invalid",
+        "ended_at": _utc_now(),
+        "trace_validation_errors": redact_value(errors),
+    }
+    if corrupt_ref is not None:
+        manifest["corrupt_manifest_artifact"] = corrupt_ref.as_dict()
     _atomic_json(manifest_path, manifest)

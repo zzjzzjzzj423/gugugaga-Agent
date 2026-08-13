@@ -106,3 +106,41 @@ def test_resume_retries_failed_run_without_overwriting_prior_attempt(tmp_path):
     assert retried.run_id != failed.run_id
     assert task_input["retry_of_run_id"] == failed.run_id
     assert (failed.run_dir / "manifest.json").exists()
+
+
+def test_resume_invalidates_corrupt_completed_trace_and_retries(tmp_path):
+    output = tmp_path / "runs"
+    dataset = _dataset(tmp_path, 1)
+    first = run_benchmark(
+        RunnerOptions(dataset, output, workers=1, timeout_seconds=10),
+        worker_command=[sys.executable, "tests/fixtures/isolation_probe.py"],
+    )[0]
+    with (first.run_dir / "trajectory.jsonl").open("ab") as handle:
+        handle.write(b'{"truncated"')
+
+    retried = run_benchmark(
+        RunnerOptions(dataset, output, workers=1, timeout_seconds=10, resume=True),
+        worker_command=[sys.executable, "tests/fixtures/isolation_probe.py"],
+    )[0]
+    old_manifest = json.loads(
+        (first.run_dir / "manifest.json").read_text(encoding="utf-8")
+    )
+    task_input = json.loads(
+        (retried.run_dir / "task_input.json").read_text(encoding="utf-8")
+    )
+    assert old_manifest["status"] == "trace_invalid"
+    assert retried.run_id != first.run_id
+    assert task_input["retry_of_run_id"] == first.run_id
+
+
+def test_malformed_worker_manifest_does_not_crash_coordinator(tmp_path):
+    result = run_benchmark(
+        RunnerOptions(_dataset(tmp_path, 1), tmp_path / "runs", workers=1),
+        worker_command=[
+            sys.executable,
+            "tests/fixtures/isolation_probe.py",
+            "--malformed-manifest",
+        ],
+    )[0]
+    assert result.manifest["status"] == "trace_invalid"
+    assert list((result.run_dir / "artifacts").glob("corrupt-manifest-*"))

@@ -621,7 +621,9 @@ def agent_loop(
                 )
 
             if should_run_background(block.name, arguments):
-                background_id = start_background_task(block, handlers)
+                background_id = start_background_task(
+                    block, handlers, parent_span_id=span_id
+                )
                 output = (
                     f"[Background task {background_id} started] "
                     "Result will arrive as a task_notification."

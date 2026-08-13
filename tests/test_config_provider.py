@@ -6,6 +6,7 @@ import pytest
 from simple_cc.config import Settings
 from simple_cc.models import ToolCall, ToolSpec
 from simple_cc.provider import (
+    ProviderRequestError,
     ProviderUsage,
     SiliconFlowProvider,
     normalize_tool_call,
@@ -131,3 +132,43 @@ def test_provider_reports_missing_usage_as_unknown(tmp_path):
         messages=[], system="", tools=[], max_tokens=10
     )
     assert result.usage == ProviderUsage(None, None, None)
+
+
+def test_provider_exhausted_retries_preserve_attempt_count(tmp_path, monkeypatch):
+    settings = Settings(
+        workspace=tmp_path,
+        state_dir=tmp_path / ".simple_cc",
+        tasks_dir=tmp_path / ".simple_cc/tasks",
+        memory_dir=tmp_path / ".simple_cc/memory",
+        mailboxes_dir=tmp_path / ".simple_cc/mailboxes",
+        transcripts_dir=tmp_path / ".simple_cc/transcripts",
+        outputs_dir=tmp_path / ".simple_cc/outputs",
+        skills_dir=tmp_path / ".simple_cc/skills",
+        api_key="key",
+        model="model",
+    )
+
+    class RateLimited(RuntimeError):
+        status_code = 429
+
+        def __str__(self):
+            return "rate limited"
+
+    class FailingClient:
+        def __init__(self):
+            self.calls = 0
+            self.chat = SimpleNamespace(
+                completions=SimpleNamespace(create=self.create)
+            )
+
+        def create(self, **kwargs):
+            self.calls += 1
+            raise RateLimited()
+
+    client = FailingClient()
+    monkeypatch.setattr("simple_cc.provider.time.sleep", lambda _: None)
+    with pytest.raises(ProviderRequestError) as captured:
+        SiliconFlowProvider(settings, client=client).create([], "", [], 10)
+    assert captured.value.attempts == 4
+    assert captured.value.status_code == 429
+    assert client.calls == 4

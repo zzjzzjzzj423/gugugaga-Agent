@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import time
 import uuid
 
 from . import config
@@ -106,42 +107,100 @@ def spawn_subagent(description: str) -> str:
     subagent_id = f"subagent:{uuid.uuid4().hex[:8]}"
     if client is None:
         raise RuntimeError("Subagent provider is not configured")
-    for _ in range(30):
-        scope = (
-            bind_run_context(parent_run.child(subagent_id))
-            if parent_run is not None
-            else contextlib.nullcontext()
-        )
-        with scope, model_call_scope("subagent"):
-            response = client.create(
-                messages,
-                subagent_system_prompt(),
-                SUB_TOOLS,
-                config.DEFAULT_MAX_TOKENS,
-                model=MODEL,
-            )
-        messages.append({"role": "assistant", "content": response.content})
-        if not has_tool_use(response.content):
-            break
-        results = []
-        for block in response.content:
-            if block.type != "tool_use":
-                continue
-            blocked = trigger_hooks("PreToolUse", block)
-            if blocked:
-                output = str(blocked)
-            else:
-                handler = SUB_HANDLERS.get(block.name)
-                output = call_tool_handler(handler, block.input, block.name)
-                trigger_hooks("PostToolUse", block, output)
-            results.append(
-                {
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": str(output),
-                }
-            )
-        messages.append({"role": "user", "content": results})
+    scope = (
+        bind_run_context(parent_run.child(subagent_id))
+        if parent_run is not None
+        else contextlib.nullcontext()
+    )
+    with scope:
+        for _ in range(30):
+            with model_call_scope("subagent"):
+                response = client.create(
+                    messages,
+                    subagent_system_prompt(),
+                    SUB_TOOLS,
+                    config.DEFAULT_MAX_TOKENS,
+                    model=MODEL,
+                )
+            messages.append({"role": "assistant", "content": response.content})
+            if not has_tool_use(response.content):
+                break
+            results = []
+            for block in response.content:
+                if block.type != "tool_use":
+                    continue
+                run = current_run_context()
+                span_id = f"tool_{uuid.uuid4().hex}"
+                if run is not None:
+                    run.recorder.record(
+                        "tool_requested",
+                        {
+                            "tool_call_id": block.id,
+                            "tool_name": block.name,
+                            "arguments": block.input,
+                        },
+                        span_id=span_id,
+                        agent_id=run.agent_id,
+                    )
+                    run.recorder.record(
+                        "tool_started",
+                        {"tool_call_id": block.id, "tool_name": block.name},
+                        span_id=span_id,
+                        agent_id=run.agent_id,
+                    )
+                started = time.monotonic()
+                blocked = trigger_hooks("PreToolUse", block)
+                try:
+                    if blocked:
+                        output = str(blocked)
+                    else:
+                        handler = SUB_HANDLERS.get(block.name)
+                        output = call_tool_handler(handler, block.input, block.name)
+                        trigger_hooks("PostToolUse", block, output)
+                except Exception as error:
+                    output = f"Error: {type(error).__name__}: {error}"
+                    if run is not None:
+                        run.recorder.record(
+                            "tool_error",
+                            {
+                                "exception_class": type(error).__name__,
+                                "message": str(error),
+                                "latency_ms": round(
+                                    (time.monotonic() - started) * 1000, 3
+                                ),
+                            },
+                            span_id=span_id,
+                            agent_id=run.agent_id,
+                        )
+                else:
+                    if run is not None:
+                        output_ref = run.recorder.store_artifact(
+                            str(output),
+                            media_type="text/plain",
+                            source=f"subagent_tool:{block.name}",
+                            suffix=".txt",
+                        )
+                        run.recorder.record(
+                            "tool_result",
+                            {
+                                "success": not blocked
+                                and not str(output).startswith("Error:"),
+                                "latency_ms": round(
+                                    (time.monotonic() - started) * 1000, 3
+                                ),
+                                "output_artifact": output_ref.as_dict(),
+                            },
+                            span_id=span_id,
+                            agent_id=run.agent_id,
+                        )
+                results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": str(output),
+                    }
+                )
+            messages.append({"role": "user", "content": results})
     for message in reversed(messages):
         if message["role"] == "assistant":
             text = extract_text(message["content"])

@@ -15,6 +15,15 @@ class ContextLengthError(RuntimeError):
     pass
 
 
+class ProviderRequestError(RuntimeError):
+    def __init__(
+        self, message: str, *, attempts: int, status_code: int | None = None
+    ):
+        super().__init__(message)
+        self.attempts = attempts
+        self.status_code = status_code
+
+
 @dataclass(frozen=True)
 class TextBlock:
     text: str
@@ -234,4 +243,8 @@ class SiliconFlowProvider(ChatProvider):
                     break
                 time.sleep(min(2**attempt, 4))
         assert last_error is not None
-        raise last_error
+        raise ProviderRequestError(
+            str(last_error),
+            attempts=4,
+            status_code=_status_code(last_error),
+        ) from last_error
