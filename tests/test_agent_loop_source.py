@@ -114,6 +114,64 @@ def test_agent_loop_writes_file_then_returns_exact_tool_result_order(
     ]
 
 
+def test_agent_loop_returns_pdf_page_result_before_cited_answer(
+    monkeypatch,
+):
+    monkeypatch.setattr(agent.config, "MEMORY_ENABLED", False)
+    monkeypatch.setattr(agent, "rounds_since_todo", 0, raising=False)
+    tool_output = (
+        '{"ok":true,"pages":[{"page_number":11,'
+        '"content":"--- PAGE 11 START ---\\nRevenue 120\\n'
+        '--- PAGE 11 END ---"}]}'
+    )
+    provider = ScriptedProvider(
+        [
+            ProviderResponse(
+                content=[
+                    ToolUseBlock(
+                        id="toolu_pdf",
+                        name="pdf_fetch",
+                        input={
+                            "url": "https://example.com/report.pdf",
+                            "start_page": 11,
+                            "page_count": 1,
+                        },
+                    )
+                ],
+                stop_reason="tool_use",
+            ),
+            ProviderResponse(
+                content=[TextBlock(text="Revenue was 120 [PDF p. 11].")],
+                stop_reason="end_turn",
+            ),
+        ]
+    )
+    install(provider, monkeypatch)
+    monkeypatch.setitem(
+        tools.TOOL_HANDLERS,
+        "pdf_fetch",
+        lambda **arguments: tool_output,
+    )
+    messages = [{"role": "user", "content": "Read the annual report"}]
+
+    agent.agent_loop(messages, {})
+
+    assert provider.requests[1]["messages"][-1] == {
+        "role": "user",
+        "content": [
+            {
+                "type": "tool_result",
+                "tool_use_id": "toolu_pdf",
+                "content": tool_output,
+            }
+        ],
+    }
+    assert messages[-1] == {
+        "role": "assistant",
+        "content": [TextBlock(text="Revenue was 120 [PDF p. 11].")],
+    }
+
+
 def test_prompt_too_long_runs_one_real_reactive_compaction_retry(
     source_loop, tmp_path, monkeypatch
 ):

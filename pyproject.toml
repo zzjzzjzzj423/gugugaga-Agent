@@ -7,7 +7,14 @@ name = "simple-cc"
 version = "0.1.0"
 description = "A compact S01-S17 coding-agent harness using SiliconFlow"
 requires-python = ">=3.11"
-dependencies = ["openai>=1.0", "python-dotenv>=1.0", "pyyaml>=6.0"]
+dependencies = [
+    "openai>=1.0",
+    "python-dotenv>=1.0",
+    "pyyaml>=6.0",
+    "ddgs>=9.0",
+    "trafilatura>=2.0",
+    "pdfplumber>=0.11.10",
+]
 
 [project.optional-dependencies]
 test = ["pytest>=8"]

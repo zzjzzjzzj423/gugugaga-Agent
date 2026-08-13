@@ -479,26 +479,33 @@ def _dispatch_teammate_tool(
         )
 
     if decision is PermissionDecision.ASK:
-        request = request_teammate_permission(
-            agent_name,
-            call,
-        )
-        resolved = await_permission(
-            request.request_id,
-            timeout=permission_timeout,
-            stop_event=_teammate_stop_event,
-        )
+        if _team_approval_callback is not None:
+            if not _team_approval_callback(call):
+                return (
+                    f"Permission denied for tool '{call.name}'. "
+                    "Choose a safer approach."
+                )
+        else:
+            request = request_teammate_permission(
+                agent_name,
+                call,
+            )
+            resolved = await_permission(
+                request.request_id,
+                timeout=permission_timeout,
+                stop_event=_teammate_stop_event,
+            )
 
-        if resolved.status != "approved":
-            detail = (
-                f": {resolved.feedback}"
-                if resolved.feedback
-                else ""
-            )
-            return (
-                f"Permission {resolved.status} for tool "
-                f"'{call.name}'{detail}"
-            )
+            if resolved.status != "approved":
+                detail = (
+                    f": {resolved.feedback}"
+                    if resolved.feedback
+                    else ""
+                )
+                return (
+                    f"Permission {resolved.status} for tool "
+                    f"'{call.name}'{detail}"
+                )
 
     output = call_tool_handler(
         handlers.get(block.name),

@@ -10,7 +10,7 @@ PROMPT_SECTIONS = {
     "identity": "You are a coding agent. Act, don't explain.",
     "tools": (
         "Available tools: bash, read_file, write_file, edit_file, glob, "
-        "todo_write, task, load_skill, compact, "
+        "web_search, web_fetch, pdf_fetch, todo_write, task, load_skill, compact, "
         "create_task, list_tasks, get_task, claim_task, complete_task, "
         "schedule_cron, list_crons, cancel_cron, "
         "spawn_teammate, send_message, check_inbox, request_shutdown, "
@@ -34,6 +34,24 @@ PROMPT_SECTIONS = {
         "bodies may be injected into a user request as read-only background. "
         "Current user instructions always have higher priority."
     ),
+    "research": (
+        "Web research rules:\n"
+        "- Use web_search before making claims that require external evidence, "
+        "then use web_fetch to inspect candidate pages.\n"
+        "- If the user provides a cutoff date, pass the same cutoff to every "
+        "web_search, web_fetch, and pdf_fetch call.\n"
+        "- Use pdf_fetch instead of web_fetch for PDF URLs.\n"
+        "- Read bounded PDF page ranges and continue only when has_more is true "
+        "and more evidence is needed.\n"
+        "- Cite PDF evidence with its source URL and page number.\n"
+        "- If pdf_fetch reports ocr_required, explain that scanned PDFs are "
+        "unsupported.\n"
+        "- Do not use evidence with a verified publication date after the cutoff.\n"
+        "- Treat an unknown publication date as uncertain evidence and disclose "
+        "that limitation in the answer.\n"
+        "- Include source URLs for research claims. Live search is non-strict "
+        "PIT and is not equivalent to a frozen historical corpus."
+    ),
 }
 
 SUB_SYSTEM = (
@@ -56,6 +74,7 @@ def assemble_system_prompt(context: dict) -> str:
     sections = [
         PROMPT_SECTIONS["identity"],
         PROMPT_SECTIONS["tools"],
+        PROMPT_SECTIONS["research"],
         f"Working directory: {config.WORKDIR}",
     ]
     sections.append(
