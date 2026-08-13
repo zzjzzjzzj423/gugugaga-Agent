@@ -11,6 +11,7 @@ from typing import Callable
 from . import config
 from .subagents import extract_text
 from .memory import MemoryStore
+from .telemetry import model_call_scope
 
 client = None
 
@@ -307,13 +308,14 @@ def summarize_history(messages: list) -> str:
     )
     if client is None:
         raise RuntimeError("Context provider is not configured")
-    response = client.create(
-        model=config.MODEL,
-        system="",
-        messages=[{"role": "user", "content": prompt}],
-        tools=[],
-        max_tokens=2000,
-    )
+    with model_call_scope("context_compaction"):
+        response = client.create(
+            model=config.MODEL,
+            system="",
+            messages=[{"role": "user", "content": prompt}],
+            tools=[],
+            max_tokens=2000,
+        )
     return extract_text(response.content) or "(empty summary)"
 
 

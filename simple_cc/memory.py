@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .telemetry import model_call_scope
+
 
 MEMORY_TYPES = frozenset({"user", "feedback", "project", "reference"})
 INDEX_MARKER = "<!-- simple-cc-memory-index:v1 -->"
@@ -517,7 +519,8 @@ class MemoryStore:
             f"{json.dumps(catalog, ensure_ascii=False)}"
         )
         try:
-            selected = _json_array(self._call(prompt, 300))
+            with model_call_scope("memory_retrieval"):
+                selected = _json_array(self._call(prompt, 300))
             allowed = {record.filename for record in records}
             if not all(isinstance(name, str) and name in allowed for name in selected):
                 raise MemoryValidationError("selector returned an unknown filename")
@@ -665,7 +668,8 @@ class MemoryStore:
             f"{json.dumps(existing, ensure_ascii=False)}\n\nDialogue:\n{dialogue}"
         )
         try:
-            values = _json_array(self._call(prompt, 1_000))
+            with model_call_scope("memory_extraction"):
+                values = _json_array(self._call(prompt, 1_000))
             items = self._validate_model_items(values)
             count = self._apply(items)
             if count:
@@ -706,7 +710,8 @@ class MemoryStore:
         backup: Path | None = None
         stage: Path | None = None
         try:
-            values = _json_array(self._call(prompt, 3_000))
+            with model_call_scope("memory_consolidation"):
+                values = _json_array(self._call(prompt, 3_000))
             if not values or len(values) > self.consolidate_target:
                 raise MemoryValidationError("invalid consolidation item count")
             candidates = []

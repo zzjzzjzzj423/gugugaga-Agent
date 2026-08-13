@@ -79,3 +79,36 @@ def test_tracing_provider_records_safe_error(tmp_path):
     assert event["event_type"] == "llm_error"
     assert event["payload"]["exception_class"] == "RuntimeError"
     assert event["payload"]["latency_ms"] >= 0
+
+
+def test_background_thread_inherits_run_context(tmp_path):
+    import time
+    from types import SimpleNamespace
+
+    from simple_cc.background import (
+        background_is_quiescent,
+        initialize_background_tasks,
+        shutdown_background_tasks,
+        start_background_task,
+    )
+    from simple_cc.trace import current_run_context
+
+    recorder, run = _start(tmp_path)
+    observed = []
+
+    def handler(**kwargs):
+        observed.append(current_run_context().run_id)
+        return "ok"
+
+    initialize_background_tasks()
+    block = SimpleNamespace(
+        id="tool-1", name="bash", input={"command": "noop"}
+    )
+    with bind_run_context(run):
+        start_background_task(block, {"bash": handler})
+    deadline = time.monotonic() + 2
+    while not background_is_quiescent() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    shutdown_background_tasks()
+
+    assert observed == ["run-1"]

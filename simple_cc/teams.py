@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import contextlib
+import contextvars
 import random
 import re
 import threading
@@ -17,6 +19,8 @@ from .permissions import PermissionDecision, PermissionPolicy
 from .planning import Task, TaskStore
 from .tasks import can_start, claim_task, complete_task, list_tasks
 from .workspace import run_bash, run_read, run_write
+from .telemetry import model_call_scope
+from .trace import bind_run_context, current_run_context
 
 
 # S15-S17 source-compatible team communication. Paths are resolved from
@@ -726,13 +730,14 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                                 }
                             )
                     try:
-                        response = _team_provider.create(
-                            model=config.MODEL or None,
-                            system=system,
-                            messages=messages[-20:],
-                            tools=sub_tools,
-                            max_tokens=8000,
-                        )
+                        with model_call_scope("teammate"):
+                            response = _team_provider.create(
+                                model=config.MODEL or None,
+                                system=system,
+                                messages=messages[-20:],
+                                tools=sub_tools,
+                                max_tokens=8000,
+                            )
                     except Exception:
                         break
                     if _teammate_stop_event.is_set():
@@ -812,8 +817,23 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                 active_teammates.pop(name, None)
                 _teammate_threads.pop(name, None)
 
+    copied_context = contextvars.copy_context()
+    parent_run = current_run_context()
+
+    def run_in_copied_context():
+        scope = (
+            bind_run_context(parent_run.child(f"teammate:{name}"))
+            if parent_run is not None
+            else contextlib.nullcontext()
+        )
+        with scope:
+            run()
+
+    def run_with_context():
+        copied_context.run(run_in_copied_context)
+
     thread = threading.Thread(
-        target=run, name=f"teammate-{name}", daemon=True
+        target=run_with_context, name=f"teammate-{name}", daemon=True
     )
     with _teammate_lock:
         _teammate_threads[name] = thread

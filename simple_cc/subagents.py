@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import contextlib
+import uuid
+
 from . import config
 from .hooks import trigger_hooks
 from .prompts import subagent_system_prompt
 from .workspace import run_bash, run_edit, run_glob, run_read, run_write
+from .telemetry import model_call_scope
+from .trace import bind_run_context, current_run_context
 
 
 client = None
@@ -97,16 +102,24 @@ def spawn_subagent(description: str) -> str:
     from .tools import call_tool_handler
 
     messages = [{"role": "user", "content": description}]
+    parent_run = current_run_context()
+    subagent_id = f"subagent:{uuid.uuid4().hex[:8]}"
     if client is None:
         raise RuntimeError("Subagent provider is not configured")
     for _ in range(30):
-        response = client.create(
-            messages,
-            subagent_system_prompt(),
-            SUB_TOOLS,
-            config.DEFAULT_MAX_TOKENS,
-            model=MODEL,
+        scope = (
+            bind_run_context(parent_run.child(subagent_id))
+            if parent_run is not None
+            else contextlib.nullcontext()
         )
+        with scope, model_call_scope("subagent"):
+            response = client.create(
+                messages,
+                subagent_system_prompt(),
+                SUB_TOOLS,
+                config.DEFAULT_MAX_TOKENS,
+                model=MODEL,
+            )
         messages.append({"role": "assistant", "content": response.content})
         if not has_tool_use(response.content):
             break

@@ -104,7 +104,8 @@ class SourceRuntime:
         max_rounds: int = 40,
         memory_enabled: bool | None = None,
     ):
-        self.provider = TracingProvider(provider)
+        self.provider = provider
+        self.tracing_provider = TracingProvider(provider)
         self.permissions = permissions or PermissionPolicy()
         self.approval_callback = approval_callback
         self.recorder = recorder
@@ -180,7 +181,7 @@ class SourceRuntime:
                         self.context,
                         self.permissions,
                         self.approval_callback,
-                        provider=self.provider,
+                        provider=self.tracing_provider,
                         tools=self.tool_definitions,
                         handlers=self.tool_handlers,
                         max_rounds=self.max_rounds,
@@ -212,7 +213,7 @@ class SourceRuntime:
                     self.context,
                     self.permissions,
                     self.approval_callback,
-                    provider=self.provider,
+                    provider=self.tracing_provider,
                     tools=self.tool_definitions,
                     handlers=self.tool_handlers,
                     max_rounds=self.max_rounds,

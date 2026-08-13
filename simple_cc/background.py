@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import contextvars
 import threading
 import time
 import uuid
@@ -10,6 +11,7 @@ from typing import Callable
 from .hooks import trigger_hooks
 from .models import ToolCall
 from .tools import call_tool_handler
+from .trace import current_run_context
 
 
 _bg_counter = 0
@@ -92,8 +94,10 @@ def start_background_task(block, handlers: dict) -> str:
     global _bg_counter
     command = block.input.get("command", block.name)
     cancel_event = threading.Event()
+    copied_context = contextvars.copy_context()
+    started = time.monotonic()
 
-    def worker():
+    def worker_body():
         handler = handlers.get(block.name)
         try:
             result = _call_background_handler(
@@ -105,10 +109,38 @@ def start_background_task(block, handlers: dict) -> str:
             task = background_tasks[bg_id]
             if cancel_event.is_set():
                 task["status"] = "cancelled"
+                run = current_run_context()
+                if run is not None:
+                    run.recorder.record(
+                        "background_cancelled",
+                        {
+                            "background_id": bg_id,
+                            "latency_ms": round(
+                                (time.monotonic() - started) * 1000, 3
+                            ),
+                        },
+                        agent_id=run.agent_id,
+                    )
                 return
             trigger_hooks("PostToolUse", block, result)
             task["status"] = "completed"
             background_results[bg_id] = str(result)
+            run = current_run_context()
+            if run is not None:
+                run.recorder.record(
+                    "background_completed",
+                    {
+                        "background_id": bg_id,
+                        "latency_ms": round(
+                            (time.monotonic() - started) * 1000, 3
+                        ),
+                        "output": str(result),
+                    },
+                    agent_id=run.agent_id,
+                )
+
+    def worker():
+        copied_context.run(worker_body)
 
     with background_lock:
         if not _background_accepting:
@@ -130,6 +162,14 @@ def start_background_task(block, handlers: dict) -> str:
         thread.start()
     print(f"  \033[33m[background] {bg_id}: {str(command)[:60]}\033[0m")
     return bg_id
+
+
+def background_is_quiescent() -> bool:
+    with background_lock:
+        return not any(
+            task.get("thread") is not None and task["thread"].is_alive()
+            for task in background_tasks.values()
+        )
 
 
 def shutdown_background_tasks(timeout: float = 2.0) -> BackgroundShutdownOutcome:
