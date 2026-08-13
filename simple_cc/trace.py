@@ -146,6 +146,21 @@ def redact_value(value: Any, secrets: tuple[str, ...] = ()) -> Any:
     return value
 
 
+def configured_secrets_from_environment(
+    *extra: str | None,
+) -> tuple[str, ...]:
+    values = [str(item) for item in extra if item is not None and str(item)]
+    for key, value in os.environ.items():
+        normalized = key.upper()
+        if any(
+            token in normalized
+            for token in ("API_KEY", "TOKEN", "PASSWORD", "SECRET")
+        ):
+            if value and len(value) >= 8:
+                values.append(value)
+    return tuple(dict.fromkeys(values))
+
+
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -466,7 +481,9 @@ def supervisor_invalidate_manifest(
     manifest_path = run_dir / "manifest.json"
     previous: dict[str, Any] = {}
     corrupt_ref = None
+    superseded_ref = None
     if manifest_path.exists():
+        superseded_ref = _preserve_manifest_snapshot(run_dir, manifest_path)
         try:
             previous = json.loads(manifest_path.read_text(encoding="utf-8"))
         except Exception:
@@ -484,4 +501,36 @@ def supervisor_invalidate_manifest(
     }
     if corrupt_ref is not None:
         manifest["corrupt_manifest_artifact"] = corrupt_ref.as_dict()
+    if superseded_ref is not None:
+        manifest["superseded_manifest_artifact"] = superseded_ref.as_dict()
     _atomic_json(manifest_path, manifest)
+
+
+def _preserve_manifest_snapshot(
+    run_dir: Path, manifest_path: Path
+) -> ArtifactRef:
+    data = manifest_path.read_bytes()
+    digest = hashlib.sha256(data).hexdigest()
+    artifacts = run_dir / "artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    target = artifacts / f"superseded-manifest-{digest}"
+    if not target.exists():
+        fd, temporary = tempfile.mkstemp(prefix=".manifest-snapshot.", dir=artifacts)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, target)
+        except Exception:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
+    return ArtifactRef(
+        target.relative_to(run_dir).as_posix(),
+        digest,
+        "application/json",
+        len(data),
+    )

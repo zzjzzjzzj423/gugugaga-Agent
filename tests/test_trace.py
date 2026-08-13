@@ -171,3 +171,22 @@ def test_supervisor_details_cannot_override_parent_owned_identity(tmp_path):
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["run_id"] == "actual-run"
     assert manifest["task_id"] == "actual-task"
+
+
+def test_invalidation_preserves_exact_prior_terminal_manifest(tmp_path):
+    recorder = TraceRecorder(tmp_path / "run", run_id="run-1")
+    recorder.start_run(task_id="task-1", question="q", cutoff=None, metadata={})
+    recorder.finalize("completed")
+    original = recorder.manifest_path.read_bytes()
+
+    from simple_cc.trace import supervisor_invalidate_manifest
+
+    supervisor_invalidate_manifest(
+        recorder.run_dir,
+        {"run_id": "run-1", "task_id": "task-1"},
+        ["answer missing"],
+    )
+    manifest = json.loads(recorder.manifest_path.read_text(encoding="utf-8"))
+    ref = manifest["superseded_manifest_artifact"]
+    assert (recorder.run_dir / ref["path"]).read_bytes() == original
+    assert manifest["previous_status"] == "completed"

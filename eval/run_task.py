@@ -19,6 +19,7 @@ from simple_cc.provider import SiliconFlowProvider
 from simple_cc.trace import (
     TraceRecorder,
     TraceWriteError,
+    configured_secrets_from_environment,
     supervisor_invalidate_manifest,
 )
 from simple_cc.web_research import PIT_MODE
@@ -287,18 +288,8 @@ def main(argv: list[str] | None = None) -> int:
         provider,
         model=settings.model,
         max_rounds=settings.max_rounds,
-        secrets=_configured_secrets(settings.api_key),
+        secrets=configured_secrets_from_environment(settings.api_key),
     )
-
-
-def _configured_secrets(api_key: str) -> tuple[str, ...]:
-    values = [api_key]
-    for key, value in os.environ.items():
-        normalized = key.upper()
-        if any(token in normalized for token in ("API_KEY", "TOKEN", "PASSWORD", "SECRET")):
-            if value and len(value) >= 8:
-                values.append(value)
-    return tuple(dict.fromkeys(values))
 
 
 if __name__ == "__main__":

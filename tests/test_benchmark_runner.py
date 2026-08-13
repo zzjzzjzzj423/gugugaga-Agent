@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sys
 
-from eval.run_benchmark import RunnerOptions, run_benchmark
+from eval.run_benchmark import RunnerOptions, allocate_run, run_benchmark
 
 
 def _dataset(tmp_path, count=2):
@@ -144,3 +144,47 @@ def test_malformed_worker_manifest_does_not_crash_coordinator(tmp_path):
     )[0]
     assert result.manifest["status"] == "trace_invalid"
     assert list((result.run_dir / "artifacts").glob("corrupt-manifest-*"))
+
+
+def test_successful_process_with_nonterminal_manifest_is_trace_invalid(tmp_path):
+    result = run_benchmark(
+        RunnerOptions(_dataset(tmp_path, 1), tmp_path / "runs", workers=1),
+        worker_command=[
+            sys.executable,
+            "tests/fixtures/isolation_probe.py",
+            "--running-manifest",
+        ],
+    )[0]
+    assert result.exit_code == 0
+    assert result.manifest["status"] == "trace_invalid"
+    assert "not terminal" in " ".join(result.manifest["trace_validation_errors"])
+
+
+def test_terminal_manifest_identity_mismatch_is_trace_invalid(tmp_path):
+    result = run_benchmark(
+        RunnerOptions(_dataset(tmp_path, 1), tmp_path / "runs", workers=1),
+        worker_command=[
+            sys.executable,
+            "tests/fixtures/isolation_probe.py",
+            "--mismatched-identity",
+        ],
+    )[0]
+    assert result.manifest["status"] == "trace_invalid"
+    assert result.manifest["run_id"] == result.run_id
+    assert "identity mismatch" in " ".join(
+        result.manifest["trace_validation_errors"]
+    )
+
+
+def test_allocated_task_input_is_redacted_before_durable_write(tmp_path, monkeypatch):
+    secret = "sk-parent-environment-secret"
+    monkeypatch.setenv("SILICONFLOW_API_KEY", secret)
+    task = {
+        "task_id": "task-secret",
+        "question": f"Do not persist {secret}",
+        "cutoff": None,
+    }
+    assignment = allocate_run(task, tmp_path / "runs")
+    disk = assignment.task_input.read_text(encoding="utf-8")
+    assert secret not in disk
+    assert "[REDACTED:configured_secret]" in disk

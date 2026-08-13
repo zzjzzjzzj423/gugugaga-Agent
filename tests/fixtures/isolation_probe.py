@@ -19,6 +19,8 @@ def main():
     parser.add_argument("--workspace", type=Path, required=True)
     parser.add_argument("--sleep", type=float, default=0)
     parser.add_argument("--malformed-manifest", action="store_true")
+    parser.add_argument("--running-manifest", action="store_true")
+    parser.add_argument("--mismatched-identity", action="store_true")
     args = parser.parse_args()
     task = json.loads(args.task_input.read_text(encoding="utf-8"))
     state_names = (
@@ -58,6 +60,16 @@ def main():
     (args.run_dir / "final_answer.txt").write_text(answer, encoding="utf-8")
     if args.malformed_manifest:
         (args.run_dir / "manifest.json").write_text("{broken", encoding="utf-8")
+    elif args.running_manifest:
+        manifest_path = args.run_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["status"] = "running"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    elif args.mismatched_identity:
+        manifest_path = args.run_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["run_id"] = "forged-run-id"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
 
 if __name__ == "__main__":

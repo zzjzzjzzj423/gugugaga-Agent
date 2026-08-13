@@ -15,6 +15,9 @@ from typing import Any
 
 from simple_cc.eval_metrics import validate_completed_run
 from simple_cc.trace import (
+    TERMINAL_STATUSES,
+    configured_secrets_from_environment,
+    redact_value,
     supervisor_finalize_manifest,
     supervisor_invalidate_manifest,
 )
@@ -139,7 +142,10 @@ def allocate_run(
         "retry_of_run_id": retry_of_run_id,
     }
     task_input = run_dir / "task_input.json"
-    _atomic_json(task_input, payload)
+    _atomic_json(
+        task_input,
+        redact_value(payload, configured_secrets_from_environment()),
+    )
     return RunAssignment(
         task, run_id, run_dir, workspace, task_input, retry_of_run_id
     )
@@ -236,6 +242,11 @@ def launch_assignment(
             [f"manifest unreadable: {type(error).__name__}"],
         )
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    validation_errors = []
+    if manifest.get("run_id") != assignment.run_id or manifest.get("task_id") != assignment.task["task_id"]:
+        validation_errors.append("manifest identity mismatch")
+    if manifest.get("status") not in TERMINAL_STATUSES:
+        validation_errors.append("manifest status is not terminal")
     if manifest.get("status") == "completed":
         valid, errors = validate_completed_run(
             assignment.run_dir,
@@ -243,12 +254,14 @@ def launch_assignment(
             expected_task_id=assignment.task["task_id"],
         )
         if not valid:
-            supervisor_invalidate_manifest(
-                assignment.run_dir,
-                {"run_id": assignment.run_id, "task_id": assignment.task["task_id"]},
-                errors,
-            )
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            validation_errors.extend(errors)
+    if validation_errors:
+        supervisor_invalidate_manifest(
+            assignment.run_dir,
+            {"run_id": assignment.run_id, "task_id": assignment.task["task_id"]},
+            list(dict.fromkeys(validation_errors)),
+        )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     return RunResult(
         assignment.task["task_id"],
         assignment.run_id,
