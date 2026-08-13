@@ -31,9 +31,12 @@ _SENSITIVE_KEYS = {
     "apikey": "api_key",
     "authorization": "authorization",
     "cookie": "cookie",
+    "setcookie": "cookie",
     "password": "password",
     "secret": "configured_secret",
-    "token": "configured_secret",
+    "accesstoken": "configured_secret",
+    "refreshtoken": "configured_secret",
+    "authtoken": "configured_secret",
 }
 
 
@@ -116,7 +119,7 @@ def _jsonable(value: Any) -> Any:
 def _key_reason(key: str) -> str | None:
     normalized = str(key).lower().replace("_", "").replace("-", "")
     for candidate, reason in _SENSITIVE_KEYS.items():
-        if candidate in normalized:
+        if normalized == candidate or normalized.endswith(candidate):
             return reason
     return None
 

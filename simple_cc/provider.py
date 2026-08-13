@@ -30,9 +30,21 @@ class ToolUseBlock:
 
 
 @dataclass(frozen=True)
+class ProviderUsage:
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    total_tokens: int | None
+
+
+@dataclass(frozen=True)
 class ProviderResponse:
     content: list[TextBlock | ToolUseBlock]
     stop_reason: str
+    usage: ProviderUsage = field(
+        default_factory=lambda: ProviderUsage(None, None, None)
+    )
+    request_id: str | None = None
+    attempts: int = 1
 
 
 def _value(item: Any, name: str, default: Any = None) -> Any:
@@ -198,7 +210,19 @@ class SiliconFlowProvider(ChatProvider):
                 if message.content:
                     content.append(TextBlock(text=message.content))
                 content.extend(_tool_use_block(call) for call in (message.tool_calls or []))
-                return ProviderResponse(content=content, stop_reason=_stop_reason(choice.finish_reason))
+                raw_usage = _value(response, "usage")
+                usage = ProviderUsage(
+                    _value(raw_usage, "prompt_tokens"),
+                    _value(raw_usage, "completion_tokens"),
+                    _value(raw_usage, "total_tokens"),
+                )
+                return ProviderResponse(
+                    content=content,
+                    stop_reason=_stop_reason(choice.finish_reason),
+                    usage=usage,
+                    request_id=_value(response, "id"),
+                    attempts=attempt + 1,
+                )
             except Exception as error:
                 if is_context_length_error(error):
                     raise ContextLengthError(str(error)) from error

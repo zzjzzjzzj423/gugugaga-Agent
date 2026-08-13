@@ -1,0 +1,81 @@
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from simple_cc.provider import ProviderResponse, ProviderUsage, TextBlock
+from simple_cc.telemetry import TracingProvider, model_call_scope
+from simple_cc.trace import RunContext, TraceRecorder, bind_run_context
+
+
+class Delegate:
+    def __init__(self, response):
+        self.response = response
+
+    def create(self, messages, system, tools, max_tokens=8192, model=None):
+        if isinstance(self.response, Exception):
+            raise self.response
+        return self.response
+
+
+def _start(tmp_path):
+    recorder = TraceRecorder(tmp_path / "run", run_id="run-1")
+    recorder.start_run(task_id="task-1", question="q", cutoff=None, metadata={})
+    return recorder, RunContext(recorder, "run-1", "task-1", None)
+
+
+def _rows(recorder):
+    return [
+        json.loads(line)
+        for line in recorder.trajectory_path.read_text(encoding="utf-8").splitlines()
+    ]
+
+
+def test_tracing_provider_records_request_response_usage_and_latency(tmp_path):
+    recorder, run = _start(tmp_path)
+    delegate = Delegate(
+        ProviderResponse(
+            [TextBlock("answer")],
+            "end_turn",
+            usage=ProviderUsage(5, 3, 8),
+            request_id="req-1",
+            attempts=2,
+        )
+    )
+    provider = TracingProvider(delegate)
+
+    with bind_run_context(run), model_call_scope("agent"):
+        response = provider.create(
+            [{"role": "user", "content": "secret-free"}],
+            "system",
+            [],
+            100,
+            "model-a",
+        )
+
+    assert response.stop_reason == "end_turn"
+    rows = _rows(recorder)
+    request, result = rows[-2:]
+    assert request["event_type"] == "llm_request_started"
+    assert result["event_type"] == "llm_response"
+    assert request["span_id"] == result["span_id"]
+    assert result["payload"]["usage"]["total_tokens"] == 8
+    assert result["payload"]["attempts"] == 2
+    assert result["payload"]["latency_ms"] >= 0
+    artifact = recorder.run_dir / request["payload"]["request_artifact"]["path"]
+    saved = json.loads(artifact.read_text(encoding="utf-8"))
+    assert saved["messages"][0]["content"] == "secret-free"
+
+
+def test_tracing_provider_records_safe_error(tmp_path):
+    recorder, run = _start(tmp_path)
+    provider = TracingProvider(Delegate(RuntimeError("provider failed")))
+
+    with bind_run_context(run), pytest.raises(RuntimeError, match="provider failed"):
+        provider.create([], "", [], 100, "model-a")
+
+    event = _rows(recorder)[-1]
+    assert event["event_type"] == "llm_error"
+    assert event["payload"]["exception_class"] == "RuntimeError"
+    assert event["payload"]["latency_ms"] >= 0
