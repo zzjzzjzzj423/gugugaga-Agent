@@ -77,6 +77,49 @@ def test_execute_task_writes_completed_run_after_clean_shutdown(tmp_path):
     assert manifest["worker_pid"] > 0
 
 
+def test_execute_task_publishes_only_terminal_answer(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "simple_cc.benchmark._benchmark_tool_tables",
+        lambda options: (
+            [{"name": "noop", "description": "noop", "input_schema": {}}],
+            {"noop": lambda: "ok"},
+        ),
+    )
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    task = TaskInput("run-1", "task-1", "Research", None, "test", "research")
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                "intermediate narration",
+                [ToolCall("tool-1", "noop", {})],
+                "tool_calls",
+            ),
+            ModelResponse("terminal answer"),
+        ]
+    )
+
+    exit_code = execute_task(
+        task,
+        run_dir,
+        run_dir / "agent_workspace",
+        provider,
+        model="test-model",
+    )
+
+    rows, _ = read_trace_lines(run_dir / "trajectory.jsonl")
+    traced_answer = next(
+        row["payload"]["text"]
+        for row in rows
+        if row["event_type"] == "final_answer"
+    )
+    saved_answer = (run_dir / "final_answer.txt").read_text(encoding="utf-8")
+
+    assert exit_code == 0
+    assert traced_answer == "terminal answer"
+    assert saved_answer == traced_answer
+
+
 def test_execute_task_marks_provider_failure_without_final_answer(tmp_path):
     run_dir = tmp_path / "run"
     run_dir.mkdir()

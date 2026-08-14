@@ -201,7 +201,7 @@ def execute_task(
             options=options,
         )
         try:
-            answer = session.runtime.run_turn(
+            session.runtime.run_turn(
                 task.question,
                 task_id=task.task_id,
                 cutoff=task.cutoff,
@@ -231,7 +231,7 @@ def execute_task(
                 },
             )
             return 1
-        safe_answer = recorder.redact_text(answer)
+        safe_answer = recorder.redact_text(outcome.final_text)
         staged_answer = run_dir / ".final_answer.staged"
         recorder.record("run_completed", {"answer_chars": len(safe_answer)})
         _atomic_text(staged_answer, safe_answer)

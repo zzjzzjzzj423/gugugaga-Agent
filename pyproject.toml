@@ -22,3 +22,8 @@ test = ["pytest>=8"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-p no:cacheprovider"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["simple_cc*", "eval*"]
+exclude = ["tests*"]
