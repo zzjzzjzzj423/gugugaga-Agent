@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "simple-cc"
 version = "0.1.0"
-description = "A compact S01-S17 coding-agent harness using SiliconFlow"
+description = "A compact financial-research agent harness using SiliconFlow"
 requires-python = ">=3.11"
 dependencies = [
     "openai>=1.0",

@@ -1,5 +1,5 @@
 from simple_cc.context import ContextManager, MemoryStore, SkillStore
-from simple_cc.prompts import PromptAssembler
+from simple_cc.prompts import PromptAssembler, subagent_system_prompt
 
 
 def test_skill_store_discovers_metadata_then_loads_body(tmp_path):
@@ -69,3 +69,11 @@ def test_prompt_assembler_includes_named_runtime_sections():
     for heading in ("Workspace", "Tools", "Skills", "Memory", "Tasks", "Team", "Safety"):
         assert f"## {heading}" in prompt
     assert "alice (reviewer)" in prompt
+    assert "financial research agent" in prompt
+    assert "coding agent" not in prompt
+
+
+def test_subagent_prompt_has_financial_research_identity():
+    prompt = subagent_system_prompt()
+    assert "financial research subagent" in prompt
+    assert "coding subagent" not in prompt

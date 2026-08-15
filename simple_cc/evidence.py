@@ -93,6 +93,34 @@ def link_final_answer_sources(
     }
 
 
+def validate_research_final(
+    final_text: str,
+    registered_sources: dict[str, str],
+) -> list[str]:
+    errors: list[str] = []
+
+    domains = {
+        urlsplit(url).hostname
+        for url in registered_sources
+        if urlsplit(url).hostname
+    }
+    linkage = link_final_answer_sources(final_text, registered_sources)
+
+    if len(registered_sources) < 2:
+        errors.append("read at least two sources")
+
+    if len(domains) < 2:
+        errors.append("use at least two independent domains")
+
+    if not linkage["matched_source_ids"]:
+        errors.append("cite fetched sources in the final answer")
+
+    if linkage["unmatched_citations"]:
+        errors.append("final answer contains unfetched citations")
+
+    return errors
+
+
 def record_research_evidence(
     run: RunContext,
     tool_name: str,

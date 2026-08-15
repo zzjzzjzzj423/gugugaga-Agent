@@ -13,6 +13,10 @@ from simple_cc.trace import TraceRecorder, TraceWriteError, read_trace_lines
 from tests.fakes import ScriptedProvider
 
 
+def unsupported_research_provider(text: str = "answer") -> ScriptedProvider:
+    return ScriptedProvider([ModelResponse(text), ModelResponse(text)])
+
+
 def test_load_task_input_validates_required_fields_and_cutoff(tmp_path):
     path = tmp_path / "task.json"
     path.write_text(
@@ -67,13 +71,14 @@ def test_execute_task_writes_completed_run_after_clean_shutdown(tmp_path):
         task,
         run_dir,
         workspace,
-        ScriptedProvider([ModelResponse("answer")]),
+        unsupported_research_provider(),
         model="test-model",
     )
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     assert exit_code == 0
     assert manifest["status"] == "completed"
-    assert (run_dir / "final_answer.txt").read_text(encoding="utf-8") == "answer"
+    final_answer = (run_dir / "final_answer.txt").read_text(encoding="utf-8")
+    assert final_answer.startswith("INSUFFICIENT_EVIDENCE")
     assert manifest["worker_pid"] > 0
 
 
@@ -96,6 +101,7 @@ def test_execute_task_publishes_only_terminal_answer(tmp_path, monkeypatch):
                 "tool_calls",
             ),
             ModelResponse("terminal answer"),
+            ModelResponse("terminal answer"),
         ]
     )
 
@@ -116,7 +122,7 @@ def test_execute_task_publishes_only_terminal_answer(tmp_path, monkeypatch):
     saved_answer = (run_dir / "final_answer.txt").read_text(encoding="utf-8")
 
     assert exit_code == 0
-    assert traced_answer == "terminal answer"
+    assert traced_answer.startswith("INSUFFICIENT_EVIDENCE")
     assert saved_answer == traced_answer
 
 
@@ -161,7 +167,7 @@ def test_worker_cli_does_not_dirty_workspace_before_isolation_check(
     monkeypatch.setenv("SILICONFLOW_MODEL", "test-model")
     monkeypatch.setattr(
         "eval.run_task.SiliconFlowProvider",
-        lambda settings: ScriptedProvider([ModelResponse("answer")]),
+        lambda settings: unsupported_research_provider(),
     )
 
     exit_code = main(
@@ -176,14 +182,16 @@ def test_worker_cli_does_not_dirty_workspace_before_isolation_check(
     )
 
     assert exit_code == 0
-    assert (run_dir / "final_answer.txt").read_text(encoding="utf-8") == "answer"
+    final_answer = (run_dir / "final_answer.txt").read_text(encoding="utf-8")
+    assert final_answer.startswith("INSUFFICIENT_EVIDENCE")
 
 
 def test_offline_worker_search_fetch_answer_trace_is_self_consistent(
     tmp_path, monkeypatch
 ):
     cutoff = "2025-05-01"
-    url = "https://example.com/report?a=1&b=2"
+    url_a = "https://alpha.example/report?a=1&b=2"
+    url_b = "https://beta.example/data"
     seen_arguments = []
 
     def search(**arguments):
@@ -194,7 +202,10 @@ def test_offline_worker_search_fetch_answer_trace_is_self_consistent(
                 "operation": "search",
                 "query": arguments["query"],
                 "cutoff": arguments["cutoff"],
-                "results": [{"url": url, "title": "Report"}],
+                "results": [
+                    {"url": url_a, "title": "Report"},
+                    {"url": url_b, "title": "Data"},
+                ],
             }
         )
 
@@ -203,14 +214,14 @@ def test_offline_worker_search_fetch_answer_trace_is_self_consistent(
         capture_tool_artifact(
             b"<html>accepted evidence</html>",
             media_type="text/html",
-            source=url,
+            source=arguments["url"],
             suffix=".html",
         )
         return json.dumps(
             {
                 "ok": True,
                 "operation": "fetch",
-                "url": url,
+                "url": arguments["url"],
                 "cutoff": arguments["cutoff"],
                 "published_at": "2025-04-01",
                 "date_status": "known",
@@ -237,10 +248,20 @@ def test_offline_worker_search_fetch_answer_trace_is_self_consistent(
             ),
             ModelResponse(
                 "",
-                [ToolCall("fetch-1", "web_fetch", {"url": url})],
+                [ToolCall("fetch-1", "web_fetch", {"url": url_a})],
                 "tool_calls",
             ),
-            ModelResponse(f"Answer: {url}", [], "stop"),
+            ModelResponse(f"Draft answer: {url_a}", [], "stop"),
+            ModelResponse(
+                "",
+                [ToolCall("fetch-2", "web_fetch", {"url": url_b})],
+                "tool_calls",
+            ),
+            ModelResponse(
+                f"Final answer supported by {url_a} and {url_b}.",
+                [],
+                "stop",
+            ),
         ]
     )
     run_dir = tmp_path / "run"
@@ -259,7 +280,7 @@ def test_offline_worker_search_fetch_answer_trace_is_self_consistent(
 
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     rows, incomplete = read_trace_lines(run_dir / "trajectory.jsonl")
-    source = next(row for row in rows if row["event_type"] == "source_registered")
+    sources = [row for row in rows if row["event_type"] == "source_registered"]
     final = next(row for row in rows if row["event_type"] == "final_answer")
     llm = [row for row in rows if row["event_type"] == "llm_response"]
     tools = [row for row in rows if row["event_type"] == "tool_result"]
@@ -273,19 +294,23 @@ def test_offline_worker_search_fetch_answer_trace_is_self_consistent(
     assert valid is True, errors
     assert seen_arguments == [
         ("search", {"query": "report", "cutoff": cutoff}),
-        ("fetch", {"url": url, "cutoff": cutoff}),
+        ("fetch", {"url": url_a, "cutoff": cutoff}),
+        ("fetch", {"url": url_b, "cutoff": cutoff}),
     ]
-    assert source["payload"]["source_id"] in final["payload"]["matched_source_ids"]
+    assert len(sources) == 2
+    assert {
+        row["payload"]["source_id"] for row in sources
+    } == set(final["payload"]["matched_source_ids"])
     assert all(row["payload"]["latency_ms"] >= 0 for row in llm + tools)
-    assert metrics.model_calls == 3
+    assert metrics.model_calls == 5
     assert metrics.searches == 1
-    assert metrics.fetches == 1
+    assert metrics.fetches == 2
     assert metrics.all_in_prompt_tokens is None
 
 
 def test_worker_redacts_configured_secret_everywhere(tmp_path):
     secret = "sk-test-super-secret-value"
-    provider = ScriptedProvider([ModelResponse(f"answer {secret}")])
+    provider = unsupported_research_provider(f"answer {secret}")
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     task = TaskInput(
@@ -318,7 +343,7 @@ def test_manifest_hashes_match_first_captured_request(tmp_path):
         task,
         run_dir,
         run_dir / "agent_workspace",
-        ScriptedProvider([ModelResponse("answer")]),
+        unsupported_research_provider(),
         model="test-model",
     ) == 0
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
@@ -354,7 +379,7 @@ def test_trace_finalize_failure_never_publishes_official_answer(tmp_path, monkey
         TaskInput("run-1", "task-1", "q", None, "test", "research"),
         run_dir,
         run_dir / "agent_workspace",
-        ScriptedProvider([ModelResponse("answer")]),
+        unsupported_research_provider(),
         model="test-model",
     )
     assert exit_code == 2

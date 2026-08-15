@@ -10,6 +10,7 @@ from simple_cc.evidence import (
     canonicalize_url,
     link_final_answer_sources,
     prepare_research_arguments,
+    validate_research_final,
 )
 from simple_cc.models import ModelResponse, ToolCall
 from simple_cc.trace import TraceRecorder, read_trace_lines
@@ -70,6 +71,7 @@ def test_source_runtime_traces_tool_and_injects_cutoff(tmp_path, monkeypatch):
                 "tool_calls",
             ),
             ModelResponse("Research complete", [], "stop"),
+            ModelResponse("Research complete", [], "stop"),
         ]
     )
     recorder = TraceRecorder(tmp_path / "run", run_id="run-1")
@@ -100,7 +102,8 @@ def test_source_runtime_traces_tool_and_injects_cutoff(tmp_path, monkeypatch):
     finally:
         config.configure_workspace(old_workspace)
 
-    assert answer == "Research complete"
+    assert answer.startswith("INSUFFICIENT_EVIDENCE")
+    assert len(provider.requests) == 3
     assert runtime.last_outcome.status == "completed"
     assert seen == [{"query": "rates", "cutoff": "2025-05-01"}]
     rows = [
@@ -124,6 +127,7 @@ def test_tool_exception_has_exactly_one_terminal_trace_event(tmp_path):
                 [ToolCall("tool-1", "explode", {})],
                 "tool_calls",
             ),
+            ModelResponse("done", [], "stop"),
             ModelResponse("done", [], "stop"),
         ]
     )
@@ -186,6 +190,7 @@ def test_cutoff_mismatch_is_a_failed_terminal_tool_result(tmp_path):
                 "tool_calls",
             ),
             ModelResponse("done", [], "stop"),
+            ModelResponse("done", [], "stop"),
         ]
     )
     recorder = TraceRecorder(tmp_path / "run", run_id="run-cutoff")
@@ -210,3 +215,74 @@ def test_cutoff_mismatch_is_a_failed_terminal_tool_result(tmp_path):
     assert len(results) == 1
     assert results[0]["payload"]["success"] is False
     assert results[0]["payload"]["error_code"] == "cutoff_mismatch"
+
+def test_validate_research_final_accepts_traceable_sources():
+    sources = {
+        "https://alpha.example/report": "src_alpha",
+        "https://beta.example/data": "src_beta",
+    }
+
+    errors = validate_research_final(
+        (
+            "The result is supported by "
+            "https://alpha.example/report and "
+            "https://beta.example/data."
+        ),
+        sources,
+    )
+
+    assert errors == []
+
+
+def test_validate_research_final_rejects_weak_evidence():
+    sources = {
+        "https://alpha.example/report": "src_alpha",
+    }
+
+    errors = validate_research_final(
+        "See https://unfetched.example/report.",
+        sources,
+    )
+
+    assert errors == [
+        "read at least two sources",
+        "use at least two independent domains",
+        "cite fetched sources in the final answer",
+        "final answer contains unfetched citations",
+    ]
+
+def test_research_finalization_allows_only_one_repair(tmp_path):
+    provider = ScriptedProvider(
+        [
+            ModelResponse("First unsupported answer", [], "stop"),
+            ModelResponse("Second unsupported answer", [], "stop"),
+        ]
+    )
+
+    recorder = TraceRecorder(tmp_path / "run", run_id="run-gate")
+    recorder.start_run(
+        task_id="task-gate",
+        question="Research the company",
+        cutoff="2025-05-01",
+        metadata={},
+    )
+
+    runtime = agent.SourceRuntime(
+        provider,
+        recorder=recorder,
+        tool_definitions=[],
+        tool_handlers={},
+        memory_enabled=False,
+    )
+
+    answer = runtime.run_turn(
+        "Research the company",
+        task_id="task-gate",
+        cutoff="2025-05-01",
+    )
+
+    assert len(provider.requests) == 2
+    assert answer.startswith("INSUFFICIENT_EVIDENCE")
+
+    repair_message = provider.requests[1]["messages"][-1]["content"]
+    assert repair_message.startswith("[Research finalization blocked]")

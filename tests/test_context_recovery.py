@@ -141,9 +141,9 @@ def test_summarize_history_calls_provider_with_anthropic_shaped_message(monkeypa
                 {
                     "role": "user",
                     "content": (
-                        "Summarize this coding-agent conversation so work can continue. "
-                        "Preserve current goal, key findings, changed files, remaining work, "
-                        "and user constraints.\n\n"
+                        "Summarize this financial-research conversation so work can continue. "
+                        "Preserve the current question, key findings, source URLs, remaining "
+                        "research, uncertainties, and user constraints.\n\n"
                         '[{"role": "user", "content": "fix the parser"}]'
                     ),
                 }

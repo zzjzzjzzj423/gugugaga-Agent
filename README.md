@@ -1,6 +1,6 @@
 # Simple CC（SiliconFlow 版）
 
-Simple CC 是一个从 `learn-claude-code` S20 综合示例拆分出的教学型 Coding Agent。它保留 S01 Agent Loop 到 S17 Autonomous Agents 的控制流，并通过 SiliconFlow 的 OpenAI 兼容 Chat Completions / Function Calling 接口调用模型。
+Simple CC 是一个从 `learn-claude-code` S20 综合示例演化而来的教学型金融研究 Agent。它保留精简的 Agent Loop 与工具调用控制流，并通过 SiliconFlow 的 OpenAI 兼容 Chat Completions / Function Calling 接口调用模型。
 
 模型请求只有一个内部边界：`SiliconFlowProvider.create()`。Agent、一次性 Subagent、Team Teammate 和上下文摘要都使用相同的 S20 内容块协议（`text`、`tool_use`、`tool_result`）。
 

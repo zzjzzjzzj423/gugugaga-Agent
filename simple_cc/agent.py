@@ -38,6 +38,7 @@ from .evidence import (
     link_final_answer_sources,
     prepare_research_arguments,
     record_research_evidence,
+    validate_research_final,
 )
 from .telemetry import ToolCapture, TracingProvider, bind_tool_capture
 from .trace import RunContext, TraceRecorder, bind_run_context
@@ -275,6 +276,7 @@ def agent_loop(
         config.MEMORY_ENABLED if memory_enabled is None else memory_enabled
     )
     registered_sources = registered_sources if registered_sources is not None else {}
+    research_final_repair_used = False
 
     def record_compaction(report) -> None:
         if run_context is None:
@@ -425,32 +427,92 @@ def agent_loop(
         max_tokens = config.DEFAULT_MAX_TOKENS
         state.has_escalated = False
         messages.append({"role": "assistant", "content": response.content})
+
         if not has_tool_use(response.content):
+            final_text = extract_text(response.content)
+
+            # Recorded financial-research runs must pass the evidence gate.
+            if run_context is not None:
+                final_errors = validate_research_final(
+                    final_text,
+                    registered_sources,
+                )
+
+                if final_errors:
+                    can_repair = (
+                        not research_final_repair_used
+                        and _round_index + 1 < max_rounds
+                    )
+
+                    if can_repair:
+                        research_final_repair_used = True
+
+                        # 不把被拒绝的草稿留在最终返回文本里。
+                        # 原始模型响应仍然保留在 trajectory trace 中。
+                        messages.pop()
+
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "[Research finalization blocked]\n"
+                                    + "\n".join(
+                                        f"- {error}" for error in final_errors
+                                    )
+                                    + "\n\n"
+                                    "Repair the research once, then return "
+                                    "the final report."
+                                ),
+                            }
+                        )
+                        continue
+
+                    # 已经修复过一次，或者没有剩余 round：
+                    # 返回受控弃答，不再反复要求模型搜索。
+                    final_text = (
+                        "INSUFFICIENT_EVIDENCE\n\n"
+                        "Research finalization failed:\n"
+                        + "\n".join(
+                            f"- {error}" for error in final_errors
+                        )
+                    )
+
+                    # SourceRuntime 会从 messages 中读取返回文本，
+                    # 所以必须同步替换最后一条 assistant 消息。
+                    messages[-1] = {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": final_text,
+                            }
+                        ],
+                    }
+
             trigger_hooks("Stop", messages)
 
             # 只有真人触发且正常完成的回合才提取记忆。
-            # 错误、max_tokens、工具中间轮次、定时任务都不会进入这里保存。
             if (
-                    memory_store is not None
-                    and turn_prompt
-                    and not turn_prompt.lstrip().startswith(
-                (
+                memory_store is not None
+                and turn_prompt
+                and not turn_prompt.lstrip().startswith(
+                    (
                         "[Scheduled]",
                         "<reminder>",
                         "[Compacted]",
                         "[Reactive compact]",
                         "<task_notification>",
                         "<teammate-message>",
+                    )
                 )
-            )
             ):
                 memory_store.extract(
                     memory_snapshot,
-                    extract_text(response.content),
+                    final_text,
                 )
                 memory_store.consolidate_if_needed()
 
-            return AgentLoopOutcome("completed", extract_text(response.content))
+            return AgentLoopOutcome("completed", final_text)
 
         results = []
         compacted_now = False
@@ -813,8 +875,8 @@ class AgentRuntime:
         try:
             response = self.provider.create(
                 system=(
-                    "Summarize this coding-agent history. Preserve goals, "
-                    "decisions, files changed, pending tasks, and errors."
+                    "Summarize this financial-research history. Preserve goals, "
+                    "evidence, source URLs, decisions, pending tasks, and errors."
                 ),
                 messages=[{"role": "user", "content": transcript}],
                 tools=[],
