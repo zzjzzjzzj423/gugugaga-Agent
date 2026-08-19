@@ -393,6 +393,7 @@ def test_offline_worker_search_fetch_answer_trace_is_self_consistent(
     rows, incomplete = read_trace_lines(run_dir / "trajectory.jsonl")
     sources = [row for row in rows if row["event_type"] == "source_registered"]
     final = next(row for row in rows if row["event_type"] == "final_answer")
+    saved_answer = (run_dir / "final_answer.txt").read_text(encoding="utf-8")
     llm = [row for row in rows if row["event_type"] == "llm_response"]
     tools = [row for row in rows if row["event_type"] == "tool_result"]
     valid, errors = validate_trace(run_dir)
@@ -412,6 +413,7 @@ def test_offline_worker_search_fetch_answer_trace_is_self_consistent(
     assert {
         row["payload"]["source_id"] for row in sources
     } == set(final["payload"]["matched_source_ids"])
+    assert saved_answer == final["payload"]["text"]
     assert all(row["payload"]["latency_ms"] >= 0 for row in llm + tools)
     assert metrics.model_calls == 7
     assert metrics.searches == 1

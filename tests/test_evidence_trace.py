@@ -19,6 +19,41 @@ from simple_cc.trace import TraceRecorder, read_trace_lines
 from tests.fakes import ScriptedProvider
 
 
+def _light_plan_response() -> ModelResponse:
+    return ModelResponse(json.dumps({
+        "rank": "light",
+        "directions": ["primary filings"],
+        "reason": "bounded trace test",
+    }))
+
+
+def _failed_gate_response() -> ModelResponse:
+    return ModelResponse(json.dumps({
+        "directions": [{
+            "direction": "primary filings",
+            "covered": False,
+            "source_ids": [],
+            "reason": "no fetched evidence",
+        }],
+        "authorities": [],
+        "gaps": ["no fetched evidence"],
+    }))
+
+
+def _unsupported_research_script(
+    initial_research_responses: list[ModelResponse],
+) -> list[ModelResponse]:
+    return [
+        _light_plan_response(),
+        *initial_research_responses,
+        _failed_gate_response(),
+        ModelResponse("supplemental research notes"),
+        _failed_gate_response(),
+        ModelResponse("unsupported draft"),
+        ModelResponse("unsupported rewrite"),
+    ]
+
+
 def test_cutoff_is_injected_and_mismatch_is_rejected():
     prepared = prepare_research_arguments(
         "web_search", {"query": "rates"}, required_cutoff="2025-05-01"
@@ -66,14 +101,14 @@ def test_source_runtime_traces_tool_and_injects_cutoff(tmp_path, monkeypatch):
         )
 
     provider = ScriptedProvider(
-        [
+        _unsupported_research_script([
             ModelResponse(
                 "",
                 [ToolCall("search-1", "web_search", {"query": "rates"})],
                 "tool_calls",
             ),
-            ModelResponse("Research complete", [], "stop"),
-        ]
+            ModelResponse("initial research notes", [], "stop"),
+        ])
     )
     recorder = TraceRecorder(tmp_path / "run", run_id="run-1")
     recorder.start_run(
@@ -98,13 +133,16 @@ def test_source_runtime_traces_tool_and_injects_cutoff(tmp_path, monkeypatch):
     )
     try:
         answer = runtime.run_turn(
-            "Research rates", task_id="task-1", cutoff="2025-05-01"
+            "Research rates",
+            task_id="task-1",
+            cutoff="2025-05-01",
+            run_metadata={"task_type": "research"},
         )
     finally:
         config.configure_workspace(old_workspace)
 
-    assert answer == "Research complete"
-    assert len(provider.requests) == 2
+    assert answer.startswith("INSUFFICIENT_EVIDENCE")
+    assert len(provider.requests) == 8
     assert runtime.last_outcome.status == "completed"
     assert seen == [{"query": "rates", "cutoff": "2025-05-01"}]
     rows = [
@@ -175,7 +213,7 @@ def test_cutoff_mismatch_is_a_failed_terminal_tool_result(tmp_path):
         return "should not run"
 
     provider = ScriptedProvider(
-        [
+        _unsupported_research_script([
             ModelResponse(
                 "",
                 [
@@ -190,9 +228,8 @@ def test_cutoff_mismatch_is_a_failed_terminal_tool_result(tmp_path):
                 ],
                 "tool_calls",
             ),
-            ModelResponse("done", [], "stop"),
-            ModelResponse("done", [], "stop"),
-        ]
+            ModelResponse("initial research notes", [], "stop"),
+        ])
     )
     recorder = TraceRecorder(tmp_path / "run", run_id="run-cutoff")
     recorder.start_run(
@@ -208,7 +245,12 @@ def test_cutoff_mismatch_is_a_failed_terminal_tool_result(tmp_path):
         memory_enabled=False,
     )
 
-    runtime.run_turn("test", task_id="task-cutoff", cutoff="2025-05-01")
+    runtime.run_turn(
+        "test",
+        task_id="task-cutoff",
+        cutoff="2025-05-01",
+        run_metadata={"task_type": "research"},
+    )
     rows, _ = read_trace_lines(recorder.trajectory_path)
     results = [row for row in rows if row["event_type"] == "tool_result"]
 

@@ -4,8 +4,9 @@ import json
 
 import pytest
 
+from simple_cc import agent, config
 from simple_cc.agent import AgentLoopOutcome
-from simple_cc.evidence import evidence_record_from_result
+from simple_cc.evidence import evidence_record_from_result, source_id_for_url
 from simple_cc.models import ModelResponse, ToolCall
 from simple_cc.research_models import EvidenceRegistry, ResearchPlan, ResearchRank
 from simple_cc.research_workflow import (
@@ -15,7 +16,12 @@ from simple_cc.research_workflow import (
     parse_research_plan,
 )
 from simple_cc.telemetry import TracingProvider
-from simple_cc.trace import RunContext, TraceRecorder, bind_run_context
+from simple_cc.trace import (
+    RunContext,
+    TraceRecorder,
+    bind_run_context,
+    read_trace_lines,
+)
 from tests.fakes import ScriptedProvider
 
 
@@ -545,9 +551,238 @@ def test_initial_gate_pass_skips_supplement():
     assert executor_calls == [(10, False, True)]
     assert result.research_rounds_used == 3
     assert result.supplemental_research_used is False
+    assert result.writing_repair_used is False
+    assert len(provider.requests) == 3
     writing_content = provider.requests[-1]["messages"][0]["content"]
     assert "src_" in writing_content
     assert "private-unregistered.example" not in writing_content
+
+
+def test_routed_trace_orders_phases_shares_budget_and_links_sources(
+    tmp_path, monkeypatch
+):
+    old_workspace = config.WORKDIR
+    config.configure_workspace(tmp_path / "workspace")
+    monkeypatch.setattr(config, "MEMORY_ENABLED", False)
+    cutoff = "2025-05-01"
+    urls = (
+        "https://alpha.example/report",
+        "https://beta.example/data",
+    )
+    source_ids = tuple(source_id_for_url(url) for url in urls)
+
+    def fetch(**arguments):
+        return json.dumps({
+            "ok": True,
+            "url": arguments["url"],
+            "title": "Registered evidence",
+            "content": f"evidence from {arguments['url']}",
+            "published_at": "2025-01-02",
+            "date_status": "verified",
+            "cutoff": arguments["cutoff"],
+        })
+
+    failed_gate = ModelResponse(json.dumps({
+        "directions": [{
+            "direction": "primary filings",
+            "covered": False,
+            "source_ids": [],
+            "reason": "independent corroboration is still missing",
+        }],
+        "authorities": [{
+            "source_id": source_ids[0],
+            "is_authoritative": True,
+            "reason": "official disclosure",
+        }],
+        "gaps": ["independent corroboration is still missing"],
+    }))
+    passing_gate = ModelResponse(json.dumps({
+        "directions": [{
+            "direction": "primary filings",
+            "covered": True,
+            "source_ids": list(source_ids),
+            "reason": "the registered sources now corroborate the filing",
+        }],
+        "authorities": [{
+            "source_id": source_ids[0],
+            "is_authoritative": True,
+            "reason": "official disclosure",
+        }],
+        "gaps": [],
+    }))
+    provider = ScriptedProvider([
+        light_plan_response(),
+        ModelResponse(
+            "",
+            [ToolCall("fetch-1", "web_fetch", {"url": urls[0]})],
+            "tool_calls",
+        ),
+        ModelResponse(
+            "",
+            [ToolCall("fetch-2", "web_fetch", {"url": urls[1]})],
+            "tool_calls",
+        ),
+        ModelResponse("initial research notes"),
+        failed_gate,
+        ModelResponse("supplemental research notes"),
+        passing_gate,
+        ModelResponse(f"Report {urls[0]} {urls[1]}"),
+    ])
+    recorder = TraceRecorder(tmp_path / "run", run_id="routed-trace-run")
+    recorder.start_run(
+        task_id="research-task",
+        question="question",
+        cutoff=cutoff,
+        metadata={"task_type": "research"},
+    )
+    runtime = agent.SourceRuntime(
+        provider,
+        recorder=recorder,
+        tool_definitions=[{
+            "name": "web_fetch",
+            "description": "fetch",
+            "input_schema": {},
+        }],
+        tool_handlers={"web_fetch": fetch},
+        memory_enabled=False,
+    )
+
+    try:
+        final_answer = runtime.run_turn(
+            "question",
+            task_id="research-task",
+            cutoff=cutoff,
+            run_metadata={"task_type": "research"},
+        )
+    finally:
+        config.configure_workspace(old_workspace)
+
+    rows, incomplete = read_trace_lines(recorder.trajectory_path)
+    workflow_event_names = {
+        "task_routed",
+        "research_plan",
+        "research_attempt_started",
+        "research_attempt_finished",
+        "research_gate",
+        "writing_attempt_started",
+        "writing_gate",
+        "research_workflow_completed",
+    }
+    workflow_rows = [
+        row for row in rows if row["event_type"] in workflow_event_names
+    ]
+    assert incomplete is False
+    assert [row["event_type"] for row in workflow_rows] == [
+        "task_routed",
+        "research_plan",
+        "research_attempt_started",
+        "research_attempt_finished",
+        "research_gate",
+        "research_attempt_started",
+        "research_attempt_finished",
+        "research_gate",
+        "writing_attempt_started",
+        "writing_gate",
+        "research_workflow_completed",
+    ]
+    assert {row["agent_id"] for row in workflow_rows} == {"root"}
+
+    first_finished = next(
+        row for row in workflow_rows
+        if row["event_type"] == "research_attempt_finished"
+        and row["payload"]["attempt"] == 1
+    )
+    second_started = next(
+        row for row in workflow_rows
+        if row["event_type"] == "research_attempt_started"
+        and row["payload"]["attempt"] == 2
+    )
+    assert second_started["payload"]["supplied_rounds"] == (
+        10 - first_finished["payload"]["used_rounds"]
+    )
+
+    registered_sequences = {
+        row["payload"]["source_id"]: row["sequence"]
+        for row in rows
+        if row["event_type"] == "source_registered"
+    }
+    for gate in (
+        row for row in workflow_rows if row["event_type"] == "research_gate"
+    ):
+        for source_id in gate["payload"]["authoritative_source_ids"]:
+            assert registered_sequences[source_id] < gate["sequence"]
+
+    final_event = next(
+        row for row in rows if row["event_type"] == "final_answer"
+    )
+    assert final_answer == f"Report {urls[0]} {urls[1]}"
+    assert set(final_event["payload"]["matched_source_ids"]) == set(source_ids)
+    assert final_event["payload"]["unmatched_citations"] == []
+
+
+def test_routed_trace_caps_research_and_writing_retries(tmp_path):
+    failed_gate = json.dumps({
+        "directions": [{
+            "direction": "primary filings",
+            "covered": False,
+            "source_ids": [],
+            "reason": "no registered evidence",
+        }],
+        "authorities": [],
+        "gaps": ["no registered evidence"],
+    })
+    provider = ScriptedProvider([
+        light_plan_response(),
+        ModelResponse("initial research notes"),
+        ModelResponse(failed_gate),
+        ModelResponse("supplemental research notes"),
+        ModelResponse(failed_gate),
+        ModelResponse("unsupported draft"),
+        ModelResponse("unsupported rewrite"),
+    ])
+    recorder = TraceRecorder(tmp_path / "run", run_id="retry-cap-run")
+    recorder.start_run(
+        task_id="research-task",
+        question="question",
+        cutoff=None,
+        metadata={"task_type": "research"},
+    )
+    runtime = agent.SourceRuntime(
+        provider,
+        recorder=recorder,
+        tool_definitions=[],
+        tool_handlers={},
+        memory_enabled=False,
+    )
+
+    final_answer = runtime.run_turn(
+        "question",
+        task_id="research-task",
+        run_metadata={"task_type": "research"},
+    )
+
+    rows, incomplete = read_trace_lines(recorder.trajectory_path)
+    assert incomplete is False
+    assert len([
+        row for row in rows
+        if row["event_type"] == "research_attempt_started"
+    ]) == 2
+    assert len([
+        row for row in rows
+        if row["event_type"] == "writing_repair_started"
+    ]) == 1
+    assert len([
+        row for row in rows
+        if row["event_type"] in {
+            "writing_attempt_started",
+            "writing_repair_started",
+        }
+    ]) == 2
+    assert len([
+        row for row in rows
+        if row["event_type"] == "writing_gate"
+    ]) == 2
+    assert final_answer.startswith("INSUFFICIENT_EVIDENCE")
 
 
 def test_failed_gate_uses_remaining_budget_once():

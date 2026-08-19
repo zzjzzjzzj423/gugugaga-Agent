@@ -45,6 +45,8 @@ TARGET_MODULES = (
     "simple_cc.prompts",
     "simple_cc.provider",
     "simple_cc.recovery",
+    "simple_cc.research_models",
+    "simple_cc.research_workflow",
     "simple_cc.skills",
     "simple_cc.subagents",
     "simple_cc.tasks",
