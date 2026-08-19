@@ -393,9 +393,11 @@ def agent_loop(
         config.MEMORY_ENABLED if memory_enabled is None else memory_enabled
     )
     registered_sources = registered_sources if registered_sources is not None else {}
-    required_cutoff = (
-        research_cutoff if evidence_registry is not None else None
-    )
+    required_cutoff = None
+    if evidence_registry is not None:
+        required_cutoff = research_cutoff
+        if required_cutoff is None and run_context is not None:
+            required_cutoff = run_context.cutoff
 
     def record_compaction(report) -> None:
         if run_context is None:

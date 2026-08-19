@@ -19,7 +19,7 @@ from simple_cc.research_models import (
     ResearchWorkflowResult,
 )
 from simple_cc.research_workflow import ResearchWorkflowError
-from simple_cc.trace import TraceRecorder, read_trace_lines
+from simple_cc.trace import RunContext, TraceRecorder, read_trace_lines
 
 
 class ScriptedProvider:
@@ -663,6 +663,139 @@ def test_untraced_ordinary_task_does_not_enforce_research_cutoff(monkeypatch):
         run_metadata={"task_type": "normal"},
     ) == "ordinary answer"
     assert seen == [{"query": "q"}]
+
+
+def _direct_research_run(tmp_path, run_id, cutoff):
+    recorder = TraceRecorder(tmp_path / run_id, run_id=run_id)
+    recorder.start_run(
+        task_id=f"{run_id}-task",
+        question="q",
+        cutoff=cutoff,
+        metadata={},
+    )
+    return RunContext(recorder, run_id, f"{run_id}-task", cutoff)
+
+
+def test_direct_agent_loop_falls_back_to_run_context_cutoff(tmp_path):
+    seen = []
+    provider = ScriptedProvider([
+        ProviderResponse(
+            [ToolUseBlock("search-1", "web_search", {"query": "q"})],
+            "tool_use",
+        ),
+        ProviderResponse([TextBlock(text="research notes")], "end_turn"),
+    ])
+    registry = EvidenceRegistry()
+    run = _direct_research_run(tmp_path, "legacy-inject", "2025-05-01")
+
+    outcome = agent.agent_loop(
+        [{"role": "user", "content": "q"}],
+        {},
+        provider=provider,
+        tools=[{
+            "name": "web_search",
+            "description": "search",
+            "input_schema": {},
+        }],
+        handlers={
+            "web_search": lambda **arguments: (
+                seen.append(arguments)
+                or json.dumps({"ok": True, "results": []})
+            )
+        },
+        memory_enabled=False,
+        run_context=run,
+        evidence_registry=registry,
+        finalize_user_turn=False,
+    )
+
+    assert outcome.status == "completed"
+    assert seen == [{"query": "q", "cutoff": "2025-05-01"}]
+
+
+def test_direct_agent_loop_fallback_rejects_cutoff_mismatch(tmp_path):
+    called = False
+
+    def fetch(**arguments):
+        nonlocal called
+        called = True
+        return "should not run"
+
+    provider = ScriptedProvider([
+        ProviderResponse(
+            [ToolUseBlock(
+                "fetch-1",
+                "web_fetch",
+                {
+                    "url": "https://example.com/report",
+                    "cutoff": "2025-05-02",
+                },
+            )],
+            "tool_use",
+        ),
+        ProviderResponse([TextBlock(text="research notes")], "end_turn"),
+    ])
+    registry = EvidenceRegistry()
+    run = _direct_research_run(tmp_path, "legacy-mismatch", "2025-05-01")
+
+    outcome = agent.agent_loop(
+        [{"role": "user", "content": "q"}],
+        {},
+        provider=provider,
+        tools=[{
+            "name": "web_fetch",
+            "description": "fetch",
+            "input_schema": {},
+        }],
+        handlers={"web_fetch": fetch},
+        memory_enabled=False,
+        run_context=run,
+        evidence_registry=registry,
+        finalize_user_turn=False,
+    )
+    result = provider.requests[1]["messages"][-1]["content"][0]
+
+    assert outcome.status == "completed"
+    assert called is False
+    assert json.loads(result["content"])["error"]["code"] == "cutoff_mismatch"
+
+
+def test_direct_agent_loop_explicit_research_cutoff_precedes_run_context(tmp_path):
+    seen = []
+    provider = ScriptedProvider([
+        ProviderResponse(
+            [ToolUseBlock("search-1", "web_search", {"query": "q"})],
+            "tool_use",
+        ),
+        ProviderResponse([TextBlock(text="research notes")], "end_turn"),
+    ])
+    registry = EvidenceRegistry()
+    run = _direct_research_run(tmp_path, "explicit-cutoff", "2025-04-01")
+
+    outcome = agent.agent_loop(
+        [{"role": "user", "content": "q"}],
+        {},
+        provider=provider,
+        tools=[{
+            "name": "web_search",
+            "description": "search",
+            "input_schema": {},
+        }],
+        handlers={
+            "web_search": lambda **arguments: (
+                seen.append(arguments)
+                or json.dumps({"ok": True, "results": []})
+            )
+        },
+        memory_enabled=False,
+        run_context=run,
+        evidence_registry=registry,
+        research_cutoff="2025-05-01",
+        finalize_user_turn=False,
+    )
+
+    assert outcome.status == "completed"
+    assert seen == [{"query": "q", "cutoff": "2025-05-01"}]
 
 
 def test_source_runtime_traces_explicit_and_default_routing(tmp_path):
