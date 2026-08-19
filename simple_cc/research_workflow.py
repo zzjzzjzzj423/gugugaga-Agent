@@ -6,14 +6,17 @@ from dataclasses import asdict
 from typing import Any, Callable
 
 from . import config
+from .evidence import validate_research_final
 from .models import ChatProvider
 from .research_models import (
     DirectionAssessment,
     EvidenceRegistry,
+    ResearchBudget,
     ResearchExecutionOutcome,
     ResearchGateDecision,
     ResearchPlan,
     ResearchRank,
+    ResearchWorkflowResult,
 )
 from .subagents import extract_text
 from .telemetry import model_call_scope
@@ -35,6 +38,17 @@ _FENCED_JSON = re.compile(
     r"\A```json[ \t]*\r?\n(?P<body>.*?)\r?\n```[ \t]*\Z",
     re.IGNORECASE | re.DOTALL,
 )
+
+
+class ResearchWorkflowError(RuntimeError):
+    """Terminal research-execution failure with benchmark-safe details."""
+
+    def __init__(self, failure_class: str, failure_message: str) -> None:
+        self.failure_class = str(failure_class or "ResearchWorkflowError")
+        self.failure_message = str(
+            failure_message or "research workflow execution failed"
+        )
+        super().__init__(f"{self.failure_class}: {self.failure_message}")
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -358,6 +372,8 @@ class ResearchWorkflow:
         cutoff: str | None,
         plan: ResearchPlan,
         registry: EvidenceRegistry,
+        *,
+        attempt: int | None = None,
     ) -> ResearchGateDecision:
         system = (
             "Evaluate research sufficiency only from the supplied registered "
@@ -388,6 +404,7 @@ class ResearchWorkflow:
         decision = parse_research_gate(raw, plan, registry)
         artifact = self._record_output_artifact(raw, "research_gate_output")
         self._record("research_gate", {
+            "attempt": attempt,
             "passed": decision.passed,
             "source_count": decision.source_count,
             "domain_count": decision.domain_count,
@@ -400,3 +417,382 @@ class ResearchWorkflow:
             "raw_output_artifact": artifact.as_dict() if artifact else None,
         })
         return decision
+
+    def _research_prompt(
+        self,
+        question: str,
+        cutoff: str | None,
+        plan: ResearchPlan,
+        gaps: tuple[str, ...],
+        remaining_rounds: int,
+    ) -> str:
+        return json.dumps({
+            "instructions": (
+                "Research the supplied directions using fetched primary and "
+                "independent sources. Register successful fetches in the shared "
+                "evidence registry. Search snippets are leads, not evidence."
+            ),
+            "question": question,
+            "cutoff": cutoff,
+            "rank": plan.rank.value,
+            "fixed_policy": asdict(plan.policy),
+            "directions": list(plan.directions),
+            "remaining_rounds": remaining_rounds,
+            "research_gaps": list(gaps),
+        }, ensure_ascii=False, sort_keys=True)
+
+    def _consume_outcome(
+        self,
+        budget: ResearchBudget,
+        outcome: ResearchExecutionOutcome,
+        supplied_rounds: int,
+    ) -> int:
+        rounds_used = getattr(outcome, "rounds_used", None)
+        if (
+            isinstance(rounds_used, bool)
+            or not isinstance(rounds_used, int)
+            or rounds_used < 0
+            or rounds_used > supplied_rounds
+        ):
+            raise ResearchWorkflowError(
+                "ResearchBudgetExceeded",
+                f"executor reported {rounds_used!r} rounds for a supplied "
+                f"budget of {supplied_rounds}",
+            )
+
+        status = str(getattr(outcome, "status", ""))
+        if status == "failed":
+            raise ResearchWorkflowError(
+                getattr(outcome, "failure_class", None)
+                or "ResearchExecutionFailed",
+                getattr(outcome, "failure_message", None)
+                or "research executor returned a failed outcome",
+            )
+        if status == "max_rounds":
+            budget.consume(supplied_rounds)
+            return supplied_rounds
+        if status != "completed":
+            raise ResearchWorkflowError(
+                "ResearchExecutionInvalidOutcome",
+                f"unsupported research executor status: {status or '<empty>'}",
+            )
+        budget.consume(rounds_used)
+        return rounds_used
+
+    def _execute_research(
+        self,
+        question: str,
+        cutoff: str | None,
+        plan: ResearchPlan,
+        gaps: tuple[str, ...],
+        budget: ResearchBudget,
+        registry: EvidenceRegistry,
+        *,
+        attempt: int,
+    ) -> ResearchExecutionOutcome:
+        supplied_rounds = budget.remaining_rounds
+        supplemental = attempt == 2
+        self._record("research_attempt_started", {
+            "attempt": attempt,
+            "supplemental": supplemental,
+            "supplied_rounds": supplied_rounds,
+            "used_rounds": budget.used_rounds,
+            "remaining_rounds": budget.remaining_rounds,
+            "directions": tuple(plan.directions),
+            "gaps": tuple(gaps),
+            "supplemental_research_used": supplemental,
+        })
+        prompt = self._research_prompt(
+            question,
+            cutoff,
+            plan,
+            gaps,
+            supplied_rounds,
+        )
+        before = budget.used_rounds
+        outcome: ResearchExecutionOutcome | None = None
+        try:
+            outcome = self.research_executor(prompt, supplied_rounds, registry)
+            consumed = self._consume_outcome(budget, outcome, supplied_rounds)
+        except ResearchWorkflowError as error:
+            self._record("research_attempt_finished", {
+                "attempt": attempt,
+                "supplemental": supplemental,
+                "status": "failed",
+                "supplied_rounds": supplied_rounds,
+                "reported_rounds": (
+                    outcome.rounds_used if outcome is not None else None
+                ),
+                "consumed_rounds": budget.used_rounds - before,
+                "used_rounds": budget.used_rounds,
+                "remaining_rounds": budget.remaining_rounds,
+                "failure_class": error.failure_class,
+                "failure_message": error.failure_message,
+            })
+            raise
+        except Exception as error:
+            wrapped = ResearchWorkflowError(type(error).__name__, str(error))
+            self._record("research_attempt_finished", {
+                "attempt": attempt,
+                "supplemental": supplemental,
+                "status": "failed",
+                "supplied_rounds": supplied_rounds,
+                "reported_rounds": None,
+                "consumed_rounds": 0,
+                "used_rounds": budget.used_rounds,
+                "remaining_rounds": budget.remaining_rounds,
+                "failure_class": wrapped.failure_class,
+                "failure_message": wrapped.failure_message,
+            })
+            raise wrapped from error
+        self._record("research_attempt_finished", {
+            "attempt": attempt,
+            "supplemental": supplemental,
+            "status": outcome.status,
+            "supplied_rounds": supplied_rounds,
+            "reported_rounds": outcome.rounds_used,
+            "consumed_rounds": consumed,
+            "used_rounds": budget.used_rounds,
+            "remaining_rounds": budget.remaining_rounds,
+            "failure_class": outcome.failure_class,
+            "failure_message": outcome.failure_message,
+        })
+        return outcome
+
+    def _writing_input(
+        self,
+        question: str,
+        cutoff: str | None,
+        plan: ResearchPlan,
+        registry: EvidenceRegistry,
+        gaps: tuple[str, ...],
+    ) -> dict[str, Any]:
+        return {
+            "question": question,
+            "cutoff": cutoff,
+            "plan": {
+                "rank": plan.rank.value,
+                "directions": list(plan.directions),
+                "reason": plan.reason,
+            },
+            "fixed_requirements": asdict(plan.policy),
+            "evidence": build_evidence_packet(registry),
+            "authority_decisions": [{
+                "source_id": item.source_id,
+                "is_authoritative": item.authoritative,
+                "reason": item.authority_reason,
+            } for item in registry.records],
+            "unresolved_research_gaps": list(gaps),
+        }
+
+    def write(
+        self,
+        question: str,
+        cutoff: str | None,
+        plan: ResearchPlan,
+        registry: EvidenceRegistry,
+        gaps: tuple[str, ...],
+    ) -> str:
+        system = (
+            "Write the final answer only from the supplied registered evidence. "
+            "Cite exact fetched URLs. Distinguish verified facts, inference, and "
+            "uncertainty. Disclose every unresolved research gap. Do not invent "
+            "or cite any URL absent from the evidence packet."
+        )
+        return self._call_text(
+            "research_writing",
+            system,
+            json.dumps(
+                self._writing_input(question, cutoff, plan, registry, gaps),
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+        )
+
+    def rewrite(
+        self,
+        question: str,
+        cutoff: str | None,
+        plan: ResearchPlan,
+        registry: EvidenceRegistry,
+        gaps: tuple[str, ...],
+        rejected_draft: str,
+        errors: list[str],
+    ) -> str:
+        system = (
+            "Rewrite the rejected report once using only the supplied evidence. "
+            "Fix every listed validation error. Do not search, request tools, or "
+            "introduce new URLs. Return only the revised final report."
+        )
+        content = self._writing_input(question, cutoff, plan, registry, gaps)
+        content.update({
+            "rejected_draft": rejected_draft,
+            "validation_errors": list(errors),
+        })
+        return self._call_text(
+            "research_rewrite",
+            system,
+            json.dumps(content, ensure_ascii=False, sort_keys=True),
+        )
+
+    def run(
+        self,
+        question: str,
+        cutoff: str | None,
+        *,
+        registry: EvidenceRegistry | None = None,
+    ) -> ResearchWorkflowResult:
+        evidence_registry = registry if registry is not None else EvidenceRegistry()
+        plan = self.plan(question, cutoff)
+        budget = ResearchBudget(plan.policy.max_research_rounds)
+
+        self._execute_research(
+            question,
+            cutoff,
+            plan,
+            (),
+            budget,
+            evidence_registry,
+            attempt=1,
+        )
+        gate = self.evaluate_research(
+            question,
+            cutoff,
+            plan,
+            evidence_registry,
+            attempt=1,
+        )
+
+        supplemental_used = False
+        if not gate.passed and budget.remaining_rounds > 0:
+            supplemental_used = True
+            self._execute_research(
+                question,
+                cutoff,
+                plan,
+                gate.gaps,
+                budget,
+                evidence_registry,
+                attempt=2,
+            )
+            gate = self.evaluate_research(
+                question,
+                cutoff,
+                plan,
+                evidence_registry,
+                attempt=2,
+            )
+        else:
+            self._record("supplemental_research_skipped", {
+                "reason": (
+                    "initial research gate passed"
+                    if gate.passed
+                    else "research round budget exhausted"
+                ),
+                "remaining_rounds": budget.remaining_rounds,
+                "gate_gaps": tuple(gate.gaps),
+                "supplemental_research_used": False,
+            })
+
+        self._record("writing_attempt_started", {
+            "attempt": 1,
+            "repair": False,
+            "gaps": tuple(gate.gaps),
+            "source_ids": tuple(
+                item.source_id for item in evidence_registry.records
+            ),
+            "authoritative_source_ids": tuple(
+                item.source_id
+                for item in evidence_registry.records
+                if item.authoritative
+            ),
+            "supplemental_research_used": supplemental_used,
+            "writing_repair_used": False,
+        })
+        draft = self.write(
+            question,
+            cutoff,
+            plan,
+            evidence_registry,
+            gate.gaps,
+        )
+        errors = validate_research_final(draft, evidence_registry, plan)
+        self._record("writing_gate", {
+            "attempt": 1,
+            "passed": not errors,
+            "validation_errors": tuple(errors),
+            "source_count": len(evidence_registry.records),
+            "domain_count": len({
+                item.domain for item in evidence_registry.records if item.domain
+            }),
+            "authoritative_source_ids": tuple(
+                item.source_id
+                for item in evidence_registry.records
+                if item.authoritative
+            ),
+            "writing_repair_used": False,
+        })
+
+        repair_used = False
+        if errors:
+            repair_used = True
+            self._record("writing_repair_started", {
+                "attempt": 2,
+                "validation_errors": tuple(errors),
+                "gaps": tuple(gate.gaps),
+                "supplemental_research_used": supplemental_used,
+                "writing_repair_used": True,
+            })
+            draft = self.rewrite(
+                question,
+                cutoff,
+                plan,
+                evidence_registry,
+                gate.gaps,
+                draft,
+                errors,
+            )
+            errors = validate_research_final(draft, evidence_registry, plan)
+            self._record("writing_gate", {
+                "attempt": 2,
+                "passed": not errors,
+                "validation_errors": tuple(errors),
+                "source_count": len(evidence_registry.records),
+                "domain_count": len({
+                    item.domain
+                    for item in evidence_registry.records
+                    if item.domain
+                }),
+                "authoritative_source_ids": tuple(
+                    item.source_id
+                    for item in evidence_registry.records
+                    if item.authoritative
+                ),
+                "writing_repair_used": True,
+            })
+
+        terminal_reason = "completed"
+        if errors:
+            terminal_reason = "insufficient_evidence"
+            draft = (
+                "INSUFFICIENT_EVIDENCE\n\nResearch finalization failed:\n"
+                + "\n".join(f"- {error}" for error in errors)
+            )
+        result = ResearchWorkflowResult(
+            draft,
+            plan,
+            budget.used_rounds,
+            supplemental_used,
+            repair_used,
+        )
+        self._record("research_workflow_completed", {
+            "terminal_reason": terminal_reason,
+            "rank": plan.rank.value,
+            "research_rounds_used": budget.used_rounds,
+            "remaining_rounds": budget.remaining_rounds,
+            "supplemental_research_used": supplemental_used,
+            "writing_repair_used": repair_used,
+            "final_validation_errors": tuple(errors),
+            "remaining_gaps": tuple(gate.gaps),
+        })
+        return result

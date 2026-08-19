@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+from simple_cc.agent import AgentLoopOutcome
 from simple_cc.evidence import evidence_record_from_result
 from simple_cc.models import ModelResponse, ToolCall
 from simple_cc.research_models import EvidenceRegistry, ResearchPlan, ResearchRank
@@ -58,6 +59,43 @@ def valid_gate_payload(registry: EvidenceRegistry) -> dict[str, object]:
         }],
         "gaps": [],
     }
+
+
+def light_plan_response() -> ModelResponse:
+    return ModelResponse(json.dumps({
+        "rank": "light",
+        "directions": ["primary filings"],
+        "reason": "narrow factual question",
+    }))
+
+
+def gate_response(
+    registry: EvidenceRegistry,
+    *,
+    covered: bool,
+    gap: str = "",
+) -> ModelResponse:
+    source_ids = [item.source_id for item in registry.records]
+    return ModelResponse(json.dumps({
+        "directions": [{
+            "direction": "primary filings",
+            "covered": covered,
+            "source_ids": source_ids if covered else [],
+            "reason": "direct support" if covered else "support is missing",
+        }],
+        "authorities": ([{
+            "source_id": source_ids[0],
+            "is_authoritative": True,
+            "reason": "official disclosure",
+        }] if source_ids else []),
+        "gaps": [gap] if gap else [],
+    }))
+
+
+def valid_light_report() -> ModelResponse:
+    return ModelResponse(
+        "Report https://alpha.example/report https://beta.example/data"
+    )
 
 
 def test_parse_plan_accepts_fixed_rank_and_exact_directions():
@@ -477,3 +515,292 @@ def test_tool_only_phase_response_extracts_empty_text():
 
     assert result == ""
     assert provider.requests[0]["tools"] == []
+
+
+def test_initial_gate_pass_skips_supplement():
+    registry = registry_with_two_sources()
+    provider = ScriptedProvider([
+        light_plan_response(),
+        gate_response(registry, covered=True),
+        valid_light_report(),
+    ])
+    executor_calls = []
+
+    def executor(prompt, max_rounds, evidence_registry):
+        executor_calls.append((
+            max_rounds,
+            "missing direct support" in prompt,
+            evidence_registry is registry,
+        ))
+        return AgentLoopOutcome(
+            "completed",
+            "private note https://private-unregistered.example",
+            rounds_used=3,
+        )
+
+    result = ResearchWorkflow(provider, executor).run(
+        "question", "2025-05-01", registry=registry
+    )
+
+    assert executor_calls == [(10, False, True)]
+    assert result.research_rounds_used == 3
+    assert result.supplemental_research_used is False
+    writing_content = provider.requests[-1]["messages"][0]["content"]
+    assert "src_" in writing_content
+    assert "private-unregistered.example" not in writing_content
+
+
+def test_failed_gate_uses_remaining_budget_once():
+    registry = registry_with_two_sources()
+    provider = ScriptedProvider([
+        light_plan_response(),
+        gate_response(registry, covered=False, gap="missing direct support"),
+        gate_response(registry, covered=True),
+        valid_light_report(),
+    ])
+    executor_calls = []
+
+    def executor(prompt, max_rounds, evidence_registry):
+        executor_calls.append((
+            max_rounds,
+            "missing direct support" in prompt,
+            evidence_registry is registry,
+        ))
+        return AgentLoopOutcome(
+            "completed",
+            "notes",
+            rounds_used=4 if len(executor_calls) == 1 else 2,
+        )
+
+    result = ResearchWorkflow(provider, executor).run(
+        "question", "2025-05-01", registry=registry
+    )
+
+    assert executor_calls == [(10, False, True), (6, True, True)]
+    assert result.research_rounds_used == 6
+    assert result.supplemental_research_used is True
+
+
+def test_second_gate_failure_still_enters_tool_free_writing():
+    registry = registry_with_two_sources()
+    provider = ScriptedProvider([
+        light_plan_response(),
+        gate_response(registry, covered=False, gap="gap one"),
+        gate_response(registry, covered=False, gap="gap remains"),
+        valid_light_report(),
+    ])
+    workflow = ResearchWorkflow(
+        provider,
+        lambda prompt, max_rounds, evidence_registry: AgentLoopOutcome(
+            "completed", "notes", rounds_used=1
+        ),
+    )
+
+    result = workflow.run("question", "2025-05-01", registry=registry)
+
+    writing_request = provider.requests[-1]
+    assert "gap remains" in writing_request["messages"][0]["content"]
+    assert writing_request["tools"] == []
+    assert result.final_text.startswith("Report")
+
+
+def test_second_writing_failure_returns_controlled_insufficient():
+    registry = EvidenceRegistry()
+    provider = ScriptedProvider([
+        light_plan_response(),
+        gate_response(registry, covered=False, gap="no evidence"),
+        gate_response(registry, covered=False, gap="still no evidence"),
+        ModelResponse("unsupported draft"),
+        ModelResponse("unsupported rewrite"),
+    ])
+    workflow = ResearchWorkflow(
+        provider,
+        lambda prompt, max_rounds, evidence_registry: AgentLoopOutcome(
+            "completed", "notes", rounds_used=1
+        ),
+    )
+
+    result = workflow.run("question", "2025-05-01", registry=registry)
+
+    assert result.writing_repair_used is True
+    assert result.final_text.startswith("INSUFFICIENT_EVIDENCE")
+    assert provider.requests[-1]["tools"] == []
+    assert len(provider.requests) == 5
+    rewrite_content = json.loads(
+        provider.requests[-1]["messages"][0]["content"]
+    )
+    assert rewrite_content["evidence"] == []
+    assert rewrite_content["validation_errors"] == [
+        "read at least 2 distinct sources",
+        "use at least 2 independent domains",
+        "use at least 1 authoritative source",
+        "cite fetched sources in the final answer",
+    ]
+
+
+def test_executor_cannot_report_rounds_beyond_supplied_budget():
+    provider = ScriptedProvider([light_plan_response()])
+    workflow = ResearchWorkflow(
+        provider,
+        lambda prompt, max_rounds, evidence_registry: AgentLoopOutcome(
+            "completed", "notes", rounds_used=max_rounds + 1
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        workflow.run("question", "2025-05-01")
+
+    assert getattr(caught.value, "failure_class", None) == (
+        "ResearchBudgetExceeded"
+    )
+    assert "reported 11 rounds" in str(caught.value)
+
+
+def test_failed_executor_preserves_failure_class_and_message():
+    provider = ScriptedProvider([light_plan_response()])
+    workflow = ResearchWorkflow(
+        provider,
+        lambda prompt, max_rounds, evidence_registry: AgentLoopOutcome(
+            "failed",
+            "notes",
+            failure_class="ProviderUnavailable",
+            failure_message="upstream timed out",
+            rounds_used=2,
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        workflow.run("question", "2025-05-01")
+
+    assert getattr(caught.value, "failure_class", None) == (
+        "ProviderUnavailable"
+    )
+    assert getattr(caught.value, "failure_message", None) == (
+        "upstream timed out"
+    )
+
+
+def test_max_rounds_consumes_supplied_budget_and_still_writes():
+    registry = registry_with_two_sources()
+    provider = ScriptedProvider([
+        light_plan_response(),
+        gate_response(registry, covered=False, gap="gap remains"),
+        valid_light_report(),
+    ])
+    executor_calls = []
+
+    def executor(prompt, max_rounds, evidence_registry):
+        executor_calls.append(max_rounds)
+        return AgentLoopOutcome("max_rounds", "notes", rounds_used=1)
+
+    result = ResearchWorkflow(provider, executor).run(
+        "question", "2025-05-01", registry=registry
+    )
+
+    assert executor_calls == [10]
+    assert result.research_rounds_used == 10
+    assert result.supplemental_research_used is False
+    assert result.final_text.startswith("Report")
+
+
+def test_trace_reconstructs_forward_only_workflow_with_active_agent(tmp_path):
+    registry = registry_with_two_sources()
+    provider = ScriptedProvider([
+        light_plan_response(),
+        gate_response(registry, covered=True),
+        valid_light_report(),
+    ])
+    recorder = TraceRecorder(tmp_path / "run", run_id="workflow-run")
+    recorder.start_run(
+        task_id="research-task",
+        question="question",
+        cutoff="2025-05-01",
+        metadata={"task_type": "research"},
+    )
+    run = RunContext(
+        recorder,
+        "workflow-run",
+        "research-task",
+        "2025-05-01",
+        agent_id="research-agent",
+    )
+    workflow = ResearchWorkflow(
+        provider,
+        lambda prompt, max_rounds, evidence_registry: AgentLoopOutcome(
+            "completed", "private notes", rounds_used=3
+        ),
+        run_context=run,
+    )
+
+    with bind_run_context(run):
+        workflow.run("question", "2025-05-01", registry=registry)
+
+    rows = [
+        json.loads(line)
+        for line in recorder.trajectory_path.read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    phase_names = {
+        "research_plan",
+        "research_attempt_started",
+        "research_attempt_finished",
+        "research_gate",
+        "supplemental_research_skipped",
+        "writing_attempt_started",
+        "writing_gate",
+        "writing_repair_started",
+        "research_workflow_completed",
+    }
+    phase_rows = [row for row in rows if row["event_type"] in phase_names]
+
+    assert [row["event_type"] for row in phase_rows] == [
+        "research_plan",
+        "research_attempt_started",
+        "research_attempt_finished",
+        "research_gate",
+        "supplemental_research_skipped",
+        "writing_attempt_started",
+        "writing_gate",
+        "research_workflow_completed",
+    ]
+    assert {row["agent_id"] for row in phase_rows} == {"research-agent"}
+    started = next(
+        row for row in phase_rows
+        if row["event_type"] == "research_attempt_started"
+    )["payload"]
+    finished = next(
+        row for row in phase_rows
+        if row["event_type"] == "research_attempt_finished"
+    )["payload"]
+    assert started["attempt"] == 1
+    assert started["supplied_rounds"] == 10
+    assert started["directions"] == ["primary filings"]
+    assert finished["used_rounds"] == 3
+    assert finished["remaining_rounds"] == 7
+    json.dumps([row["payload"] for row in phase_rows])
+
+
+def test_research_and_writing_retry_flags_are_independent():
+    registry = EvidenceRegistry()
+    provider = ScriptedProvider([
+        light_plan_response(),
+        gate_response(registry, covered=False, gap="no evidence"),
+        gate_response(registry, covered=False, gap="still no evidence"),
+        ModelResponse("unsupported draft"),
+        ModelResponse("unsupported rewrite"),
+    ])
+    executor_calls = []
+
+    def executor(prompt, max_rounds, evidence_registry):
+        executor_calls.append(max_rounds)
+        return AgentLoopOutcome("completed", "notes", rounds_used=1)
+
+    result = ResearchWorkflow(provider, executor).run(
+        "question", "2025-05-01", registry=registry
+    )
+
+    assert executor_calls == [10, 9]
+    assert result.supplemental_research_used is True
+    assert result.writing_repair_used is True
+    assert all(request["tools"] == [] for request in provider.requests)
