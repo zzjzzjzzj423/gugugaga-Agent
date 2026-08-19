@@ -40,13 +40,16 @@ from .recovery import RecoveryState, is_prompt_too_long_error, with_retry
 from .subagents import extract_text, has_tool_use
 from .evidence import (
     CutoffMismatch,
-    evidence_record_from_result,
+    EvidenceIngestionResult,
+    attach_evidence_artifacts,
+    inspect_evidence_result,
     link_final_answer_sources,
     prepare_research_arguments,
     record_research_evidence,
     registered_source_map,
 )
 from .research_models import (
+    EvidenceRegistrationError,
     EvidenceRegistry,
     ResearchPlan,
     ResearchRank,
@@ -802,13 +805,29 @@ def agent_loop(
             except Exception as error:
                 tool_error = error
                 output = f"Error: {type(error).__name__}: {error}"
-            evidence_record = None
+            evidence_ingestion = None
             if tool_error is None:
-                evidence_record = evidence_record_from_result(
-                    block.name, str(output)
+                evidence_ingestion = inspect_evidence_result(
+                    block.name,
+                    str(output),
+                    required_cutoff=required_cutoff,
                 )
-                if evidence_record is not None and evidence_registry is not None:
-                    evidence_registry.register(evidence_record)
+                if (
+                    run_context is None
+                    and evidence_ingestion.record is not None
+                    and evidence_registry is not None
+                ):
+                    try:
+                        registered = evidence_registry.register(
+                            evidence_ingestion.record
+                        )
+                        evidence_ingestion = EvidenceIngestionResult(registered)
+                    except EvidenceRegistrationError as error:
+                        evidence_ingestion = EvidenceIngestionResult(
+                            None,
+                            error.code,
+                            str(error),
+                        )
             if run_context is not None:
                 output_ref = run_context.recorder.store_artifact(
                     str(output),
@@ -842,6 +861,33 @@ def agent_loop(
                         agent_id=run_context.agent_id,
                     )
                 else:
+                    if evidence_ingestion is not None and evidence_ingestion.record:
+                        evidence_record = attach_evidence_artifacts(
+                            evidence_ingestion.record,
+                            [
+                                output_ref,
+                                *(capture.artifacts if capture else []),
+                            ],
+                        )
+                        if evidence_registry is not None:
+                            try:
+                                evidence_record = evidence_registry.register(
+                                    evidence_record
+                                )
+                            except EvidenceRegistrationError as error:
+                                evidence_ingestion = EvidenceIngestionResult(
+                                    None,
+                                    error.code,
+                                    str(error),
+                                )
+                            else:
+                                evidence_ingestion = EvidenceIngestionResult(
+                                    evidence_record
+                                )
+                        else:
+                            evidence_ingestion = EvidenceIngestionResult(
+                                evidence_record
+                            )
                     run_context.recorder.record(
                         "tool_result",
                         {**terminal_payload, "success": True},
@@ -856,7 +902,7 @@ def agent_loop(
                         raw_artifacts=capture.artifacts if capture else [],
                         span_id=span_id,
                         registered_sources=registered_sources,
-                        record=evidence_record,
+                        ingestion=evidence_ingestion,
                     )
             trigger_hooks("PostToolUse", block, output)
             print(str(output)[:300])

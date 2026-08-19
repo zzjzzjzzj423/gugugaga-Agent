@@ -15,7 +15,8 @@ from simple_cc.evidence import (
 )
 from simple_cc.models import ModelResponse, ToolCall
 from simple_cc.research_models import EvidenceRegistry, ResearchPlan, ResearchRank
-from simple_cc.trace import TraceRecorder, read_trace_lines
+from simple_cc.telemetry import capture_tool_artifact
+from simple_cc.trace import RunContext, TraceRecorder, read_trace_lines
 from tests.fakes import ScriptedProvider
 
 
@@ -300,6 +301,367 @@ def test_evidence_record_is_bounded_and_canonicalized():
     assert record.canonical_url == "https://example.com/report?a=1&b=2"
     assert record.domain == "example.com"
     assert len(record.content_excerpt) == 6000
+
+
+def _direct_evidence_run(tmp_path, run_id, *, cutoff="2025-05-01"):
+    recorder = TraceRecorder(tmp_path / run_id, run_id=run_id)
+    recorder.start_run(
+        task_id=f"{run_id}-task",
+        question="research question",
+        cutoff=cutoff,
+        metadata={},
+    )
+    return recorder, RunContext(
+        recorder,
+        run_id,
+        f"{run_id}-task",
+        cutoff,
+    )
+
+
+def test_pdf_pages_are_flattened_and_repeated_ranges_merge_once(tmp_path):
+    url = "https://example.com/report.pdf"
+    provider = ScriptedProvider([
+        ModelResponse(
+            "",
+            [ToolCall(
+                "pdf-1",
+                "pdf_fetch",
+                {"url": url, "start_page": 11, "page_count": 1},
+            )],
+            "tool_calls",
+        ),
+        ModelResponse(
+            "",
+            [ToolCall(
+                "pdf-2",
+                "pdf_fetch",
+                {"url": url, "start_page": 13, "page_count": 1},
+            )],
+            "tool_calls",
+        ),
+        ModelResponse("research notes", [], "stop"),
+    ])
+
+    def pdf_fetch(**arguments):
+        page_number = arguments["start_page"]
+        return json.dumps({
+            "ok": True,
+            "operation": "pdf_fetch",
+            "url": url,
+            "total_pages": 20,
+            "start_page": page_number,
+            "end_page": page_number,
+            "has_more": page_number < 20,
+            "published_at": "2025-01-02",
+            "date_status": "verified",
+            "cutoff": arguments["cutoff"],
+            "pages": [{
+                "page_number": page_number,
+                "content": (
+                    f"--- PAGE {page_number} START ---\n"
+                    f"facts from page {page_number}\n"
+                    f"--- PAGE {page_number} END ---"
+                ),
+            }],
+        })
+
+    recorder, run = _direct_evidence_run(tmp_path, "pdf-merge")
+    registry = EvidenceRegistry()
+    outcome = agent.agent_loop(
+        [{"role": "user", "content": "read two PDF ranges"}],
+        {},
+        provider=provider,
+        tools=[{"name": "pdf_fetch", "description": "pdf", "input_schema": {}}],
+        handlers={"pdf_fetch": pdf_fetch},
+        memory_enabled=False,
+        run_context=run,
+        evidence_registry=registry,
+        research_cutoff="2025-05-01",
+        finalize_user_turn=False,
+    )
+
+    assert outcome.final_text == "research notes"
+    assert len(registry.records) == 1
+    record = registry.records[0]
+    assert record.content_excerpt == (
+        "--- PAGE 11 START ---\nfacts from page 11\n--- PAGE 11 END ---\n\n"
+        "--- PAGE 13 START ---\nfacts from page 13\n--- PAGE 13 END ---"
+    )
+    assert len(record.content_excerpt) <= 6000
+    assert len(record.artifact_references) == 2
+    assert len({item.sha256 for item in record.artifact_references}) == 2
+
+    rows, incomplete = read_trace_lines(recorder.trajectory_path)
+    assert incomplete is False
+    assert len([row for row in rows if row["event_type"] == "source_registered"]) == 2
+
+
+def test_repeated_pdf_fetches_bound_merged_fragments_and_artifacts(tmp_path):
+    url = "https://example.com/report.pdf"
+    provider = ScriptedProvider([
+        *[
+            ModelResponse(
+                "",
+                [ToolCall(
+                    f"pdf-{page_number}",
+                    "pdf_fetch",
+                    {"url": url, "start_page": page_number, "page_count": 1},
+                )],
+                "tool_calls",
+            )
+            for page_number in range(1, 11)
+        ],
+        ModelResponse("research notes", [], "stop"),
+    ])
+
+    def pdf_fetch(**arguments):
+        page_number = arguments["start_page"]
+        capture_tool_artifact(
+            f"raw PDF {page_number}".encode(),
+            media_type="application/pdf",
+            source=url,
+            suffix=".pdf",
+        )
+        capture_tool_artifact(
+            [{"page_number": page_number, "content": f"page {page_number}"}],
+            media_type="application/json",
+            source=f"{url}#page={page_number}",
+            suffix=".json",
+        )
+        return json.dumps({
+            "ok": True,
+            "operation": "pdf_fetch",
+            "url": url,
+            "start_page": page_number,
+            "end_page": page_number,
+            "published_at": "2025-01-02",
+            "date_status": "verified",
+            "cutoff": arguments["cutoff"],
+            "pages": [{
+                "page_number": page_number,
+                "content": f"page {page_number}",
+            }],
+        })
+
+    _, run = _direct_evidence_run(tmp_path, "pdf-bounds")
+    registry = EvidenceRegistry()
+    outcome = agent.agent_loop(
+        [{"role": "user", "content": "read many PDF ranges"}],
+        {},
+        provider=provider,
+        tools=[{"name": "pdf_fetch", "description": "pdf", "input_schema": {}}],
+        handlers={"pdf_fetch": pdf_fetch},
+        memory_enabled=False,
+        run_context=run,
+        evidence_registry=registry,
+        research_cutoff="2025-05-01",
+        finalize_user_turn=False,
+    )
+
+    assert outcome.final_text == "research notes"
+    assert len(registry.records) == 1
+    record = registry.records[0]
+    assert len(record.content_excerpt) <= 6000
+    assert len(record.content_fragments) == 8
+    assert "--- PAGE 8 START ---" in record.content_excerpt
+    assert "--- PAGE 9 START ---" not in record.content_excerpt
+    assert len(record.artifact_references) == 16
+
+
+def test_invalid_fetch_url_is_rejected_without_losing_terminal_result(tmp_path):
+    provider = ScriptedProvider([
+        ModelResponse(
+            "",
+            [ToolCall("fetch-1", "web_fetch", {"url": "https://example.com"})],
+            "tool_calls",
+        ),
+        ModelResponse("research notes", [], "stop"),
+    ])
+    malformed_output = json.dumps({
+        "ok": True,
+        "operation": "fetch",
+        "url": {"unexpected": "object"},
+        "cutoff": "2025-05-01",
+        "published_at": None,
+        "date_status": "unknown",
+        "content": "must not become registered evidence",
+    })
+    recorder, run = _direct_evidence_run(tmp_path, "invalid-url")
+    registry = EvidenceRegistry()
+
+    outcome = agent.agent_loop(
+        [{"role": "user", "content": "fetch"}],
+        {},
+        provider=provider,
+        tools=[{"name": "web_fetch", "description": "fetch", "input_schema": {}}],
+        handlers={"web_fetch": lambda **_: malformed_output},
+        memory_enabled=False,
+        run_context=run,
+        evidence_registry=registry,
+        research_cutoff="2025-05-01",
+        finalize_user_turn=False,
+    )
+
+    assert outcome.final_text == "research notes"
+    assert registry.records == ()
+    rows, incomplete = read_trace_lines(recorder.trajectory_path)
+    terminal = [row for row in rows if row["event_type"] == "tool_result"]
+    rejected = [row for row in rows if row["event_type"] == "source_rejected"]
+    assert incomplete is False
+    assert len(terminal) == 1
+    assert terminal[0]["payload"]["success"] is True
+    artifact_path = recorder.run_dir / terminal[0]["payload"]["output_artifact"]["path"]
+    assert artifact_path.read_text(encoding="utf-8") == malformed_output
+    assert len(rejected) == 1
+    assert rejected[0]["payload"]["reason_code"] == "invalid_url"
+
+
+def test_repeated_source_with_conflicting_date_metadata_is_rejected(tmp_path):
+    url = "https://example.com/report"
+    provider = ScriptedProvider([
+        ModelResponse(
+            "",
+            [ToolCall("fetch-1", "web_fetch", {"url": url})],
+            "tool_calls",
+        ),
+        ModelResponse(
+            "",
+            [ToolCall("fetch-2", "web_fetch", {"url": url})],
+            "tool_calls",
+        ),
+        ModelResponse("research notes", [], "stop"),
+    ])
+    calls = 0
+
+    def fetch(**arguments):
+        nonlocal calls
+        calls += 1
+        return json.dumps({
+            "ok": True,
+            "operation": "fetch",
+            "url": url,
+            "cutoff": arguments["cutoff"],
+            "published_at": None if calls == 1 else "2025-01-02",
+            "date_status": "unknown" if calls == 1 else "verified",
+            "content": f"fetch {calls}",
+        })
+
+    recorder, run = _direct_evidence_run(tmp_path, "conflicting-source-date")
+    registry = EvidenceRegistry()
+    outcome = agent.agent_loop(
+        [{"role": "user", "content": "fetch twice"}],
+        {},
+        provider=provider,
+        tools=[{"name": "web_fetch", "description": "fetch", "input_schema": {}}],
+        handlers={"web_fetch": fetch},
+        memory_enabled=False,
+        run_context=run,
+        evidence_registry=registry,
+        research_cutoff="2025-05-01",
+        finalize_user_turn=False,
+    )
+
+    assert outcome.final_text == "research notes"
+    assert len(registry.records) == 1
+    assert registry.records[0].published_at is None
+    assert registry.records[0].date_status == "unknown"
+    rows, _ = read_trace_lines(recorder.trajectory_path)
+    assert len([row for row in rows if row["event_type"] == "source_registered"]) == 1
+    rejected = [row for row in rows if row["event_type"] == "source_rejected"]
+    assert len(rejected) == 1
+    assert rejected[0]["payload"]["reason_code"] == "conflicting_date_status"
+
+
+@pytest.mark.parametrize(
+    ("metadata", "reason_code"),
+    (
+        (
+            {
+                "cutoff": "2025-05-01",
+                "published_at": "2025-06-01",
+                "date_status": "verified",
+            },
+            "published_after_cutoff",
+        ),
+        (
+            {
+                "cutoff": "2025-05-02",
+                "published_at": "2025-01-02",
+                "date_status": "verified",
+            },
+            "cutoff_mismatch",
+        ),
+        (
+            {
+                "cutoff": "2025-05-01",
+                "published_at": {"year": 2025},
+                "date_status": "verified",
+            },
+            "invalid_published_at",
+        ),
+        (
+            {
+                "cutoff": "2025-05-01",
+                "published_at": None,
+                "date_status": "verified",
+            },
+            "date_status_conflict",
+        ),
+        (
+            {
+                "cutoff": "2025-05-01",
+                "published_at": "2025-01-02",
+                "date_status": "verified",
+                "publication_dates": ["2025-01-02", "2025-01-03"],
+            },
+            "date_conflict",
+        ),
+    ),
+)
+def test_policy_inconsistent_fetch_metadata_is_rejected(
+    tmp_path, metadata, reason_code
+):
+    provider = ScriptedProvider([
+        ModelResponse(
+            "",
+            [ToolCall("fetch-1", "web_fetch", {"url": "https://example.com"})],
+            "tool_calls",
+        ),
+        ModelResponse("research notes", [], "stop"),
+    ])
+    output = json.dumps({
+        "ok": True,
+        "operation": "fetch",
+        "url": "https://example.com/report",
+        "content": "must not become registered evidence",
+        **metadata,
+    })
+    recorder, run = _direct_evidence_run(tmp_path, f"reject-{reason_code}")
+    registry = EvidenceRegistry()
+
+    outcome = agent.agent_loop(
+        [{"role": "user", "content": "fetch"}],
+        {},
+        provider=provider,
+        tools=[{"name": "web_fetch", "description": "fetch", "input_schema": {}}],
+        handlers={"web_fetch": lambda **_: output},
+        memory_enabled=False,
+        run_context=run,
+        evidence_registry=registry,
+        research_cutoff="2025-05-01",
+        finalize_user_turn=False,
+    )
+
+    assert outcome.final_text == "research notes"
+    assert registry.records == ()
+    rows, _ = read_trace_lines(recorder.trajectory_path)
+    terminal = [row for row in rows if row["event_type"] == "tool_result"]
+    rejected = [row for row in rows if row["event_type"] == "source_rejected"]
+    assert len(terminal) == 1
+    assert terminal[0]["payload"]["success"] is True
+    assert len(rejected) == 1
+    assert rejected[0]["payload"]["reason_code"] == reason_code
 
 
 def test_dynamic_writing_gate_uses_plan_and_authority():

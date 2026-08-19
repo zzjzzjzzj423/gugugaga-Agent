@@ -5,6 +5,14 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Mapping, Protocol
 
+from .trace import ArtifactRef
+
+
+EVIDENCE_CONTENT_CHARS_MAX = 6000
+EVIDENCE_PDF_FRAGMENT_CHARS_MAX = 700
+EVIDENCE_PDF_FRAGMENTS_MAX = 8
+EVIDENCE_ARTIFACT_REFERENCES_MAX = 16
+
 
 class TaskKind(str, Enum):
     NORMAL = "normal"
@@ -80,6 +88,12 @@ class ResearchBudget:
 
 
 @dataclass(frozen=True)
+class EvidenceFragment:
+    key: str
+    content: str
+
+
+@dataclass(frozen=True)
 class EvidenceRecord:
     source_id: str
     canonical_url: str
@@ -92,6 +106,14 @@ class EvidenceRecord:
     tool_name: str
     authoritative: bool = False
     authority_reason: str | None = None
+    content_fragments: tuple[EvidenceFragment, ...] = ()
+    artifact_references: tuple[ArtifactRef, ...] = ()
+
+
+class EvidenceRegistrationError(ValueError):
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
 
 
 class EvidenceRegistry:
@@ -103,7 +125,58 @@ class EvidenceRegistry:
         return tuple(self._records.values())
 
     def register(self, record: EvidenceRecord) -> EvidenceRecord:
-        return self._records.setdefault(record.canonical_url, record)
+        existing = self._records.get(record.canonical_url)
+        if existing is None:
+            self._records[record.canonical_url] = record
+            return record
+
+        for field_name in ("published_at", "date_status", "cutoff"):
+            old_value = getattr(existing, field_name)
+            new_value = getattr(record, field_name)
+            if old_value is not None and new_value is not None and old_value != new_value:
+                raise EvidenceRegistrationError(
+                    f"conflicting_{field_name}",
+                    f"repeated source has conflicting {field_name} metadata",
+                )
+
+        fragments = {item.key: item for item in existing.content_fragments}
+        for item in record.content_fragments:
+            fragments.setdefault(item.key, item)
+        merged_fragments = tuple(
+            fragments[key]
+            for key in sorted(fragments)[:EVIDENCE_PDF_FRAGMENTS_MAX]
+        )
+        if merged_fragments:
+            content_excerpt = "\n\n".join(
+                item.content for item in merged_fragments
+            )[:EVIDENCE_CONTENT_CHARS_MAX]
+        else:
+            content_excerpt = existing.content_excerpt
+
+        artifact_references = list(existing.artifact_references)
+        known_artifacts = {item.sha256 for item in artifact_references}
+        for item in record.artifact_references:
+            if len(artifact_references) >= EVIDENCE_ARTIFACT_REFERENCES_MAX:
+                break
+            if item.sha256 in known_artifacts:
+                continue
+            artifact_references.append(item)
+            known_artifacts.add(item.sha256)
+
+        merged = replace(
+            existing,
+            title=existing.title or record.title,
+            content_excerpt=content_excerpt,
+            published_at=existing.published_at or record.published_at,
+            date_status=existing.date_status or record.date_status,
+            cutoff=existing.cutoff or record.cutoff,
+            content_fragments=merged_fragments,
+            artifact_references=tuple(artifact_references),
+        )
+        if merged == existing:
+            return existing
+        self._records[record.canonical_url] = merged
+        return merged
 
     def get_by_id(self, source_id: str) -> EvidenceRecord | None:
         return next(
