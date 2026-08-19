@@ -7,10 +7,12 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+from .research_models import EvidenceRecord, EvidenceRegistry, ResearchPlan
 from .trace import ArtifactRef, RunContext
 
 
 RESEARCH_TOOLS = {"web_search", "web_fetch", "pdf_fetch"}
+EVIDENCE_EXCERPT_CHARS = 6000
 
 
 class CutoffMismatch(ValueError):
@@ -93,31 +95,65 @@ def link_final_answer_sources(
     }
 
 
+def evidence_record_from_result(
+    tool_name: str,
+    output: str,
+    *,
+    excerpt_chars: int = EVIDENCE_EXCERPT_CHARS,
+) -> EvidenceRecord | None:
+    if tool_name not in {"web_fetch", "pdf_fetch"}:
+        return None
+    try:
+        payload = json.loads(output)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or not payload.get("ok") or not payload.get("url"):
+        return None
+
+    canonical = canonicalize_url(payload["url"])
+    parsed = urlsplit(canonical)
+    content = str(payload.get("content") or payload.get("text") or "")
+    return EvidenceRecord(
+        source_id=source_id_for_url(canonical),
+        canonical_url=canonical,
+        domain=parsed.hostname or "",
+        title=str(payload["title"]) if payload.get("title") else None,
+        content_excerpt=content[:excerpt_chars],
+        published_at=payload.get("published_at"),
+        date_status=payload.get("date_status"),
+        cutoff=payload.get("cutoff"),
+        tool_name=tool_name,
+    )
+
+
+def registered_source_map(registry: EvidenceRegistry) -> dict[str, str]:
+    return {item.canonical_url: item.source_id for item in registry.records}
+
+
 def validate_research_final(
     final_text: str,
-    registered_sources: dict[str, str],
+    registry: EvidenceRegistry,
+    plan: ResearchPlan,
 ) -> list[str]:
+    policy = plan.policy
+    records = registry.records
+    linkage = link_final_answer_sources(final_text, registered_source_map(registry))
     errors: list[str] = []
 
-    domains = {
-        urlsplit(url).hostname
-        for url in registered_sources
-        if urlsplit(url).hostname
-    }
-    linkage = link_final_answer_sources(final_text, registered_sources)
-
-    if len(registered_sources) < 2:
-        errors.append("read at least two sources")
-
-    if len(domains) < 2:
-        errors.append("use at least two independent domains")
-
+    if len(records) < policy.distinct_source_count:
+        errors.append(f"read at least {policy.distinct_source_count} distinct sources")
+    if len({item.domain for item in records if item.domain}) < policy.distinct_source_count:
+        errors.append(
+            f"use at least {policy.distinct_source_count} independent domains"
+        )
+    if sum(item.authoritative for item in records) < policy.authoritative_source_count:
+        errors.append(
+            f"use at least {policy.authoritative_source_count} authoritative source"
+        )
     if not linkage["matched_source_ids"]:
         errors.append("cite fetched sources in the final answer")
-
     if linkage["unmatched_citations"]:
         errors.append("final answer contains unfetched citations")
-
     return errors
 
 

@@ -8,11 +8,13 @@ from simple_cc import agent, config
 from simple_cc.evidence import (
     CutoffMismatch,
     canonicalize_url,
+    evidence_record_from_result,
     link_final_answer_sources,
     prepare_research_arguments,
     validate_research_final,
 )
 from simple_cc.models import ModelResponse, ToolCall
+from simple_cc.research_models import EvidenceRegistry, ResearchPlan, ResearchRank
 from simple_cc.trace import TraceRecorder, read_trace_lines
 from tests.fakes import ScriptedProvider
 
@@ -216,37 +218,76 @@ def test_cutoff_mismatch_is_a_failed_terminal_tool_result(tmp_path):
     assert results[0]["payload"]["success"] is False
     assert results[0]["payload"]["error_code"] == "cutoff_mismatch"
 
-def test_validate_research_final_accepts_traceable_sources():
-    sources = {
-        "https://alpha.example/report": "src_alpha",
-        "https://beta.example/data": "src_beta",
-    }
-
-    errors = validate_research_final(
-        (
-            "The result is supported by "
-            "https://alpha.example/report and "
-            "https://beta.example/data."
+def _register(registry, url):
+    record = evidence_record_from_result(
+        "web_fetch",
+        json.dumps(
+            {
+                "ok": True,
+                "url": url,
+                "title": "Source",
+                "content": f"evidence from {url}",
+                "published_at": "2025-01-02",
+                "date_status": "verified",
+                "cutoff": "2025-05-01",
+            }
         ),
-        sources,
     )
+    assert record is not None
+    registry.register(record)
+    return record
 
-    assert errors == []
+
+def test_evidence_record_ignores_search_and_failed_fetch():
+    assert evidence_record_from_result("web_search", '{"ok": true}') is None
+    assert evidence_record_from_result("web_fetch", '{"ok": false}') is None
 
 
-def test_validate_research_final_rejects_weak_evidence():
-    sources = {
-        "https://alpha.example/report": "src_alpha",
-    }
-
-    errors = validate_research_final(
-        "See https://unfetched.example/report.",
-        sources,
+def test_evidence_record_is_bounded_and_canonicalized():
+    record = evidence_record_from_result(
+        "web_fetch",
+        json.dumps(
+            {
+                "ok": True,
+                "url": "HTTPS://Example.COM:443/report?b=2&a=1#part",
+                "title": "Report",
+                "content": "x" * 7000,
+            }
+        ),
     )
+    assert record is not None
+    assert record.canonical_url == "https://example.com/report?a=1&b=2"
+    assert record.domain == "example.com"
+    assert len(record.content_excerpt) == 6000
 
-    assert errors == [
-        "read at least two sources",
-        "use at least two independent domains",
+
+def test_dynamic_writing_gate_uses_plan_and_authority():
+    registry = EvidenceRegistry()
+    first = _register(registry, "https://alpha.example/report")
+    second = _register(registry, "https://beta.example/data")
+    registry.mark_authority(first.source_id, True, "official filing")
+    registry.mark_authority(second.source_id, False, "secondary source")
+    plan = ResearchPlan(ResearchRank.LIGHT, ("core facts",), "bounded")
+
+    assert validate_research_final(
+        "See https://alpha.example/report and https://beta.example/data",
+        registry,
+        plan,
+    ) == []
+
+
+def test_dynamic_writing_gate_reports_each_failure():
+    registry = EvidenceRegistry()
+    _register(registry, "https://alpha.example/report")
+    plan = ResearchPlan(ResearchRank.LIGHT, ("core facts",), "bounded")
+    assert validate_research_final(
+        "See https://unfetched.example/report",
+        registry,
+        plan,
+    ) == [
+        "read at least 2 distinct sources",
+        "use at least 2 independent domains",
+        "use at least 1 authoritative source",
         "cite fetched sources in the final answer",
         "final answer contains unfetched citations",
     ]
