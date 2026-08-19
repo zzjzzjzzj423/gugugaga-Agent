@@ -6,6 +6,9 @@ import hashlib
 import pytest
 
 from eval.run_task import TaskInput, execute_task, load_task_input, main
+from simple_cc.agent import AgentLoopOutcome
+from simple_cc.benchmark import BenchmarkCloseOutcome
+from simple_cc.evidence import source_id_for_url
 from simple_cc.eval_metrics import derive_metrics, validate_trace
 from simple_cc.models import ModelResponse, ToolCall
 from simple_cc.telemetry import capture_tool_artifact
@@ -14,7 +17,71 @@ from tests.fakes import ScriptedProvider
 
 
 def unsupported_research_provider(text: str = "answer") -> ScriptedProvider:
-    return ScriptedProvider([ModelResponse(text), ModelResponse(text)])
+    failed_gate = json.dumps({
+        "directions": [{
+            "direction": "primary filings",
+            "covered": False,
+            "source_ids": [],
+            "reason": "no fetched evidence",
+        }],
+        "authorities": [],
+        "gaps": ["no fetched evidence"],
+    })
+    return ScriptedProvider([
+        ModelResponse(json.dumps({
+            "rank": "light",
+            "directions": ["primary filings"],
+            "reason": "bounded test task",
+        })),
+        ModelResponse("initial research notes"),
+        ModelResponse(failed_gate),
+        ModelResponse("supplemental research notes"),
+        ModelResponse(failed_gate),
+        ModelResponse(text),
+        ModelResponse(text),
+    ])
+
+
+def test_execute_task_passes_task_type_to_runtime(tmp_path, monkeypatch):
+    captured = {}
+    original_start_run = TraceRecorder.start_run
+
+    def start_run_then_clear_shared_metadata(self, **kwargs):
+        original_start_run(self, **kwargs)
+        kwargs["metadata"].pop("task_type")
+
+    class FakeRuntime:
+        last_outcome = AgentLoopOutcome("completed", "answer")
+
+        def run_turn(self, query, **kwargs):
+            captured.update(kwargs)
+            return "answer"
+
+    class FakeSession:
+        runtime = FakeRuntime()
+
+        def close(self):
+            return BenchmarkCloseOutcome(True, ())
+
+    monkeypatch.setattr(
+        "eval.run_task.build_benchmark_runtime",
+        lambda **kwargs: FakeSession(),
+    )
+    monkeypatch.setattr(TraceRecorder, "start_run", start_run_then_clear_shared_metadata)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    task = TaskInput(
+        "run-route", "task-route", "q", None, "test", "research_analysis"
+    )
+
+    assert execute_task(
+        task,
+        run_dir,
+        run_dir / "agent_workspace",
+        ScriptedProvider([]),
+        model="test-model",
+    ) == 0
+    assert captured["run_metadata"]["task_type"] == "research_analysis"
 
 
 def test_load_task_input_validates_required_fields_and_cutoff(tmp_path):
@@ -95,13 +162,40 @@ def test_execute_task_publishes_only_terminal_answer(tmp_path, monkeypatch):
     task = TaskInput("run-1", "task-1", "Research", None, "test", "research")
     provider = ScriptedProvider(
         [
+            ModelResponse(json.dumps({
+                "rank": "light",
+                "directions": ["primary filings"],
+                "reason": "bounded test task",
+            })),
             ModelResponse(
                 "intermediate narration",
                 [ToolCall("tool-1", "noop", {})],
                 "tool_calls",
             ),
-            ModelResponse("terminal answer"),
-            ModelResponse("terminal answer"),
+            ModelResponse("internal research notes"),
+            ModelResponse(json.dumps({
+                "directions": [{
+                    "direction": "primary filings",
+                    "covered": False,
+                    "source_ids": [],
+                    "reason": "no fetched evidence",
+                }],
+                "authorities": [],
+                "gaps": ["no fetched evidence"],
+            })),
+            ModelResponse("supplemental notes"),
+            ModelResponse(json.dumps({
+                "directions": [{
+                    "direction": "primary filings",
+                    "covered": False,
+                    "source_ids": [],
+                    "reason": "no fetched evidence",
+                }],
+                "authorities": [],
+                "gaps": ["no fetched evidence"],
+            })),
+            ModelResponse("terminal draft"),
+            ModelResponse("terminal rewrite"),
         ]
     )
 
@@ -241,6 +335,11 @@ def test_offline_worker_search_fetch_answer_trace_is_self_consistent(
     )
     provider = ScriptedProvider(
         [
+            ModelResponse(json.dumps({
+                "rank": "light",
+                "directions": ["primary filings"],
+                "reason": "bounded test task",
+            })),
             ModelResponse(
                 "",
                 [ToolCall("search-1", "web_search", {"query": "report"})],
@@ -251,17 +350,29 @@ def test_offline_worker_search_fetch_answer_trace_is_self_consistent(
                 [ToolCall("fetch-1", "web_fetch", {"url": url_a})],
                 "tool_calls",
             ),
-            ModelResponse(f"Draft answer: {url_a}", [], "stop"),
             ModelResponse(
                 "",
                 [ToolCall("fetch-2", "web_fetch", {"url": url_b})],
                 "tool_calls",
             ),
             ModelResponse(
-                f"Final answer supported by {url_a} and {url_b}.",
-                [],
-                "stop",
+                f"Research notes supported by {url_a} and {url_b}."
             ),
+            ModelResponse(json.dumps({
+                "directions": [{
+                    "direction": "primary filings",
+                    "covered": True,
+                    "source_ids": [source_id_for_url(url_a), source_id_for_url(url_b)],
+                    "reason": "both fetched sources provide direct support",
+                }],
+                "authorities": [{
+                    "source_id": source_id_for_url(url_a),
+                    "is_authoritative": True,
+                    "reason": "official disclosure",
+                }],
+                "gaps": [],
+            })),
+            ModelResponse(f"Final answer supported by {url_a} and {url_b}."),
         ]
     )
     run_dir = tmp_path / "run"
@@ -302,7 +413,7 @@ def test_offline_worker_search_fetch_answer_trace_is_self_consistent(
         row["payload"]["source_id"] for row in sources
     } == set(final["payload"]["matched_source_ids"])
     assert all(row["payload"]["latency_ms"] >= 0 for row in llm + tools)
-    assert metrics.model_calls == 5
+    assert metrics.model_calls == 7
     assert metrics.searches == 1
     assert metrics.fetches == 2
     assert metrics.all_in_prompt_tokens is None

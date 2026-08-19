@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 
 import pytest
 
@@ -11,8 +12,14 @@ from simple_cc.provider import (
     TextBlock,
     ToolUseBlock,
 )
-from simple_cc.research_models import EvidenceRegistry
-from simple_cc.trace import TraceRecorder
+from simple_cc.research_models import (
+    EvidenceRegistry,
+    ResearchPlan,
+    ResearchRank,
+    ResearchWorkflowResult,
+)
+from simple_cc.research_workflow import ResearchWorkflowError
+from simple_cc.trace import TraceRecorder, read_trace_lines
 
 
 class ScriptedProvider:
@@ -367,3 +374,210 @@ def test_traced_ordinary_loop_no_longer_applies_research_gate(tmp_path):
         run_metadata={"task_type": "normal"},
     ) == "ordinary answer"
     assert len(provider.requests) == 1
+
+
+@pytest.mark.parametrize("task_type", [None, "normal", "future_kind"])
+def test_source_runtime_routes_only_explicit_research(monkeypatch, task_type):
+    provider = ScriptedProvider([
+        ProviderResponse(
+            content=[TextBlock(text="ordinary")],
+            stop_reason="end_turn",
+        )
+    ])
+    runtime = agent.SourceRuntime(provider, memory_enabled=False)
+
+    class ForbiddenWorkflow:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("ordinary task must not construct research workflow")
+
+    monkeypatch.setattr(agent, "ResearchWorkflow", ForbiddenWorkflow)
+
+    metadata = {} if task_type is None else {"task_type": task_type}
+    assert runtime.run_turn("q", run_metadata=metadata) == "ordinary"
+    assert "financial research agent" not in provider.requests[0]["system"]
+
+
+@pytest.mark.parametrize("task_type", ["research", "research_analysis"])
+def test_source_runtime_routes_research_aliases(monkeypatch, task_type):
+    provider = ScriptedProvider([])
+    runtime = agent.SourceRuntime(provider, memory_enabled=False)
+    events = []
+    seen = {}
+
+    class FakeWorkflow:
+        def __init__(self, provider, executor, *, run_context=None):
+            seen["provider"] = provider
+            seen["run_context"] = run_context
+
+        def run(self, question, cutoff, *, registry=None):
+            seen.update({"question": question, "cutoff": cutoff, "registry": registry})
+            return ResearchWorkflowResult(
+                "research answer",
+                ResearchPlan(ResearchRank.LIGHT, ("facts",), "narrow"),
+                2,
+                False,
+                False,
+            )
+
+    monkeypatch.setattr(agent, "ResearchWorkflow", FakeWorkflow)
+    monkeypatch.setattr(
+        agent,
+        "trigger_hooks",
+        lambda event, *args: events.append(event),
+    )
+
+    assert runtime.run_turn(
+        "q",
+        cutoff="2025-05-01",
+        run_metadata={"task_type": task_type},
+    ) == "research answer"
+    assert isinstance(seen["registry"], EvidenceRegistry)
+    assert seen["provider"] is runtime.tracing_provider
+    assert seen["question"] == "q"
+    assert seen["cutoff"] == "2025-05-01"
+    assert events == ["UserPromptSubmit", "Stop"]
+    assert runtime.messages == [
+        {"role": "user", "content": "q"},
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "research answer"}],
+        },
+    ]
+
+
+def test_source_runtime_research_executor_uses_shared_registry_and_private_notes(
+    monkeypatch,
+):
+    provider = ScriptedProvider([])
+    runtime = agent.SourceRuntime(
+        provider,
+        tool_definitions=[{
+            "name": "web_fetch",
+            "description": "fetch",
+            "input_schema": {},
+        }],
+        tool_handlers={"web_fetch": lambda **_: "unused"},
+        max_rounds=40,
+        memory_enabled=False,
+    )
+    captured = {}
+
+    def fake_agent_loop(messages, context, permissions, approval_callback, **kwargs):
+        captured.update({
+            "messages": copy.deepcopy(messages),
+            "context": context,
+            "permissions": permissions,
+            "approval_callback": approval_callback,
+            **kwargs,
+        })
+        messages.append({
+            "role": "assistant",
+            "content": [{"type": "text", "text": "private research notes"}],
+        })
+        return agent.AgentLoopOutcome("completed", "private research notes", rounds_used=3)
+
+    class ExercisingWorkflow:
+        def __init__(self, provider, executor, *, run_context=None):
+            self.executor = executor
+
+        def run(self, question, cutoff, *, registry=None):
+            prompt = json.dumps({
+                "question": question,
+                "cutoff": cutoff,
+                "rank": "light",
+                "directions": ["primary facts"],
+                "research_gaps": ["missing filing"],
+                "remaining_rounds": 7,
+            })
+            outcome = self.executor(prompt, 7, registry)
+            assert outcome.rounds_used == 3
+            return ResearchWorkflowResult(
+                "public report",
+                ResearchPlan(ResearchRank.LIGHT, ("primary facts",), "narrow"),
+                3,
+                False,
+                False,
+            )
+
+    monkeypatch.setattr(agent, "agent_loop", fake_agent_loop)
+    monkeypatch.setattr(agent, "ResearchWorkflow", ExercisingWorkflow)
+    monkeypatch.setattr(agent, "trigger_hooks", lambda *args: None)
+
+    assert runtime.run_turn(
+        "question",
+        cutoff="2025-05-01",
+        run_metadata={"task_type": "research"},
+    ) == "public report"
+    assert captured["messages"][0]["role"] == "user"
+    assert "primary facts" in captured["messages"][0]["content"]
+    assert captured["tools"] is runtime.tool_definitions
+    assert captured["handlers"] is runtime.tool_handlers
+    assert captured["permissions"] is runtime.permissions
+    assert captured["max_rounds"] == 7
+    assert captured["memory_enabled"] is False
+    assert captured["finalize_user_turn"] is False
+    assert isinstance(captured["evidence_registry"], EvidenceRegistry)
+    assert "financial research agent" in captured["system_prompt"]
+    assert "missing filing" in captured["system_prompt"]
+    assert "private research notes" not in repr(runtime.messages)
+
+
+def test_source_runtime_traces_explicit_and_default_routing(tmp_path):
+    provider = ScriptedProvider([
+        ProviderResponse([TextBlock(text="one")], "end_turn"),
+        ProviderResponse([TextBlock(text="two")], "end_turn"),
+    ])
+    recorder = TraceRecorder(tmp_path / "run", run_id="route-run")
+    recorder.start_run(task_id="route-task", question="q", cutoff=None, metadata={})
+    runtime = agent.SourceRuntime(provider, recorder=recorder, memory_enabled=False)
+
+    runtime.run_turn(
+        "q1",
+        task_id="route-task",
+        run_metadata={"task_type": "normal"},
+    )
+    runtime.run_turn(
+        "q2",
+        task_id="route-task",
+        run_metadata={"task_type": "unexpected"},
+    )
+
+    rows, incomplete = read_trace_lines(recorder.trajectory_path)
+    routed = [row["payload"] for row in rows if row["event_type"] == "task_routed"]
+    assert incomplete is False
+    assert routed == [
+        {
+            "raw_task_type": "normal",
+            "normalized_task_kind": "normal",
+            "reason": "explicit",
+        },
+        {
+            "raw_task_type": "unexpected",
+            "normalized_task_kind": "normal",
+            "reason": "default",
+        },
+    ]
+
+
+def test_source_runtime_adapts_research_workflow_failure(monkeypatch):
+    runtime = agent.SourceRuntime(ScriptedProvider([]), memory_enabled=False)
+
+    class FailedWorkflow:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self, question, cutoff, *, registry=None):
+            raise ResearchWorkflowError("ProviderUnavailable", "planner failed")
+
+    monkeypatch.setattr(agent, "ResearchWorkflow", FailedWorkflow)
+
+    assert runtime.run_turn(
+        "q", run_metadata={"task_type": "research"}
+    ) == ""
+    assert runtime.last_outcome == agent.AgentLoopOutcome(
+        "failed",
+        "",
+        "ProviderUnavailable",
+        "planner failed",
+        0,
+    )

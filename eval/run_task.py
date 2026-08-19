@@ -205,7 +205,7 @@ def execute_task(
                 task.question,
                 task_id=task.task_id,
                 cutoff=task.cutoff,
-                run_metadata=metadata,
+                run_metadata={**metadata, "task_type": task.task_type},
             )
             outcome = session.runtime.last_outcome
         finally:

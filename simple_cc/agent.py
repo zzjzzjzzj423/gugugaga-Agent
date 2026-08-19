@@ -29,7 +29,12 @@ from .hooks import trigger_hooks
 from .models import ChatProvider, ToolCall, ToolSpec
 from .memory import MemoryStore
 from .permissions import PermissionDecision, PermissionPolicy
-from .prompts import PromptAssembler, assemble_system_prompt
+from .prompts import (
+    PromptAssembler,
+    assemble_system_prompt,
+    ordinary_system_prompt,
+    research_execution_prompt,
+)
 from .provider import ContextLengthError
 from .recovery import RecoveryState, is_prompt_too_long_error, with_retry
 from .subagents import extract_text, has_tool_use
@@ -39,10 +44,18 @@ from .evidence import (
     link_final_answer_sources,
     prepare_research_arguments,
     record_research_evidence,
+    registered_source_map,
 )
-from .research_models import EvidenceRegistry
+from .research_models import (
+    EvidenceRegistry,
+    ResearchPlan,
+    ResearchRank,
+    TaskKind,
+    normalize_task_kind,
+)
+from .research_workflow import ResearchWorkflow
 from .telemetry import ToolCapture, TracingProvider, bind_tool_capture
-from .trace import RunContext, TraceRecorder, bind_run_context
+from .trace import RunContext, TraceRecorder, TraceWriteError, bind_run_context
 from .tools import (
     TOOL_DEFINITIONS,
     TOOL_HANDLERS,
@@ -167,19 +180,46 @@ class SourceRuntime:
         cutoff: str | None = None,
         run_metadata: dict[str, Any] | None = None,
     ) -> str:
-        del run_metadata
+        metadata = dict(run_metadata or {})
+        raw_task_type = metadata.get("task_type")
+        task_kind = normalize_task_kind(raw_task_type)
+        normalized_raw_type = str(raw_task_type or "").strip().lower()
+        routing_reason = (
+            "explicit"
+            if normalized_raw_type in {"normal", "research", "research_analysis"}
+            else "default"
+        )
         trigger_hooks("UserPromptSubmit", query)
         with agent_lock:
             turn_start = len(self.messages)
             self.messages.append({"role": "user", "content": query})
-            if self.recorder is not None and task_id is not None:
-                run = RunContext(
+            run = (
+                RunContext(
                     self.recorder,
                     self.recorder.run_id,
                     task_id,
                     cutoff,
                 )
-                with bind_run_context(run):
+                if self.recorder is not None and task_id is not None
+                else None
+            )
+
+            def execute_routed_turn() -> tuple[
+                AgentLoopOutcome, dict[str, str]
+            ]:
+                if run is not None:
+                    run.recorder.record(
+                        "task_routed",
+                        {
+                            "raw_task_type": raw_task_type,
+                            "normalized_task_kind": task_kind.value,
+                            "reason": routing_reason,
+                        },
+                        parent_span_id=run.parent_span_id,
+                        agent_id=run.agent_id,
+                    )
+
+                if task_kind is TaskKind.NORMAL:
                     outcome = agent_loop(
                         self.messages,
                         self.context,
@@ -191,41 +231,110 @@ class SourceRuntime:
                         max_rounds=self.max_rounds,
                         memory_enabled=self.memory_enabled,
                         run_context=run,
-                        registered_sources=self.registered_sources,
+                        registered_sources={},
                         todo_state=self.todo_state,
+                        system_prompt=ordinary_system_prompt(self.state_builder()),
                     )
-                self.last_outcome = outcome
+                    return outcome, {}
+
+                evidence_registry = EvidenceRegistry()
+                research_sources: dict[str, str] = {}
+
+                def execute_research(
+                    prompt: str,
+                    max_rounds: int,
+                    registry: EvidenceRegistry,
+                ) -> AgentLoopOutcome:
+                    stage = json.loads(prompt)
+                    plan = ResearchPlan(
+                        ResearchRank(stage["rank"]),
+                        tuple(stage["directions"]),
+                        "research execution",
+                    )
+                    gaps = tuple(stage.get("research_gaps") or ())
+                    system_prompt = research_execution_prompt(
+                        self.state_builder(),
+                        question=str(stage.get("question") or query),
+                        cutoff=stage.get("cutoff", cutoff),
+                        plan=plan,
+                        gaps=gaps,
+                        remaining_rounds=max_rounds,
+                    )
+                    research_messages = [{"role": "user", "content": prompt}]
+                    return agent_loop(
+                        research_messages,
+                        self.context,
+                        self.permissions,
+                        self.approval_callback,
+                        provider=self.tracing_provider,
+                        tools=self.tool_definitions,
+                        handlers=self.tool_handlers,
+                        max_rounds=max_rounds,
+                        memory_enabled=self.memory_enabled,
+                        run_context=run,
+                        registered_sources=research_sources,
+                        todo_state=self.todo_state,
+                        system_prompt=system_prompt,
+                        evidence_registry=registry,
+                        finalize_user_turn=False,
+                    )
+
+                try:
+                    result = ResearchWorkflow(
+                        self.tracing_provider,
+                        execute_research,
+                        run_context=run,
+                    ).run(query, cutoff, registry=evidence_registry)
+                except TraceWriteError:
+                    raise
+                except Exception as error:
+                    return AgentLoopOutcome(
+                        "failed",
+                        "",
+                        getattr(error, "failure_class", None)
+                        or type(error).__name__,
+                        getattr(error, "failure_message", None) or str(error),
+                    ), registered_source_map(evidence_registry)
+
+                outcome = AgentLoopOutcome(
+                    "completed",
+                    result.final_text,
+                    rounds_used=result.research_rounds_used,
+                )
+                self.messages.append({
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": result.final_text}],
+                })
+                trigger_hooks("Stop", self.messages)
+                return outcome, registered_source_map(evidence_registry)
+
+            if run is not None:
+                with bind_run_context(run):
+                    outcome, final_source_map = execute_routed_turn()
                 if outcome.status == "completed":
                     linkage = link_final_answer_sources(
-                        outcome.final_text, self.registered_sources
+                        outcome.final_text, final_source_map
                     )
-                    self.recorder.record(
+                    run.recorder.record(
                         "final_answer",
                         {"text": outcome.final_text, **linkage},
+                        parent_span_id=run.parent_span_id,
+                        agent_id=run.agent_id,
                     )
                 else:
-                    self.recorder.record(
+                    run.recorder.record(
                         "run_failed",
                         {
                             "status": outcome.status,
                             "failure_class": outcome.failure_class,
                             "message": outcome.failure_message,
                         },
+                        parent_span_id=run.parent_span_id,
+                        agent_id=run.agent_id,
                     )
             else:
-                outcome = agent_loop(
-                    self.messages,
-                    self.context,
-                    self.permissions,
-                    self.approval_callback,
-                    provider=self.tracing_provider,
-                    tools=self.tool_definitions,
-                    handlers=self.tool_handlers,
-                    max_rounds=self.max_rounds,
-                    memory_enabled=self.memory_enabled,
-                    todo_state=self.todo_state,
-                )
-                self.last_outcome = outcome
+                outcome, _ = execute_routed_turn()
+            self.last_outcome = outcome
             self.context = update_context(self.context, self.messages)
             return self._turn_text(self.messages, turn_start)
 
@@ -282,6 +391,11 @@ def agent_loop(
         config.MEMORY_ENABLED if memory_enabled is None else memory_enabled
     )
     registered_sources = registered_sources if registered_sources is not None else {}
+    required_cutoff = (
+        run_context.cutoff
+        if run_context is not None and evidence_registry is not None
+        else None
+    )
 
     def record_compaction(report) -> None:
         if run_context is None:
@@ -489,9 +603,7 @@ def agent_loop(
                 prepared = prepare_research_arguments(
                     block.name,
                     block.input,
-                    required_cutoff=(
-                        run_context.cutoff if run_context is not None else None
-                    ),
+                    required_cutoff=required_cutoff,
                 )
             except CutoffMismatch as error:
                 if run_context is not None:
@@ -499,7 +611,7 @@ def agent_loop(
                         "cutoff_validation",
                         {
                             "decision": "rejected",
-                            "required_cutoff": run_context.cutoff,
+                            "required_cutoff": required_cutoff,
                             "supplied_cutoff": block.input.get("cutoff"),
                             "error": str(error),
                         },
@@ -538,7 +650,7 @@ def agent_loop(
                     "cutoff_validation",
                     {
                         "decision": prepared.decision,
-                        "required_cutoff": run_context.cutoff,
+                        "required_cutoff": required_cutoff,
                         "supplied_cutoff": prepared.supplied_cutoff,
                         "normalized_cutoff": arguments.get("cutoff"),
                     },
