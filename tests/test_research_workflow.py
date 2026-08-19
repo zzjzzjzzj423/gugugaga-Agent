@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from simple_cc.evidence import evidence_record_from_result
 from simple_cc.models import ModelResponse, ToolCall
 from simple_cc.research_models import EvidenceRegistry, ResearchPlan, ResearchRank
@@ -109,6 +111,39 @@ def test_plan_rejects_trailing_prose_arrays_and_non_list_directions():
         assert plan.validation_errors
 
 
+@pytest.mark.parametrize(
+    ("value", "error_fragment"),
+    (
+        (
+            '{"rank":"light","rank":"light","directions":['
+            '"primary"],"reason":"duplicate"}',
+            "duplicate JSON object key: rank",
+        ),
+        (
+            '{"rank":"light","directions":["primary"],"reason":"ok",'
+            '"unexpected":true}',
+            "unexpected field: unexpected",
+        ),
+        (
+            '{"rank":"light","directions":["primary"],"reason":NaN}',
+            "non-standard JSON constant: NaN",
+        ),
+        (
+            '{"rank":"light","directions":["primary"],"reason":Infinity}',
+            "non-standard JSON constant: Infinity",
+        ),
+    ),
+)
+def test_plan_rejects_duplicate_extra_and_nonstandard_json(
+    value, error_fragment
+):
+    plan = parse_research_plan(value)
+
+    assert plan.used_fallback is True
+    assert plan.rank is ResearchRank.STANDARD
+    assert error_fragment in " ".join(plan.validation_errors)
+
+
 def test_build_evidence_packet_exposes_only_registered_bounded_fields():
     registry = registry_with_two_sources()
 
@@ -182,6 +217,133 @@ def test_gate_invalid_output_clears_old_authority_state():
 
     assert decision.passed is False
     assert decision.authoritative_source_ids == ()
+    assert not any(item.authoritative for item in registry.records)
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "repeated_direction_source_id",
+        "repeated_authority_id",
+        "missing_direction_reason",
+        "missing_authority_reason",
+        "non_boolean_covered",
+        "non_boolean_authority",
+        "extra_root_field",
+        "extra_direction_field",
+        "extra_authority_field",
+    ),
+)
+def test_gate_rejects_malformed_schema_and_clears_authority(case):
+    registry = registry_with_two_sources()
+    first = registry.records[0]
+    registry.mark_authority(first.source_id, True, "old decision")
+    payload = valid_gate_payload(registry)
+
+    if case == "repeated_direction_source_id":
+        payload["directions"][0]["source_ids"] = [
+            first.source_id,
+            first.source_id,
+        ]
+    elif case == "repeated_authority_id":
+        payload["authorities"].append(dict(payload["authorities"][0]))
+    elif case == "missing_direction_reason":
+        del payload["directions"][0]["reason"]
+    elif case == "missing_authority_reason":
+        del payload["authorities"][0]["reason"]
+    elif case == "non_boolean_covered":
+        payload["directions"][0]["covered"] = 1
+    elif case == "non_boolean_authority":
+        payload["authorities"][0]["is_authoritative"] = 1
+    elif case == "extra_root_field":
+        payload["unexpected"] = True
+    elif case == "extra_direction_field":
+        payload["directions"][0]["unexpected"] = True
+    elif case == "extra_authority_field":
+        payload["authorities"][0]["unexpected"] = True
+
+    decision = parse_research_gate(json.dumps(payload), light_plan(), registry)
+
+    assert decision.passed is False
+    assert decision.gaps == ("research gate output was invalid",)
+    assert decision.validation_errors
+    assert not any(item.authoritative for item in registry.records)
+
+
+def test_gate_rejects_repeated_directions_and_clears_authority():
+    registry = registry_with_two_sources()
+    first = registry.records[0]
+    registry.mark_authority(first.source_id, True, "old decision")
+    plan = ResearchPlan(
+        ResearchRank.STANDARD,
+        ("primary filings", "independent analysis"),
+        "broader",
+    )
+    direction = valid_gate_payload(registry)["directions"][0]
+    payload = {
+        "directions": [direction, dict(direction)],
+        "authorities": [],
+        "gaps": [],
+    }
+
+    decision = parse_research_gate(json.dumps(payload), plan, registry)
+
+    assert decision.passed is False
+    assert "repeated research direction" in " ".join(decision.validation_errors)
+    assert not any(item.authoritative for item in registry.records)
+
+
+def test_gate_rejects_duplicate_keys_and_nonstandard_constants():
+    registry = registry_with_two_sources()
+    first = registry.records[0]
+    valid = json.dumps(valid_gate_payload(registry), separators=(",", ":"))
+    malformed = (
+        (
+            valid[:-1] + ',"gaps":[]}',
+            "duplicate JSON object key: gaps",
+        ),
+        (
+            valid[:-1] + ',"authorities":[]}',
+            "duplicate JSON object key: authorities",
+        ),
+        (
+            valid.replace(
+                '"covered":true',
+                '"covered":true,"covered":true',
+                1,
+            ),
+            "duplicate JSON object key: covered",
+        ),
+        (
+            valid.replace('"gaps":[]', '"gaps":NaN', 1),
+            "non-standard JSON constant: NaN",
+        ),
+    )
+
+    for text, error_fragment in malformed:
+        registry.mark_authority(first.source_id, True, "old decision")
+        decision = parse_research_gate(text, light_plan(), registry)
+
+        assert decision.passed is False
+        assert decision.gaps == ("research gate output was invalid",)
+        assert error_fragment in " ".join(decision.validation_errors)
+        assert not any(item.authoritative for item in registry.records)
+
+
+def test_gate_invalid_later_authority_does_not_apply_valid_first_decision():
+    registry = registry_with_two_sources()
+    first = registry.records[0]
+    payload = valid_gate_payload(registry)
+    payload["authorities"].append({
+        "source_id": "src_not_registered",
+        "is_authoritative": True,
+        "reason": "invalid later decision",
+    })
+
+    decision = parse_research_gate(json.dumps(payload), light_plan(), registry)
+
+    assert decision.passed is False
+    assert "unknown evidence source id" in " ".join(decision.validation_errors)
     assert not any(item.authoritative for item in registry.records)
 
 

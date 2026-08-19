@@ -37,6 +37,33 @@ _FENCED_JSON = re.compile(
 )
 
 
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON object key: {key}")
+        value[key] = item
+    return value
+
+
+def _reject_nonstandard_constant(value: str) -> None:
+    raise ValueError(f"non-standard JSON constant: {value}")
+
+
+def _require_exact_schema(
+    value: dict[str, Any],
+    expected: set[str],
+    label: str,
+) -> None:
+    actual = set(value)
+    missing = sorted(expected - actual)
+    unexpected = sorted(actual - expected)
+    if missing:
+        raise ValueError(f"{label} missing field: {missing[0]}")
+    if unexpected:
+        raise ValueError(f"{label} unexpected field: {unexpected[0]}")
+
+
 def json_object(text: str) -> dict[str, Any]:
     """Parse exactly one raw or fenced JSON object, with no surrounding prose."""
     if not isinstance(text, str):
@@ -47,7 +74,11 @@ def json_object(text: str) -> dict[str, Any]:
         if fenced is None:
             raise ValueError("structured output must be one fenced json block")
         candidate = fenced.group("body").strip()
-    value = json.loads(candidate)
+    value = json.loads(
+        candidate,
+        object_pairs_hook=_reject_duplicate_keys,
+        parse_constant=_reject_nonstandard_constant,
+    )
     if not isinstance(value, dict):
         raise ValueError("structured output must be a JSON object")
     return value
@@ -56,6 +87,11 @@ def json_object(text: str) -> dict[str, Any]:
 def parse_research_plan(text: str) -> ResearchPlan:
     try:
         value = json_object(text)
+        _require_exact_schema(
+            value,
+            {"rank", "directions", "reason"},
+            "research plan",
+        )
         rank = ResearchRank(value.get("rank"))
         raw_directions = value.get("directions")
         if not isinstance(raw_directions, list):
@@ -120,6 +156,11 @@ def parse_research_gate(
     registry.clear_authority()
     try:
         value = json_object(text)
+        _require_exact_schema(
+            value,
+            {"directions", "authorities", "gaps"},
+            "research gate",
+        )
         raw_directions = value.get("directions")
         raw_authorities = value.get("authorities")
         raw_gaps = value.get("gaps")
@@ -140,6 +181,11 @@ def parse_research_gate(
         for raw in raw_directions:
             if not isinstance(raw, dict):
                 raise ValueError("gate direction assessments must be objects")
+            _require_exact_schema(
+                raw,
+                {"direction", "covered", "source_ids", "reason"},
+                "gate direction assessment",
+            )
             direction = _non_empty_string(
                 raw.get("direction"), "gate direction must be non-empty"
             )
@@ -171,6 +217,11 @@ def parse_research_gate(
         for raw in raw_authorities:
             if not isinstance(raw, dict):
                 raise ValueError("gate authority assessments must be objects")
+            _require_exact_schema(
+                raw,
+                {"source_id", "is_authoritative", "reason"},
+                "gate authority assessment",
+            )
             source_id = _non_empty_string(
                 raw.get("source_id"), "authority source_id must be non-empty"
             )
