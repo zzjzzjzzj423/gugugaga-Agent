@@ -804,3 +804,186 @@ def test_research_and_writing_retry_flags_are_independent():
     assert result.supplemental_research_used is True
     assert result.writing_repair_used is True
     assert all(request["tools"] == [] for request in provider.requests)
+
+
+def test_missing_rounds_used_is_safe_budget_error_not_attribute_error():
+    class MissingRoundsOutcome:
+        status = "completed"
+        final_text = "notes"
+        failure_class = None
+        failure_message = None
+
+    workflow = ResearchWorkflow(
+        ScriptedProvider([light_plan_response()]),
+        lambda prompt, max_rounds, evidence_registry: MissingRoundsOutcome(),
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        workflow.run("question", "2025-05-01")
+
+    assert getattr(caught.value, "failure_class", None) == (
+        "ResearchBudgetExceeded"
+    )
+    assert "reported None rounds" in str(caught.value)
+
+
+def test_invalid_round_type_records_serializable_terminal_failure(tmp_path):
+    recorder = TraceRecorder(tmp_path / "run", run_id="invalid-round-run")
+    recorder.start_run(
+        task_id="research-task",
+        question="question",
+        cutoff="2025-05-01",
+        metadata={"task_type": "research"},
+    )
+    run = RunContext(
+        recorder,
+        "invalid-round-run",
+        "research-task",
+        "2025-05-01",
+        agent_id="research-agent",
+    )
+    workflow = ResearchWorkflow(
+        ScriptedProvider([light_plan_response()]),
+        lambda prompt, max_rounds, evidence_registry: AgentLoopOutcome(
+            "completed", "notes", rounds_used=["three"]
+        ),
+        run_context=run,
+    )
+
+    with bind_run_context(run), pytest.raises(RuntimeError) as caught:
+        workflow.run("question", "2025-05-01")
+
+    assert getattr(caught.value, "failure_class", None) == (
+        "ResearchBudgetExceeded"
+    )
+    rows = [
+        json.loads(line)
+        for line in recorder.trajectory_path.read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    finished = next(
+        row for row in rows
+        if row["event_type"] == "research_attempt_finished"
+    )
+    terminal = next(
+        row for row in rows
+        if row["event_type"] == "research_workflow_completed"
+    )
+    assert finished["payload"]["reported_rounds"] == "['three']"
+    assert terminal["payload"]["terminal_reason"] == "failed"
+    assert terminal["payload"]["failure_class"] == "ResearchBudgetExceeded"
+    json.dumps(finished["payload"])
+    json.dumps(terminal["payload"])
+
+
+def test_failed_executor_consumes_reported_rounds_and_records_terminal(tmp_path):
+    recorder = TraceRecorder(tmp_path / "run", run_id="failed-executor-run")
+    recorder.start_run(
+        task_id="research-task",
+        question="question",
+        cutoff="2025-05-01",
+        metadata={"task_type": "research"},
+    )
+    run = RunContext(
+        recorder,
+        "failed-executor-run",
+        "research-task",
+        "2025-05-01",
+        agent_id="research-agent",
+    )
+    workflow = ResearchWorkflow(
+        ScriptedProvider([light_plan_response()]),
+        lambda prompt, max_rounds, evidence_registry: AgentLoopOutcome(
+            "failed",
+            "notes",
+            failure_class="ProviderUnavailable",
+            failure_message="upstream timed out",
+            rounds_used=2,
+        ),
+        run_context=run,
+    )
+
+    with bind_run_context(run), pytest.raises(RuntimeError) as caught:
+        workflow.run("question", "2025-05-01")
+
+    assert getattr(caught.value, "failure_class", None) == (
+        "ProviderUnavailable"
+    )
+    assert getattr(caught.value, "failure_message", None) == (
+        "upstream timed out"
+    )
+    rows = [
+        json.loads(line)
+        for line in recorder.trajectory_path.read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    finished = next(
+        row for row in rows
+        if row["event_type"] == "research_attempt_finished"
+    )
+    terminal = next(
+        row for row in rows
+        if row["event_type"] == "research_workflow_completed"
+    )
+    assert finished["payload"]["reported_rounds"] == 2
+    assert finished["payload"]["consumed_rounds"] == 2
+    assert finished["payload"]["used_rounds"] == 2
+    assert terminal["payload"]["research_rounds_used"] == 2
+    assert terminal["payload"]["remaining_rounds"] == 8
+    assert terminal["payload"]["failure_class"] == "ProviderUnavailable"
+    assert terminal["payload"]["failure_message"] == "upstream timed out"
+
+
+def test_model_error_is_preserved_and_records_workflow_terminal(tmp_path):
+    model_error = RuntimeError("planner offline")
+    recorder = TraceRecorder(tmp_path / "run", run_id="failed-model-run")
+    recorder.start_run(
+        task_id="research-task",
+        question="question",
+        cutoff="2025-05-01",
+        metadata={"task_type": "research"},
+    )
+    run = RunContext(
+        recorder,
+        "failed-model-run",
+        "research-task",
+        "2025-05-01",
+        agent_id="research-agent",
+    )
+    workflow = ResearchWorkflow(
+        ScriptedProvider([model_error]),
+        lambda prompt, max_rounds, evidence_registry: AgentLoopOutcome(
+            "completed", "notes", rounds_used=1
+        ),
+        run_context=run,
+    )
+
+    with bind_run_context(run), pytest.raises(RuntimeError) as caught:
+        workflow.run("question", "2025-05-01")
+
+    assert caught.value is model_error
+    rows = [
+        json.loads(line)
+        for line in recorder.trajectory_path.read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    terminal = next(
+        row for row in rows
+        if row["event_type"] == "research_workflow_completed"
+    )
+    assert terminal["agent_id"] == "research-agent"
+    assert terminal["payload"] == {
+        "failure_class": "RuntimeError",
+        "failure_message": "planner offline",
+        "final_validation_errors": [],
+        "rank": None,
+        "remaining_gaps": [],
+        "remaining_rounds": None,
+        "research_rounds_used": 0,
+        "supplemental_research_used": False,
+        "terminal_reason": "failed",
+        "writing_repair_used": False,
+    }

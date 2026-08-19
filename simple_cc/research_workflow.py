@@ -51,6 +51,19 @@ class ResearchWorkflowError(RuntimeError):
         super().__init__(f"{self.failure_class}: {self.failure_message}")
 
 
+def _safe_repr(value: Any) -> str:
+    try:
+        return repr(value)
+    except Exception:
+        return f"<{type(value).__name__}>"
+
+
+def _trace_round_count(value: Any) -> int | str | bool | None:
+    if value is None or isinstance(value, (int, str, bool)):
+        return value
+    return _safe_repr(value)
+
+
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     value: dict[str, Any] = {}
     for key, item in pairs:
@@ -338,6 +351,17 @@ class ResearchWorkflow:
             agent_id=self.run_context.agent_id,
         )
 
+    def _record_during_error(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> None:
+        """Best-effort tracing that cannot replace the active failure."""
+        try:
+            self._record(event_type, payload)
+        except Exception:
+            pass
+
     def plan(self, question: str, cutoff: str | None) -> ResearchPlan:
         system = (
             "Plan a bounded research task. Select exactly one fixed rank and "
@@ -456,12 +480,13 @@ class ResearchWorkflow:
         ):
             raise ResearchWorkflowError(
                 "ResearchBudgetExceeded",
-                f"executor reported {rounds_used!r} rounds for a supplied "
+                f"executor reported {_safe_repr(rounds_used)} rounds for a supplied "
                 f"budget of {supplied_rounds}",
             )
 
         status = str(getattr(outcome, "status", ""))
         if status == "failed":
+            budget.consume(rounds_used)
             raise ResearchWorkflowError(
                 getattr(outcome, "failure_class", None)
                 or "ResearchExecutionFailed",
@@ -511,18 +536,18 @@ class ResearchWorkflow:
         )
         before = budget.used_rounds
         outcome: ResearchExecutionOutcome | None = None
+        reported_rounds: Any = None
         try:
             outcome = self.research_executor(prompt, supplied_rounds, registry)
+            reported_rounds = getattr(outcome, "rounds_used", None)
             consumed = self._consume_outcome(budget, outcome, supplied_rounds)
         except ResearchWorkflowError as error:
-            self._record("research_attempt_finished", {
+            self._record_during_error("research_attempt_finished", {
                 "attempt": attempt,
                 "supplemental": supplemental,
                 "status": "failed",
                 "supplied_rounds": supplied_rounds,
-                "reported_rounds": (
-                    outcome.rounds_used if outcome is not None else None
-                ),
+                "reported_rounds": _trace_round_count(reported_rounds),
                 "consumed_rounds": budget.used_rounds - before,
                 "used_rounds": budget.used_rounds,
                 "remaining_rounds": budget.remaining_rounds,
@@ -532,7 +557,7 @@ class ResearchWorkflow:
             raise
         except Exception as error:
             wrapped = ResearchWorkflowError(type(error).__name__, str(error))
-            self._record("research_attempt_finished", {
+            self._record_during_error("research_attempt_finished", {
                 "attempt": attempt,
                 "supplemental": supplemental,
                 "status": "failed",
@@ -550,12 +575,12 @@ class ResearchWorkflow:
             "supplemental": supplemental,
             "status": outcome.status,
             "supplied_rounds": supplied_rounds,
-            "reported_rounds": outcome.rounds_used,
+            "reported_rounds": _trace_round_count(reported_rounds),
             "consumed_rounds": consumed,
             "used_rounds": budget.used_rounds,
             "remaining_rounds": budget.remaining_rounds,
-            "failure_class": outcome.failure_class,
-            "failure_message": outcome.failure_message,
+            "failure_class": getattr(outcome, "failure_class", None),
+            "failure_message": getattr(outcome, "failure_message", None),
         })
         return outcome
 
@@ -635,16 +660,19 @@ class ResearchWorkflow:
             json.dumps(content, ensure_ascii=False, sort_keys=True),
         )
 
-    def run(
+    def _run_forward(
         self,
         question: str,
         cutoff: str | None,
         *,
-        registry: EvidenceRegistry | None = None,
+        registry: EvidenceRegistry,
+        state: dict[str, Any],
     ) -> ResearchWorkflowResult:
-        evidence_registry = registry if registry is not None else EvidenceRegistry()
+        evidence_registry = registry
         plan = self.plan(question, cutoff)
+        state["plan"] = plan
         budget = ResearchBudget(plan.policy.max_research_rounds)
+        state["budget"] = budget
 
         self._execute_research(
             question,
@@ -662,10 +690,12 @@ class ResearchWorkflow:
             evidence_registry,
             attempt=1,
         )
+        state["gate"] = gate
 
         supplemental_used = False
         if not gate.passed and budget.remaining_rounds > 0:
             supplemental_used = True
+            state["supplemental_used"] = True
             self._execute_research(
                 question,
                 cutoff,
@@ -682,6 +712,7 @@ class ResearchWorkflow:
                 evidence_registry,
                 attempt=2,
             )
+            state["gate"] = gate
         else:
             self._record("supplemental_research_skipped", {
                 "reason": (
@@ -717,6 +748,7 @@ class ResearchWorkflow:
             gate.gaps,
         )
         errors = validate_research_final(draft, evidence_registry, plan)
+        state["errors"] = tuple(errors)
         self._record("writing_gate", {
             "attempt": 1,
             "passed": not errors,
@@ -736,6 +768,7 @@ class ResearchWorkflow:
         repair_used = False
         if errors:
             repair_used = True
+            state["repair_used"] = True
             self._record("writing_repair_started", {
                 "attempt": 2,
                 "validation_errors": tuple(errors),
@@ -753,6 +786,7 @@ class ResearchWorkflow:
                 errors,
             )
             errors = validate_research_final(draft, evidence_registry, plan)
+            state["errors"] = tuple(errors)
             self._record("writing_gate", {
                 "attempt": 2,
                 "passed": not errors,
@@ -796,3 +830,68 @@ class ResearchWorkflow:
             "remaining_gaps": tuple(gate.gaps),
         })
         return result
+
+    def _record_terminal_failure(
+        self,
+        error: Exception,
+        state: dict[str, Any],
+    ) -> None:
+        try:
+            plan = state.get("plan")
+            budget = state.get("budget")
+            gate = state.get("gate")
+            failure_class = (
+                getattr(error, "failure_class", None) or type(error).__name__
+            )
+            failure_message = (
+                getattr(error, "failure_message", None) or str(error)
+            )
+            self._record_during_error("research_workflow_completed", {
+                "terminal_reason": "failed",
+                "rank": plan.rank.value if plan is not None else None,
+                "research_rounds_used": (
+                    budget.used_rounds if budget is not None else 0
+                ),
+                "remaining_rounds": (
+                    budget.remaining_rounds if budget is not None else None
+                ),
+                "supplemental_research_used": bool(
+                    state.get("supplemental_used", False)
+                ),
+                "writing_repair_used": bool(state.get("repair_used", False)),
+                "final_validation_errors": tuple(state.get("errors", ())),
+                "remaining_gaps": (
+                    tuple(gate.gaps) if gate is not None else ()
+                ),
+                "failure_class": str(failure_class),
+                "failure_message": str(failure_message),
+            })
+        except Exception:
+            pass
+
+    def run(
+        self,
+        question: str,
+        cutoff: str | None,
+        *,
+        registry: EvidenceRegistry | None = None,
+    ) -> ResearchWorkflowResult:
+        evidence_registry = registry if registry is not None else EvidenceRegistry()
+        state: dict[str, Any] = {
+            "plan": None,
+            "budget": None,
+            "gate": None,
+            "supplemental_used": False,
+            "repair_used": False,
+            "errors": (),
+        }
+        try:
+            return self._run_forward(
+                question,
+                cutoff,
+                registry=evidence_registry,
+                state=state,
+            )
+        except Exception as error:
+            self._record_terminal_failure(error, state)
+            raise
