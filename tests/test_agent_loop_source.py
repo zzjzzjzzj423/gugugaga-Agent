@@ -11,6 +11,8 @@ from simple_cc.provider import (
     TextBlock,
     ToolUseBlock,
 )
+from simple_cc.research_models import EvidenceRegistry
+from simple_cc.trace import TraceRecorder
 
 
 class ScriptedProvider:
@@ -283,3 +285,85 @@ def test_compact_tool_mutates_history_without_dispatching_placeholder(
         )
         for message in messages
     )
+
+
+def test_agent_loop_uses_injected_prompt_and_reports_rounds():
+    provider = ScriptedProvider([
+        ProviderResponse(
+            content=[TextBlock(text="stage notes")],
+            stop_reason="end_turn",
+        )
+    ])
+
+    outcome = agent.agent_loop(
+        [{"role": "user", "content": "research"}],
+        {},
+        provider=provider,
+        tools=[],
+        handlers={},
+        memory_enabled=False,
+        system_prompt="STAGE PROMPT",
+        finalize_user_turn=False,
+    )
+
+    assert outcome.final_text == "stage notes"
+    assert outcome.rounds_used == 1
+    assert provider.requests[0]["system"] == "STAGE PROMPT"
+
+
+def test_agent_loop_registers_foreground_fetch_without_trace():
+    provider = ScriptedProvider([
+        ProviderResponse(
+            content=[
+                ToolUseBlock(
+                    id="fetch-1",
+                    name="web_fetch",
+                    input={"url": "https://example.com/report"},
+                )
+            ],
+            stop_reason="tool_use",
+        ),
+        ProviderResponse(
+            content=[TextBlock(text="research notes")],
+            stop_reason="end_turn",
+        ),
+    ])
+    registry = EvidenceRegistry()
+
+    outcome = agent.agent_loop(
+        [{"role": "user", "content": "fetch the report"}],
+        {},
+        provider=provider,
+        tools=[{"name": "web_fetch", "description": "fetch", "input_schema": {}}],
+        handlers={
+            "web_fetch": lambda **_: (
+                '{"ok": true, "url": "https://example.com/report", '
+                '"title": "Report", "content": "fetched facts"}'
+            )
+        },
+        memory_enabled=False,
+        evidence_registry=registry,
+    )
+
+    assert outcome.final_text == "research notes"
+    assert len(registry.records) == 1
+    assert registry.records[0].canonical_url == "https://example.com/report"
+
+
+def test_traced_ordinary_loop_no_longer_applies_research_gate(tmp_path):
+    provider = ScriptedProvider([
+        ProviderResponse(
+            content=[TextBlock(text="ordinary answer")],
+            stop_reason="end_turn",
+        )
+    ])
+    recorder = TraceRecorder(tmp_path / "run", run_id="ordinary-run")
+    recorder.start_run(task_id="ordinary", question="q", cutoff=None, metadata={})
+    runtime = agent.SourceRuntime(provider, recorder=recorder, memory_enabled=False)
+
+    assert runtime.run_turn(
+        "q",
+        task_id="ordinary",
+        run_metadata={"task_type": "normal"},
+    ) == "ordinary answer"
+    assert len(provider.requests) == 1

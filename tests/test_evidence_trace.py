@@ -73,7 +73,6 @@ def test_source_runtime_traces_tool_and_injects_cutoff(tmp_path, monkeypatch):
                 "tool_calls",
             ),
             ModelResponse("Research complete", [], "stop"),
-            ModelResponse("Research complete", [], "stop"),
         ]
     )
     recorder = TraceRecorder(tmp_path / "run", run_id="run-1")
@@ -104,8 +103,8 @@ def test_source_runtime_traces_tool_and_injects_cutoff(tmp_path, monkeypatch):
     finally:
         config.configure_workspace(old_workspace)
 
-    assert answer.startswith("INSUFFICIENT_EVIDENCE")
-    assert len(provider.requests) == 3
+    assert answer == "Research complete"
+    assert len(provider.requests) == 2
     assert runtime.last_outcome.status == "completed"
     assert seen == [{"query": "rates", "cutoff": "2025-05-01"}]
     rows = [
@@ -291,39 +290,3 @@ def test_dynamic_writing_gate_reports_each_failure():
         "cite fetched sources in the final answer",
         "final answer contains unfetched citations",
     ]
-
-def test_research_finalization_allows_only_one_repair(tmp_path):
-    provider = ScriptedProvider(
-        [
-            ModelResponse("First unsupported answer", [], "stop"),
-            ModelResponse("Second unsupported answer", [], "stop"),
-        ]
-    )
-
-    recorder = TraceRecorder(tmp_path / "run", run_id="run-gate")
-    recorder.start_run(
-        task_id="task-gate",
-        question="Research the company",
-        cutoff="2025-05-01",
-        metadata={},
-    )
-
-    runtime = agent.SourceRuntime(
-        provider,
-        recorder=recorder,
-        tool_definitions=[],
-        tool_handlers={},
-        memory_enabled=False,
-    )
-
-    answer = runtime.run_turn(
-        "Research the company",
-        task_id="task-gate",
-        cutoff="2025-05-01",
-    )
-
-    assert len(provider.requests) == 2
-    assert answer.startswith("INSUFFICIENT_EVIDENCE")
-
-    repair_message = provider.requests[1]["messages"][-1]["content"]
-    assert repair_message.startswith("[Research finalization blocked]")

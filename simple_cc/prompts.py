@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime
 
 from . import config
 from .skills import list_skills, scan_skills
 
 
-PROMPT_SECTIONS = {
-    "identity": """You are a financial research agent.
+ORDINARY_IDENTITY = (
+    "You are a general workspace agent. Complete the user's task using the "
+    "available tools, respect permissions, and verify work before claiming success."
+)
+
+RESEARCH_IDENTITY = """You are a financial research agent.
 
 Research contract:
 1. Directly answer the financial question and state a clear conclusion.
@@ -19,7 +24,10 @@ Research contract:
 7. Do not use evidence published after the cutoff.
 8. Include a Sources section containing the exact fetched URLs.
 9. If sufficient evidence cannot be retrieved, return
-   INSUFFICIENT_EVIDENCE instead of answering from model memory.""",
+   INSUFFICIENT_EVIDENCE instead of answering from model memory."""
+
+
+PROMPT_SECTIONS = {
     "tools": (
         "Available tools: bash, read_file, write_file, edit_file, glob, "
         "web_search, web_fetch, pdf_fetch, todo_write, task, load_skill, compact, "
@@ -67,30 +75,42 @@ Research contract:
 }
 
 SUB_SYSTEM = (
-    f"You are a financial research subagent at {config.WORKDIR}. "
-    "Gather and verify evidence for the assigned research question, "
-    "respect the cutoff date, and return a concise evidence summary. "
+    f"You are a workspace subagent at {config.WORKDIR}. "
+    "Complete the assigned workspace task, respect permissions, and return "
+    "a concise verified summary. "
     "Do not spawn more agents."
 )
 
 
 def subagent_system_prompt() -> str:
     return (
-        f"You are a financial research subagent at {config.WORKDIR}. "
-        "Gather and verify evidence for the assigned research question, "
-        "respect the cutoff date, and return a concise evidence summary. "
+        f"You are a workspace subagent at {config.WORKDIR}. "
+        "Complete the assigned workspace task, respect permissions, and return "
+        "a concise verified summary. "
         "Do not spawn more agents."
     )
 
 
-def assemble_system_prompt(context: dict) -> str:
+def assemble_system_prompt(
+    context: dict,
+    *,
+    identity: str = ORDINARY_IDENTITY,
+    include_research: bool = False,
+    stage_context: dict | None = None,
+) -> str:
     scan_skills()
     sections = [
-        PROMPT_SECTIONS["identity"],
+        identity,
         PROMPT_SECTIONS["tools"],
-        PROMPT_SECTIONS["research"],
         f"Working directory: {config.WORKDIR}",
     ]
+    if include_research:
+        sections.append(PROMPT_SECTIONS["research"])
+    if stage_context is not None:
+        sections.append(
+            "Research stage context (JSON):\n"
+            + json.dumps(stage_context, ensure_ascii=False, sort_keys=True)
+        )
     sections.append(
         f"Current time: {datetime.now().isoformat(timespec='seconds')}"
     )
@@ -108,6 +128,41 @@ def assemble_system_prompt(context: dict) -> str:
     return "\n\n".join(sections)
 
 
+def ordinary_system_prompt(context: dict) -> str:
+    return assemble_system_prompt(context)
+
+
+def research_execution_prompt(
+    context: dict,
+    *,
+    question: str,
+    cutoff: str | None,
+    plan,
+    gaps: tuple[str, ...],
+    remaining_rounds: int,
+) -> str:
+    policy = plan.policy
+    return assemble_system_prompt(
+        context,
+        identity=RESEARCH_IDENTITY,
+        include_research=True,
+        stage_context={
+            "question": question,
+            "cutoff": cutoff,
+            "rank": plan.rank.value,
+            "targets": {
+                "max_research_rounds": policy.max_research_rounds,
+                "distinct_source_count": policy.distinct_source_count,
+                "authoritative_source_count": policy.authoritative_source_count,
+                "research_direction_count": policy.research_direction_count,
+            },
+            "directions": list(plan.directions),
+            "known_gaps": list(gaps),
+            "remaining_rounds": remaining_rounds,
+        },
+    )
+
+
 class PromptAssembler:
     """State-based prompt builder for the retained runtime."""
 
@@ -115,7 +170,7 @@ class PromptAssembler:
         sections = [
             (
                 "Identity",
-                f"You are {state.get('identity', 'Simple CC')}, a financial research agent. Use research tools to gather, verify, and cite evidence before answering.",
+                f"You are {state.get('identity', 'Simple CC')}, a workspace agent. Complete the assigned task using available tools and verify work before answering.",
             ),
             ("Workspace", str(state.get("workspace", ""))),
             ("Tools", str(state.get("tools", ""))),

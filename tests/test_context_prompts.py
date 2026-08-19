@@ -1,5 +1,11 @@
 from simple_cc.context import ContextManager, MemoryStore, SkillStore
-from simple_cc.prompts import PromptAssembler, subagent_system_prompt
+from simple_cc.prompts import (
+    PromptAssembler,
+    ordinary_system_prompt,
+    research_execution_prompt,
+    subagent_system_prompt,
+)
+from simple_cc.research_models import ResearchPlan, ResearchRank
 
 
 def test_skill_store_discovers_metadata_then_loads_body(tmp_path):
@@ -69,11 +75,41 @@ def test_prompt_assembler_includes_named_runtime_sections():
     for heading in ("Workspace", "Tools", "Skills", "Memory", "Tasks", "Team", "Safety"):
         assert f"## {heading}" in prompt
     assert "alice (reviewer)" in prompt
-    assert "financial research agent" in prompt
-    assert "coding agent" not in prompt
+    assert "workspace agent" in prompt
+    assert "financial research agent" not in prompt
 
 
-def test_subagent_prompt_has_financial_research_identity():
+def test_subagent_prompt_has_general_workspace_identity():
     prompt = subagent_system_prompt()
-    assert "financial research subagent" in prompt
-    assert "coding subagent" not in prompt
+    assert "workspace subagent" in prompt
+    assert "financial research subagent" not in prompt
+
+
+def test_ordinary_prompt_is_not_financial_research_only():
+    prompt = ordinary_system_prompt({"workspace": "C:/repo", "tools": "read_file"})
+
+    assert "workspace agent" in prompt
+    assert "financial research agent" not in prompt
+    assert "read at least two sources" not in prompt
+
+
+def test_research_execution_prompt_contains_plan_and_gaps():
+    plan = ResearchPlan(
+        ResearchRank.STANDARD,
+        ("first-party facts", "independent impact analysis"),
+        "requires corroboration",
+    )
+
+    prompt = research_execution_prompt(
+        {"workspace": "C:/repo", "tools": "web_search, web_fetch"},
+        question="How did the event affect the company?",
+        cutoff="2025-05-01",
+        plan=plan,
+        gaps=("second direction lacks evidence",),
+        remaining_rounds=8,
+    )
+
+    assert "standard" in prompt
+    assert "second direction lacks evidence" in prompt
+    assert "2025-05-01" in prompt
+    assert "8" in prompt

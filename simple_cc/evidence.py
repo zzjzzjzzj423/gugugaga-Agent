@@ -166,6 +166,7 @@ def record_research_evidence(
     raw_artifacts: list[ArtifactRef],
     span_id: str,
     registered_sources: dict[str, str],
+    record: EvidenceRecord | None = None,
 ) -> None:
     if tool_name not in RESEARCH_TOOLS:
         return
@@ -211,20 +212,19 @@ def record_research_evidence(
             agent_id=run.agent_id,
         )
         return
-    url = payload.get("url")
-    if not url:
+    if record is None:
+        record = evidence_record_from_result(tool_name, output)
+    if record is None:
         return
-    canonical = canonicalize_url(url)
-    source_id = source_id_for_url(canonical)
-    registered_sources[canonical] = source_id
+    registered_sources[record.canonical_url] = record.source_id
     run.recorder.record(
         "source_registered",
         {
-            "source_id": source_id,
-            "canonical_url": canonical,
-            "published_at": payload.get("published_at"),
-            "date_status": payload.get("date_status"),
-            "cutoff": payload.get("cutoff"),
+            "source_id": record.source_id,
+            "canonical_url": record.canonical_url,
+            "published_at": record.published_at,
+            "date_status": record.date_status,
+            "cutoff": record.cutoff,
             "start_page": payload.get("start_page"),
             "end_page": payload.get("end_page"),
             "model_visible_artifact": output_artifact.as_dict(),

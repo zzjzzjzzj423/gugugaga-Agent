@@ -35,11 +35,12 @@ from .recovery import RecoveryState, is_prompt_too_long_error, with_retry
 from .subagents import extract_text, has_tool_use
 from .evidence import (
     CutoffMismatch,
+    evidence_record_from_result,
     link_final_answer_sources,
     prepare_research_arguments,
     record_research_evidence,
-    validate_research_final,
 )
+from .research_models import EvidenceRegistry
 from .telemetry import ToolCapture, TracingProvider, bind_tool_capture
 from .trace import RunContext, TraceRecorder, bind_run_context
 from .tools import (
@@ -88,6 +89,7 @@ class AgentLoopOutcome:
     final_text: str
     failure_class: str | None = None
     failure_message: str | None = None
+    rounds_used: int = 0
 
 
 class SourceRuntime:
@@ -235,11 +237,12 @@ def call_llm(
     state: RecoveryState,
     max_tokens: int,
     provider: ChatProvider | None = None,
+    system_prompt: str | None = None,
 ):
     selected_provider = provider or client
     if selected_provider is None:
         raise RuntimeError("Agent provider is not configured")
-    system = assemble_system_prompt(context)
+    system = system_prompt if system_prompt is not None else assemble_system_prompt(context)
     return with_retry(
         lambda: selected_provider.create(
             model=state.current_model or None,
@@ -266,6 +269,9 @@ def agent_loop(
     run_context: RunContext | None = None,
     registered_sources: dict[str, str] | None = None,
     todo_state: dict[str, int] | None = None,
+    system_prompt: str | None = None,
+    evidence_registry: EvidenceRegistry | None = None,
+    finalize_user_turn: bool = True,
 ) -> AgentLoopOutcome:
     global rounds_since_todo
     tools = tools if tools is not None else TOOL_DEFINITIONS
@@ -276,7 +282,6 @@ def agent_loop(
         config.MEMORY_ENABLED if memory_enabled is None else memory_enabled
     )
     registered_sources = registered_sources if registered_sources is not None else {}
-    research_final_repair_used = False
 
     def record_compaction(report) -> None:
         if run_context is None:
@@ -372,6 +377,7 @@ def agent_loop(
                 state,
                 max_tokens,
                 selected_provider,
+                system_prompt,
             )
         except Exception as error:
             if (
@@ -397,7 +403,7 @@ def agent_loop(
                 }
             )
             return AgentLoopOutcome(
-                "failed", "", type(error).__name__, str(error)
+                "failed", "", type(error).__name__, str(error), _round_index + 1
             )
 
         if response.stop_reason == "max_tokens":
@@ -422,6 +428,7 @@ def agent_loop(
                 extract_text(response.content),
                 "max_tokens",
                 "model exhausted maximum-token recovery",
+                _round_index + 1,
             )
 
         max_tokens = config.DEFAULT_MAX_TOKENS
@@ -431,69 +438,13 @@ def agent_loop(
         if not has_tool_use(response.content):
             final_text = extract_text(response.content)
 
-            # Recorded financial-research runs must pass the evidence gate.
-            if run_context is not None:
-                final_errors = validate_research_final(
-                    final_text,
-                    registered_sources,
-                )
-
-                if final_errors:
-                    can_repair = (
-                        not research_final_repair_used
-                        and _round_index + 1 < max_rounds
-                    )
-
-                    if can_repair:
-                        research_final_repair_used = True
-
-                        # 不把被拒绝的草稿留在最终返回文本里。
-                        # 原始模型响应仍然保留在 trajectory trace 中。
-                        messages.pop()
-
-                        messages.append(
-                            {
-                                "role": "user",
-                                "content": (
-                                    "[Research finalization blocked]\n"
-                                    + "\n".join(
-                                        f"- {error}" for error in final_errors
-                                    )
-                                    + "\n\n"
-                                    "Repair the research once, then return "
-                                    "the final report."
-                                ),
-                            }
-                        )
-                        continue
-
-                    # 已经修复过一次，或者没有剩余 round：
-                    # 返回受控弃答，不再反复要求模型搜索。
-                    final_text = (
-                        "INSUFFICIENT_EVIDENCE\n\n"
-                        "Research finalization failed:\n"
-                        + "\n".join(
-                            f"- {error}" for error in final_errors
-                        )
-                    )
-
-                    # SourceRuntime 会从 messages 中读取返回文本，
-                    # 所以必须同步替换最后一条 assistant 消息。
-                    messages[-1] = {
-                        "role": "assistant",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": final_text,
-                            }
-                        ],
-                    }
-
-            trigger_hooks("Stop", messages)
+            if finalize_user_turn:
+                trigger_hooks("Stop", messages)
 
             # 只有真人触发且正常完成的回合才提取记忆。
             if (
-                memory_store is not None
+                finalize_user_turn
+                and memory_store is not None
                 and turn_prompt
                 and not turn_prompt.lstrip().startswith(
                     (
@@ -512,7 +463,7 @@ def agent_loop(
                 )
                 memory_store.consolidate_if_needed()
 
-            return AgentLoopOutcome("completed", final_text)
+            return AgentLoopOutcome("completed", final_text, rounds_used=_round_index + 1)
 
         results = []
         compacted_now = False
@@ -737,6 +688,13 @@ def agent_loop(
             except Exception as error:
                 tool_error = error
                 output = f"Error: {type(error).__name__}: {error}"
+            evidence_record = None
+            if tool_error is None:
+                evidence_record = evidence_record_from_result(
+                    block.name, str(output)
+                )
+                if evidence_record is not None and evidence_registry is not None:
+                    evidence_registry.register(evidence_record)
             if run_context is not None:
                 output_ref = run_context.recorder.store_artifact(
                     str(output),
@@ -784,6 +742,7 @@ def agent_loop(
                         raw_artifacts=capture.artifacts if capture else [],
                         span_id=span_id,
                         registered_sources=registered_sources,
+                        record=evidence_record,
                     )
             trigger_hooks("PostToolUse", block, output)
             print(str(output)[:300])
@@ -818,6 +777,7 @@ def agent_loop(
         "",
         "max_rounds",
         f"agent exceeded maximum rounds ({max_rounds})",
+        max_rounds,
     )
 
 
