@@ -276,6 +276,7 @@ class SourceRuntime:
                         todo_state=self.todo_state,
                         system_prompt=system_prompt,
                         evidence_registry=registry,
+                        research_cutoff=cutoff,
                         finalize_user_turn=False,
                     )
 
@@ -380,6 +381,7 @@ def agent_loop(
     todo_state: dict[str, int] | None = None,
     system_prompt: str | None = None,
     evidence_registry: EvidenceRegistry | None = None,
+    research_cutoff: str | None = None,
     finalize_user_turn: bool = True,
 ) -> AgentLoopOutcome:
     global rounds_since_todo
@@ -392,9 +394,7 @@ def agent_loop(
     )
     registered_sources = registered_sources if registered_sources is not None else {}
     required_cutoff = (
-        run_context.cutoff
-        if run_context is not None and evidence_registry is not None
-        else None
+        research_cutoff if evidence_registry is not None else None
     )
 
     def record_compaction(report) -> None:

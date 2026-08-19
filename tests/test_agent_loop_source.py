@@ -517,9 +517,152 @@ def test_source_runtime_research_executor_uses_shared_registry_and_private_notes
     assert captured["memory_enabled"] is False
     assert captured["finalize_user_turn"] is False
     assert isinstance(captured["evidence_registry"], EvidenceRegistry)
+    assert captured["research_cutoff"] == "2025-05-01"
     assert "financial research agent" in captured["system_prompt"]
     assert "missing filing" in captured["system_prompt"]
     assert "private research notes" not in repr(runtime.messages)
+
+
+def _single_execution_workflow():
+    class SingleExecutionWorkflow:
+        def __init__(self, provider, executor, *, run_context=None):
+            self.executor = executor
+
+        def run(self, question, cutoff, *, registry=None):
+            prompt = json.dumps({
+                "question": question,
+                "cutoff": cutoff,
+                "rank": "light",
+                "directions": ["primary facts"],
+                "research_gaps": [],
+                "remaining_rounds": 2,
+            })
+            outcome = self.executor(prompt, 2, registry)
+            return ResearchWorkflowResult(
+                "public report",
+                ResearchPlan(ResearchRank.LIGHT, ("primary facts",), "narrow"),
+                outcome.rounds_used,
+                False,
+                False,
+            )
+
+    return SingleExecutionWorkflow
+
+
+def test_untraced_explicit_research_injects_cutoff(monkeypatch):
+    seen = []
+    provider = ScriptedProvider([
+        ProviderResponse(
+            [ToolUseBlock("search-1", "web_search", {"query": "q"})],
+            "tool_use",
+        ),
+        ProviderResponse([TextBlock(text="research notes")], "end_turn"),
+    ])
+    runtime = agent.SourceRuntime(
+        provider,
+        tool_definitions=[{
+            "name": "web_search",
+            "description": "search",
+            "input_schema": {},
+        }],
+        tool_handlers={
+            "web_search": lambda **arguments: (
+                seen.append(arguments)
+                or json.dumps({"ok": True, "results": []})
+            )
+        },
+        memory_enabled=False,
+    )
+    monkeypatch.setattr(agent, "ResearchWorkflow", _single_execution_workflow())
+
+    assert runtime.run_turn(
+        "q",
+        cutoff="2025-05-01",
+        run_metadata={"task_type": "research"},
+    ) == "public report"
+    assert seen == [{"query": "q", "cutoff": "2025-05-01"}]
+
+
+def test_untraced_explicit_research_rejects_cutoff_mismatch(monkeypatch):
+    called = False
+
+    def fetch(**arguments):
+        nonlocal called
+        called = True
+        return "should not run"
+
+    provider = ScriptedProvider([
+        ProviderResponse(
+            [ToolUseBlock(
+                "fetch-1",
+                "web_fetch",
+                {
+                    "url": "https://example.com/report",
+                    "cutoff": "2025-05-02",
+                },
+            )],
+            "tool_use",
+        ),
+        ProviderResponse([TextBlock(text="research notes")], "end_turn"),
+    ])
+    runtime = agent.SourceRuntime(
+        provider,
+        tool_definitions=[{
+            "name": "web_fetch",
+            "description": "fetch",
+            "input_schema": {},
+        }],
+        tool_handlers={"web_fetch": fetch},
+        memory_enabled=False,
+    )
+    monkeypatch.setattr(agent, "ResearchWorkflow", _single_execution_workflow())
+
+    assert runtime.run_turn(
+        "q",
+        cutoff="2025-05-01",
+        run_metadata={"task_type": "research_analysis"},
+    ) == "public report"
+    result = provider.requests[1]["messages"][-1]["content"][0]
+    assert called is False
+    assert json.loads(result["content"])["error"]["code"] == "cutoff_mismatch"
+
+
+def test_untraced_ordinary_task_does_not_enforce_research_cutoff(monkeypatch):
+    seen = []
+    provider = ScriptedProvider([
+        ProviderResponse(
+            [ToolUseBlock("search-1", "web_search", {"query": "q"})],
+            "tool_use",
+        ),
+        ProviderResponse([TextBlock(text="ordinary answer")], "end_turn"),
+    ])
+    runtime = agent.SourceRuntime(
+        provider,
+        tool_definitions=[{
+            "name": "web_search",
+            "description": "search",
+            "input_schema": {},
+        }],
+        tool_handlers={
+            "web_search": lambda **arguments: (
+                seen.append(arguments)
+                or json.dumps({"ok": True, "results": []})
+            )
+        },
+        memory_enabled=False,
+    )
+    monkeypatch.setattr(
+        agent,
+        "ResearchWorkflow",
+        lambda *args, **kwargs: pytest.fail("ordinary task constructed workflow"),
+    )
+
+    assert runtime.run_turn(
+        "q",
+        cutoff="2025-05-01",
+        run_metadata={"task_type": "normal"},
+    ) == "ordinary answer"
+    assert seen == [{"query": "q"}]
 
 
 def test_source_runtime_traces_explicit_and_default_routing(tmp_path):
