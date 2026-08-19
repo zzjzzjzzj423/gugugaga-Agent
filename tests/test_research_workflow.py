@@ -32,6 +32,7 @@ def registry_with_two_sources() -> EvidenceRegistry:
             "web_fetch",
             json.dumps({
                 "ok": True,
+                "operation": "fetch",
                 "url": url,
                 "title": "Evidence",
                 "content": "direct evidence",
@@ -574,6 +575,7 @@ def test_routed_trace_orders_phases_shares_budget_and_links_sources(
     def fetch(**arguments):
         return json.dumps({
             "ok": True,
+            "operation": "fetch",
             "url": arguments["url"],
             "title": "Registered evidence",
             "content": f"evidence from {arguments['url']}",

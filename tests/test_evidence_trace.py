@@ -266,6 +266,7 @@ def _register(registry, url):
         json.dumps(
             {
                 "ok": True,
+                "operation": "fetch",
                 "url": url,
                 "title": "Source",
                 "content": f"evidence from {url}",
@@ -291,9 +292,13 @@ def test_evidence_record_is_bounded_and_canonicalized():
         json.dumps(
             {
                 "ok": True,
+                "operation": "fetch",
                 "url": "HTTPS://Example.COM:443/report?b=2&a=1#part",
                 "title": "Report",
                 "content": "x" * 7000,
+                "published_at": None,
+                "date_status": "unknown",
+                "cutoff": None,
             }
         ),
     )
@@ -469,43 +474,68 @@ def test_repeated_pdf_fetches_bound_merged_fragments_and_artifacts(tmp_path):
     assert len(record.artifact_references) == 16
 
 
-def test_invalid_fetch_url_is_rejected_without_losing_terminal_result(tmp_path):
+def _run_single_fetch_result(tmp_path, run_id, tool_name, output):
     provider = ScriptedProvider([
         ModelResponse(
             "",
-            [ToolCall("fetch-1", "web_fetch", {"url": "https://example.com"})],
+            [ToolCall("fetch-1", tool_name, {"url": "https://example.com"})],
             "tool_calls",
         ),
         ModelResponse("research notes", [], "stop"),
     ])
-    malformed_output = json.dumps({
-        "ok": True,
-        "operation": "fetch",
-        "url": {"unexpected": "object"},
-        "cutoff": "2025-05-01",
-        "published_at": None,
-        "date_status": "unknown",
-        "content": "must not become registered evidence",
-    })
-    recorder, run = _direct_evidence_run(tmp_path, "invalid-url")
+    recorder, run = _direct_evidence_run(tmp_path, run_id)
     registry = EvidenceRegistry()
-
     outcome = agent.agent_loop(
         [{"role": "user", "content": "fetch"}],
         {},
         provider=provider,
-        tools=[{"name": "web_fetch", "description": "fetch", "input_schema": {}}],
-        handlers={"web_fetch": lambda **_: malformed_output},
+        tools=[{"name": tool_name, "description": "fetch", "input_schema": {}}],
+        handlers={tool_name: lambda **_: output},
         memory_enabled=False,
         run_context=run,
         evidence_registry=registry,
         research_cutoff="2025-05-01",
         finalize_user_turn=False,
     )
+    rows, incomplete = read_trace_lines(recorder.trajectory_path)
+    return recorder, outcome, registry, rows, incomplete
+
+
+@pytest.mark.parametrize(
+    "malformed_url",
+    (
+        {"unexpected": "object"},
+        "https://user:password@example.com/report",
+        "https://exa mple.com/report",
+        "https://exa\tmple.com/report",
+        "https://-bad.example/report",
+        "https://example..com/report",
+        "https://999.999.999.999/report",
+        "https://example.com:0/report",
+        "https://example.com:99999/report",
+    ),
+)
+def test_invalid_fetch_url_is_rejected_without_losing_terminal_result(
+    tmp_path, malformed_url
+):
+    malformed_output = json.dumps({
+        "ok": True,
+        "operation": "fetch",
+        "url": malformed_url,
+        "cutoff": "2025-05-01",
+        "published_at": None,
+        "date_status": "unknown",
+        "content": "must not become registered evidence",
+    })
+    recorder, outcome, registry, rows, incomplete = _run_single_fetch_result(
+        tmp_path,
+        "invalid-url",
+        "web_fetch",
+        malformed_output,
+    )
 
     assert outcome.final_text == "research notes"
     assert registry.records == ()
-    rows, incomplete = read_trace_lines(recorder.trajectory_path)
     terminal = [row for row in rows if row["event_type"] == "tool_result"]
     rejected = [row for row in rows if row["event_type"] == "source_rejected"]
     assert incomplete is False
@@ -515,6 +545,152 @@ def test_invalid_fetch_url_is_rejected_without_losing_terminal_result(tmp_path):
     assert artifact_path.read_text(encoding="utf-8") == malformed_output
     assert len(rejected) == 1
     assert rejected[0]["payload"]["reason_code"] == "invalid_url"
+
+
+@pytest.mark.parametrize(
+    ("payload", "reason_code"),
+    (
+        (
+            {
+                "ok": True,
+                "url": "https://example.com/report",
+                "cutoff": "2025-05-01",
+                "published_at": None,
+                "date_status": "unknown",
+                "content": "facts",
+            },
+            "invalid_operation",
+        ),
+        (
+            {
+                "ok": True,
+                "operation": "web_fetch",
+                "url": "https://example.com/report",
+                "cutoff": "2025-05-01",
+                "published_at": None,
+                "date_status": "unknown",
+                "content": "facts",
+            },
+            "invalid_operation",
+        ),
+        (
+            {
+                "ok": True,
+                "operation": "fetch",
+                "url": "https://example.com/report",
+                "published_at": None,
+                "date_status": "unknown",
+                "content": "facts",
+            },
+            "invalid_cutoff",
+        ),
+        (
+            {
+                "ok": True,
+                "operation": "fetch",
+                "url": "https://example.com/report",
+                "cutoff": "2025-05-01",
+                "date_status": "unknown",
+                "content": "facts",
+            },
+            "invalid_published_at",
+        ),
+        (
+            {
+                "ok": True,
+                "operation": "fetch",
+                "url": "https://example.com/report",
+                "cutoff": "2025-05-01",
+                "published_at": None,
+                "date_status": "unknown",
+            },
+            "invalid_content",
+        ),
+        (
+            {
+                "ok": True,
+                "operation": "fetch",
+                "url": "https://example.com/report",
+                "cutoff": "2025-05-01",
+                "published_at": None,
+                "date_status": "unknown",
+                "content": "   \n\t",
+            },
+            "invalid_content",
+        ),
+        (
+            {
+                "ok": True,
+                "operation": "fetch",
+                "url": "https://example.com/report",
+                "cutoff": "2025-05-01",
+                "published_at": None,
+                "content": "facts",
+            },
+            "invalid_date_status",
+        ),
+        (
+            {
+                "ok": True,
+                "operation": "fetch",
+                "url": "https://example.com/report",
+                "cutoff": "2025-05-01",
+                "published_at": None,
+                "date_status": "nonsense",
+                "content": "facts",
+            },
+            "invalid_date_status",
+        ),
+    ),
+)
+def test_malformed_web_success_schema_does_not_count_as_evidence(
+    tmp_path, payload, reason_code
+):
+    output = json.dumps(payload)
+    _, outcome, registry, rows, incomplete = _run_single_fetch_result(
+        tmp_path,
+        f"invalid-web-{reason_code}",
+        "web_fetch",
+        output,
+    )
+
+    assert outcome.final_text == "research notes"
+    assert registry.records == ()
+    assert incomplete is False
+    terminal = [row for row in rows if row["event_type"] == "tool_result"]
+    rejected = [row for row in rows if row["event_type"] == "source_rejected"]
+    assert len(terminal) == 1
+    assert terminal[0]["payload"]["success"] is True
+    assert len(rejected) == 1
+    assert rejected[0]["payload"]["reason_code"] == reason_code
+
+
+def test_pdf_success_with_empty_page_text_does_not_count_as_evidence(tmp_path):
+    output = json.dumps({
+        "ok": True,
+        "operation": "pdf_fetch",
+        "url": "https://example.com/report.pdf",
+        "start_page": 1,
+        "end_page": 1,
+        "cutoff": "2025-05-01",
+        "published_at": None,
+        "date_status": "unknown",
+        "pages": [{"page_number": 1, "content": " \n\t "}],
+    })
+    _, outcome, registry, rows, incomplete = _run_single_fetch_result(
+        tmp_path,
+        "invalid-pdf-empty",
+        "pdf_fetch",
+        output,
+    )
+
+    assert outcome.final_text == "research notes"
+    assert registry.records == ()
+    assert incomplete is False
+    assert len([row for row in rows if row["event_type"] == "tool_result"]) == 1
+    rejected = [row for row in rows if row["event_type"] == "source_rejected"]
+    assert len(rejected) == 1
+    assert rejected[0]["payload"]["reason_code"] == "invalid_pdf_pages"
 
 
 def test_repeated_source_with_conflicting_date_metadata_is_rejected(tmp_path):

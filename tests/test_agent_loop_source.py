@@ -344,8 +344,10 @@ def test_agent_loop_registers_foreground_fetch_without_trace():
         tools=[{"name": "web_fetch", "description": "fetch", "input_schema": {}}],
         handlers={
             "web_fetch": lambda **_: (
-                '{"ok": true, "url": "https://example.com/report", '
-                '"title": "Report", "content": "fetched facts"}'
+                '{"ok": true, "operation": "fetch", '
+                '"url": "https://example.com/report", "title": "Report", '
+                '"content": "fetched facts", "published_at": null, '
+                '"date_status": "unknown", "cutoff": null}'
             )
         },
         memory_enabled=False,

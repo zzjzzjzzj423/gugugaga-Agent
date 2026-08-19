@@ -318,7 +318,7 @@ def test_offline_worker_search_fetch_answer_trace_is_self_consistent(
                 "url": arguments["url"],
                 "cutoff": arguments["cutoff"],
                 "published_at": "2025-04-01",
-                "date_status": "known",
+                "date_status": "verified",
                 "content": "accepted evidence",
             }
         )

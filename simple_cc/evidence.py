@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import re
 from dataclasses import dataclass, replace
@@ -23,6 +24,9 @@ from .trace import ArtifactRef, RunContext
 
 RESEARCH_TOOLS = {"web_search", "web_fetch", "pdf_fetch"}
 EVIDENCE_EXCERPT_CHARS = EVIDENCE_CONTENT_CHARS_MAX
+_HOST_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
+_URL_CONTROL_OR_WHITESPACE = re.compile(r"[\x00-\x20\x7f]")
+_ALLOWED_DATE_STATUSES = {"unknown", "verified"}
 
 
 class CutoffMismatch(ValueError):
@@ -68,12 +72,48 @@ def prepare_research_arguments(
 
 
 def canonicalize_url(url: str) -> str:
-    parsed = urlsplit(str(url).strip())
+    if (
+        not isinstance(url, str)
+        or not url
+        or _URL_CONTROL_OR_WHITESPACE.search(url)
+    ):
+        raise ValueError(f"not a canonicalizable HTTP URL: {url}")
+    try:
+        parsed = urlsplit(url)
+    except ValueError as error:
+        raise ValueError(f"not a canonicalizable HTTP URL: {url}") from error
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
         raise ValueError(f"not a canonicalizable HTTP URL: {url}")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("HTTP URL credentials are not allowed")
     scheme = parsed.scheme.lower()
-    host = parsed.hostname.lower()
-    port = parsed.port
+    raw_host = parsed.hostname.rstrip(".")
+    try:
+        address = ipaddress.ip_address(raw_host.split("%", 1)[0])
+    except ValueError:
+        if re.fullmatch(r"[0-9.]+", raw_host):
+            raise ValueError(f"malformed HTTP URL hostname: {raw_host}")
+        try:
+            host = raw_host.encode("idna").decode("ascii").lower()
+        except UnicodeError as error:
+            raise ValueError(f"malformed HTTP URL hostname: {raw_host}") from error
+        labels = host.split(".")
+        if (
+            not host
+            or len(host) > 253
+            or any(not _HOST_LABEL.fullmatch(label) for label in labels)
+        ):
+            raise ValueError(f"malformed HTTP URL hostname: {raw_host}")
+    else:
+        host = address.compressed
+        if address.version == 6:
+            host = f"[{host}]"
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError(f"invalid HTTP URL port: {url}") from error
+    if port == 0:
+        raise ValueError(f"invalid HTTP URL port: {url}")
     if port is not None and port != (443 if scheme == "https" else 80):
         host = f"{host}:{port}"
     query = urlencode(sorted(parse_qsl(parsed.query, keep_blank_values=True)))
@@ -185,6 +225,20 @@ def _pdf_fragments(payload: dict[str, Any]) -> tuple[
                 "invalid_pdf_pages",
                 "PDF pages require a positive integer page_number and string content",
             )
+        start_marker = f"--- PAGE {page_number} START ---"
+        end_marker = f"--- PAGE {page_number} END ---"
+        usable_content = content.strip()
+        if usable_content.startswith(start_marker) and usable_content.endswith(
+            end_marker
+        ):
+            usable_content = usable_content[
+                len(start_marker):-len(end_marker)
+            ].strip()
+        if not usable_content:
+            return None, _rejected(
+                "invalid_pdf_pages",
+                "PDF pages must contain non-empty extractable evidence",
+            )
         if page_number in by_page:
             return None, _rejected(
                 "invalid_pdf_pages", "PDF payload contains a repeated page number"
@@ -197,8 +251,14 @@ def _pdf_fragments(payload: dict[str, Any]) -> tuple[
         ("end_page", page_numbers[-1]),
     ):
         value = payload.get(field_name)
-        if value is not None and (
-            isinstance(value, bool) or not isinstance(value, int) or value != expected
+        if (
+            field_name not in payload
+            or value is None
+            or (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value != expected
+            )
         ):
             return None, _rejected(
                 "invalid_pdf_pages",
@@ -236,16 +296,11 @@ def inspect_evidence_result(
 
     operation = payload.get("operation")
     expected_operation = "fetch" if tool_name == "web_fetch" else "pdf_fetch"
-    if operation is not None:
-        if not isinstance(operation, str):
-            return _rejected(
-                "invalid_operation", "fetch operation metadata must be a string"
-            )
-        if operation != expected_operation:
-            return _rejected(
-                "operation_mismatch",
-                f"{tool_name} returned operation {operation!r}",
-            )
+    if not isinstance(operation, str) or operation != expected_operation:
+        return _rejected(
+            "invalid_operation",
+            f"{tool_name} must return operation {expected_operation!r}",
+        )
 
     raw_url = payload.get("url")
     if not isinstance(raw_url, str) or not raw_url.strip():
@@ -266,6 +321,10 @@ def inspect_evidence_result(
     )
     if error is not None:
         return error
+    if "cutoff" not in payload:
+        return _rejected(
+            "invalid_cutoff", "successful fetch payload must include cutoff"
+        )
     normalized_cutoff, cutoff_date, error = _parse_iso_date(
         payload.get("cutoff"),
         field_name="cutoff",
@@ -280,6 +339,11 @@ def inspect_evidence_result(
             )
         cutoff_date = required_cutoff_date
 
+    if "published_at" not in payload:
+        return _rejected(
+            "invalid_published_at",
+            "successful fetch payload must include published_at",
+        )
     published_at, published_date, error = _parse_iso_date(
         payload.get("published_at"),
         field_name="published_at",
@@ -314,16 +378,17 @@ def inspect_evidence_result(
                 "publication_dates conflict with published_at",
             )
     date_status = payload.get("date_status")
-    if date_status is not None and (
-        not isinstance(date_status, str) or not date_status.strip()
+    if (
+        not isinstance(date_status, str)
+        or date_status not in _ALLOWED_DATE_STATUSES
     ):
         return _rejected(
-            "invalid_date_status", "date_status must be null or a non-empty string"
+            "invalid_date_status",
+            "date_status must be exactly 'unknown' or 'verified'",
         )
-    date_status = date_status.strip() if isinstance(date_status, str) else None
-    normalized_date_status = date_status.casefold() if date_status else None
+    normalized_date_status = date_status
     if (
-        normalized_date_status in {"verified", "known"}
+        normalized_date_status == "verified"
         and published_date is None
     ) or (normalized_date_status == "unknown" and published_date is not None):
         return _rejected(
@@ -345,10 +410,10 @@ def inspect_evidence_result(
         fragments = parsed_fragments
         content = "\n\n".join(item.content for item in fragments)
     else:
-        content = payload.get("content", payload.get("text", ""))
-        if not isinstance(content, str):
+        content = payload.get("content")
+        if not isinstance(content, str) or not content.strip():
             return _rejected(
-                "invalid_content", "fetch content must be a string"
+                "invalid_content", "fetch content must be a non-empty string"
             )
 
     parsed = urlsplit(canonical)
