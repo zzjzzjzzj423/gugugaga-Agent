@@ -14,7 +14,12 @@ from simple_cc.evidence import (
     validate_research_final,
 )
 from simple_cc.models import ModelResponse, ToolCall
-from simple_cc.research_models import EvidenceRegistry, ResearchPlan, ResearchRank
+from simple_cc.research_models import (
+    EVIDENCE_PDF_FRAGMENT_CHARS_MAX,
+    EvidenceRegistry,
+    ResearchPlan,
+    ResearchRank,
+)
 from simple_cc.telemetry import capture_tool_artifact
 from simple_cc.trace import RunContext, TraceRecorder, read_trace_lines
 from tests.fakes import ScriptedProvider
@@ -550,6 +555,45 @@ def test_pdf_range_keeps_usable_pages_and_accepts_blank_neighbors(tmp_path):
     assert terminal["sequence"] < registered["sequence"]
 
 
+def test_pdf_fragment_preserves_meaningful_normalized_unicode(tmp_path):
+    output = json.dumps({
+        "ok": True,
+        "operation": "pdf_fetch",
+        "url": "https://example.com/unicode.pdf",
+        "start_page": 1,
+        "end_page": 1,
+        "cutoff": "2025-05-01",
+        "published_at": None,
+        "date_status": "unknown",
+        "pages": [{
+            "page_number": 1,
+            "content": (
+                "--- PAGE 1 START ---\r\n"
+                "研究结论 📈\r\ncafe\u0301\r\n"
+                "--- PAGE 1 END ---"
+            ),
+        }],
+    })
+    _, outcome, registry, rows, incomplete = _run_single_fetch_result(
+        tmp_path,
+        "pdf-meaningful-unicode",
+        "pdf_fetch",
+        output,
+    )
+
+    assert outcome.final_text == "research notes"
+    assert incomplete is False
+    assert len(registry.records) == 1
+    expected = "--- PAGE 1 START ---\n研究结论 📈\ncafé\n--- PAGE 1 END ---"
+    assert registry.records[0].content_excerpt == expected
+    assert registry.records[0].content_fragments[0].content == expected
+    terminal = next(row for row in rows if row["event_type"] == "tool_result")
+    registered = next(
+        row for row in rows if row["event_type"] == "source_registered"
+    )
+    assert terminal["sequence"] < registered["sequence"]
+
+
 @pytest.mark.parametrize(
     ("start_page", "end_page", "pages"),
     (
@@ -629,6 +673,159 @@ def test_web_content_is_trimmed_before_the_stored_excerpt_is_bounded(tmp_path):
     assert terminal["sequence"] < registered["sequence"]
 
 
+def test_web_content_normalizes_nonprinting_prefix_before_bounding(tmp_path):
+    output = json.dumps({
+        "ok": True,
+        "operation": "fetch",
+        "url": "https://example.com/unicode-report",
+        "cutoff": "2025-05-01",
+        "published_at": None,
+        "date_status": "unknown",
+        "content": "\x00" * 6000 + "研究事实\r\ncafe\u0301 📈",
+    })
+    _, outcome, registry, rows, incomplete = _run_single_fetch_result(
+        tmp_path,
+        "web-normalize-before-bound",
+        "web_fetch",
+        output,
+    )
+
+    assert outcome.final_text == "research notes"
+    assert incomplete is False
+    assert len(registry.records) == 1
+    assert registry.records[0].content_excerpt == "研究事实\ncafé 📈"
+    terminal = next(row for row in rows if row["event_type"] == "tool_result")
+    registered = next(
+        row for row in rows if row["event_type"] == "source_registered"
+    )
+    assert terminal["sequence"] < registered["sequence"]
+
+
+@pytest.mark.parametrize("content", ("\x00\x01", "\u200b\u2060"))
+def test_control_or_format_only_web_content_is_rejected(tmp_path, content):
+    output = json.dumps({
+        "ok": True,
+        "operation": "fetch",
+        "url": "https://example.com/nonprinting-report",
+        "cutoff": "2025-05-01",
+        "published_at": None,
+        "date_status": "unknown",
+        "content": content,
+    })
+    _, outcome, registry, rows, incomplete = _run_single_fetch_result(
+        tmp_path,
+        "web-nonprinting-only",
+        "web_fetch",
+        output,
+    )
+
+    assert outcome.final_text == "research notes"
+    assert registry.records == ()
+    assert incomplete is False
+    terminal = next(row for row in rows if row["event_type"] == "tool_result")
+    rejected = next(row for row in rows if row["event_type"] == "source_rejected")
+    assert terminal["sequence"] < rejected["sequence"]
+    assert rejected["payload"]["reason_code"] == "invalid_content"
+
+
+def test_control_or_format_only_pdf_page_is_rejected(tmp_path):
+    output = json.dumps({
+        "ok": True,
+        "operation": "pdf_fetch",
+        "url": "https://example.com/nonprinting.pdf",
+        "start_page": 1,
+        "end_page": 1,
+        "cutoff": "2025-05-01",
+        "published_at": None,
+        "date_status": "unknown",
+        "pages": [{
+            "page_number": 1,
+            "content": (
+                "--- PAGE 1 START ---\n\x00\u200b\u2060\n"
+                "--- PAGE 1 END ---"
+            ),
+        }],
+    })
+    _, outcome, registry, rows, incomplete = _run_single_fetch_result(
+        tmp_path,
+        "pdf-nonprinting-only",
+        "pdf_fetch",
+        output,
+    )
+
+    assert outcome.final_text == "research notes"
+    assert registry.records == ()
+    assert incomplete is False
+    terminal = next(row for row in rows if row["event_type"] == "tool_result")
+    rejected = next(row for row in rows if row["event_type"] == "source_rejected")
+    assert terminal["sequence"] < rejected["sequence"]
+    assert rejected["payload"]["reason_code"] == "invalid_pdf_pages"
+
+
+def test_pdf_page_number_cannot_overflow_the_fragment_cap(tmp_path):
+    page_number = int("9" * 400)
+    assert len(
+        f"--- PAGE {page_number} START ---\nfacts\n"
+        f"--- PAGE {page_number} END ---"
+    ) > EVIDENCE_PDF_FRAGMENT_CHARS_MAX
+    output = json.dumps({
+        "ok": True,
+        "operation": "pdf_fetch",
+        "url": "https://example.com/oversized-marker.pdf",
+        "start_page": page_number,
+        "end_page": page_number,
+        "cutoff": "2025-05-01",
+        "published_at": None,
+        "date_status": "unknown",
+        "pages": [{"page_number": page_number, "content": "facts"}],
+    })
+    _, outcome, registry, rows, incomplete = _run_single_fetch_result(
+        tmp_path,
+        "pdf-oversized-marker",
+        "pdf_fetch",
+        output,
+    )
+
+    assert outcome.final_text == "research notes"
+    assert registry.records == ()
+    assert incomplete is False
+    terminal = next(row for row in rows if row["event_type"] == "tool_result")
+    rejected = next(row for row in rows if row["event_type"] == "source_rejected")
+    assert terminal["sequence"] < rejected["sequence"]
+    assert rejected["payload"]["reason_code"] == "invalid_pdf_pages"
+
+
+def test_pdf_success_cannot_exceed_the_handler_page_count_limit(tmp_path):
+    output = json.dumps({
+        "ok": True,
+        "operation": "pdf_fetch",
+        "url": "https://example.com/too-many-pages.pdf",
+        "start_page": 1,
+        "end_page": 21,
+        "cutoff": "2025-05-01",
+        "published_at": None,
+        "date_status": "unknown",
+        "pages": [
+            {"page_number": page_number, "content": f"facts {page_number}"}
+            for page_number in range(1, 22)
+        ],
+    })
+    _, outcome, registry, rows, incomplete = _run_single_fetch_result(
+        tmp_path,
+        "pdf-handler-page-limit",
+        "pdf_fetch",
+        output,
+    )
+
+    assert outcome.final_text == "research notes"
+    assert registry.records == ()
+    assert incomplete is False
+    terminal = next(row for row in rows if row["event_type"] == "tool_result")
+    rejected = next(row for row in rows if row["event_type"] == "source_rejected")
+    assert terminal["sequence"] < rejected["sequence"]
+    assert rejected["payload"]["reason_code"] == "invalid_pdf_pages"
+
+
 @pytest.mark.parametrize("tool_name", ("web_fetch", "pdf_fetch"))
 def test_fetch_parse_failure_is_auditable_source_rejection(tmp_path, tool_name):
     _, outcome, registry, rows, incomplete = _run_single_fetch_result(
@@ -685,6 +882,7 @@ def test_search_parse_failure_keeps_legacy_unparseable_trace(tmp_path):
         "https://example.com../report",
         "https://example.com/\u00a0report",
         "https://example.com/\u0085report",
+        "https://[fe80::1%25eth0]/report",
         "https://999.999.999.999/report",
         "https://example.com:0/report",
         "https://example.com:99999/report",

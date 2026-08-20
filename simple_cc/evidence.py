@@ -4,12 +4,14 @@ import hashlib
 import ipaddress
 import json
 import re
+import sys
 import unicodedata
 from dataclasses import dataclass, replace
 from datetime import date
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+from .pdf_research import PDF_PAGE_COUNT_MAX
 from .research_models import (
     EVIDENCE_ARTIFACT_REFERENCES_MAX,
     EVIDENCE_CONTENT_CHARS_MAX,
@@ -92,6 +94,8 @@ def canonicalize_url(url: str) -> str:
         raise ValueError("HTTP URL credentials are not allowed")
     scheme = parsed.scheme.lower()
     raw_host = parsed.hostname
+    if "%" in raw_host:
+        raise ValueError("IPv6 scope identifiers are not allowed")
     if raw_host.endswith(".."):
         raise ValueError(f"malformed HTTP URL hostname: {raw_host}")
     if raw_host.endswith("."):
@@ -192,15 +196,50 @@ def _parse_iso_date(
     return normalized, parsed, None
 
 
-def _pdf_page_fragment(page_number: int, content: str) -> EvidenceFragment:
+def _normalize_evidence_text(content: str) -> str:
+    normalized = unicodedata.normalize("NFC", content)
+    normalized = normalized.replace("\r\n", "\n").replace("\r", "\n")
+    visible: list[str] = []
+    for character in normalized:
+        if character in {"\n", "\t"}:
+            visible.append(character)
+        elif character.isspace():
+            visible.append(" ")
+        elif (
+            unicodedata.category(character).startswith("C")
+            or not character.isprintable()
+        ):
+            continue
+        else:
+            visible.append(character)
+    return "".join(visible).strip()
+
+
+def _pdf_page_body(page_number: int, content: str) -> str:
     start_marker = f"--- PAGE {page_number} START ---"
     end_marker = f"--- PAGE {page_number} END ---"
-    body = content.strip()
+    body = _normalize_evidence_text(content)
     if body.startswith(start_marker) and body.endswith(end_marker):
         body = body[len(start_marker):-len(end_marker)].strip()
+    return body
+
+
+def _pdf_page_fragment(
+    page_number: int,
+    body: str,
+) -> EvidenceFragment | None:
+    start_marker = f"--- PAGE {page_number} START ---"
+    end_marker = f"--- PAGE {page_number} END ---"
     fixed_chars = len(start_marker) + len(end_marker) + 2
-    body = body[:max(0, EVIDENCE_PDF_FRAGMENT_CHARS_MAX - fixed_chars)].rstrip()
-    fragment = f"{start_marker}\n{body}\n{end_marker}"
+    available_body_chars = EVIDENCE_PDF_FRAGMENT_CHARS_MAX - fixed_chars
+    if available_body_chars < 1:
+        return None
+    bounded_body = body[:available_body_chars].rstrip()
+    if not bounded_body:
+        return None
+    fragment = f"{start_marker}\n{bounded_body}\n{end_marker}"
+    if len(fragment) > EVIDENCE_PDF_FRAGMENT_CHARS_MAX:
+        return None
     return EvidenceFragment(f"pdf_page:{page_number:010d}", fragment)
 
 
@@ -209,15 +248,34 @@ def _pdf_fragments(payload: dict[str, Any]) -> tuple[
     EvidenceIngestionResult | None,
 ]:
     pages = payload.get("pages")
-    if not isinstance(pages, list) or not pages:
+    if (
+        not isinstance(pages, list)
+        or not pages
+        or len(pages) > PDF_PAGE_COUNT_MAX
+    ):
         return None, _rejected(
             "invalid_pdf_pages",
-            "successful pdf_fetch payload must contain a non-empty pages list",
+            "successful pdf_fetch pages must respect the handler page-count limit",
         )
 
-    page_numbers: list[int] = []
+    start_page = payload.get("start_page")
+    end_page = payload.get("end_page")
+    if (
+        isinstance(start_page, bool)
+        or not isinstance(start_page, int)
+        or not 1 <= start_page <= sys.maxsize
+        or isinstance(end_page, bool)
+        or not isinstance(end_page, int)
+        or not start_page <= end_page <= sys.maxsize
+        or end_page - start_page + 1 != len(pages)
+    ):
+        return None, _rejected(
+            "invalid_pdf_pages",
+            "PDF pages must exactly match a handler-valid start_page/end_page range",
+        )
+
     fragments: list[EvidenceFragment] = []
-    for page in pages:
+    for offset, page in enumerate(pages):
         if not isinstance(page, dict):
             return None, _rejected(
                 "invalid_pdf_pages", "each PDF page must be an object"
@@ -227,45 +285,23 @@ def _pdf_fragments(payload: dict[str, Any]) -> tuple[
         if (
             isinstance(page_number, bool)
             or not isinstance(page_number, int)
-            or page_number < 1
+            or not 1 <= page_number <= sys.maxsize
+            or page_number != start_page + offset
             or not isinstance(content, str)
         ):
             return None, _rejected(
                 "invalid_pdf_pages",
-                "PDF pages require a positive integer page_number and string content",
+                "PDF pages require ordered handler-valid page numbers and string content",
             )
-        start_marker = f"--- PAGE {page_number} START ---"
-        end_marker = f"--- PAGE {page_number} END ---"
-        usable_content = content.strip()
-        if usable_content.startswith(start_marker) and usable_content.endswith(
-            end_marker
-        ):
-            usable_content = usable_content[
-                len(start_marker):-len(end_marker)
-            ].strip()
-        page_numbers.append(page_number)
+        usable_content = _pdf_page_body(page_number, content)
         if usable_content:
-            fragments.append(_pdf_page_fragment(page_number, content))
-
-    start_page = payload.get("start_page")
-    end_page = payload.get("end_page")
-    if (
-        isinstance(start_page, bool)
-        or not isinstance(start_page, int)
-        or start_page < 1
-        or isinstance(end_page, bool)
-        or not isinstance(end_page, int)
-        or end_page < start_page
-        or len(page_numbers) != end_page - start_page + 1
-        or any(
-            page_number != start_page + offset
-            for offset, page_number in enumerate(page_numbers)
-        )
-    ):
-        return None, _rejected(
-            "invalid_pdf_pages",
-            "PDF pages must exactly match the ordered start_page/end_page range",
-        )
+            fragment = _pdf_page_fragment(page_number, usable_content)
+            if fragment is None:
+                return None, _rejected(
+                    "invalid_pdf_pages",
+                    "PDF page markers and text exceed the fragment contract",
+                )
+            fragments.append(fragment)
     if not fragments:
         return None, _rejected(
             "invalid_pdf_pages",
@@ -415,11 +451,16 @@ def inspect_evidence_result(
         content = "\n\n".join(item.content for item in fragments)
     else:
         content = payload.get("content")
-        if not isinstance(content, str) or not content.strip():
+        if not isinstance(content, str):
             return _rejected(
                 "invalid_content", "fetch content must be a non-empty string"
             )
-        content = content.strip()
+        content = _normalize_evidence_text(content)
+        if not content:
+            return _rejected(
+                "invalid_content",
+                "fetch content must contain usable printable evidence",
+            )
 
     excerpt_limit = max(0, min(excerpt_chars, EVIDENCE_CONTENT_CHARS_MAX))
     content_excerpt = content[:excerpt_limit].rstrip()
