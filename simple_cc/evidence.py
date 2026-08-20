@@ -4,6 +4,7 @@ import hashlib
 import ipaddress
 import json
 import re
+import unicodedata
 from dataclasses import dataclass, replace
 from datetime import date
 from typing import Any
@@ -25,7 +26,6 @@ from .trace import ArtifactRef, RunContext
 RESEARCH_TOOLS = {"web_search", "web_fetch", "pdf_fetch"}
 EVIDENCE_EXCERPT_CHARS = EVIDENCE_CONTENT_CHARS_MAX
 _HOST_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
-_URL_CONTROL_OR_WHITESPACE = re.compile(r"[\x00-\x20\x7f]")
 _ALLOWED_DATE_STATUSES = {"unknown", "verified"}
 
 
@@ -75,7 +75,11 @@ def canonicalize_url(url: str) -> str:
     if (
         not isinstance(url, str)
         or not url
-        or _URL_CONTROL_OR_WHITESPACE.search(url)
+        or any(
+            character.isspace()
+            or unicodedata.category(character).startswith("C")
+            for character in url
+        )
     ):
         raise ValueError(f"not a canonicalizable HTTP URL: {url}")
     try:
@@ -87,7 +91,11 @@ def canonicalize_url(url: str) -> str:
     if parsed.username is not None or parsed.password is not None:
         raise ValueError("HTTP URL credentials are not allowed")
     scheme = parsed.scheme.lower()
-    raw_host = parsed.hostname.rstrip(".")
+    raw_host = parsed.hostname
+    if raw_host.endswith(".."):
+        raise ValueError(f"malformed HTTP URL hostname: {raw_host}")
+    if raw_host.endswith("."):
+        raw_host = raw_host[:-1]
     try:
         address = ipaddress.ip_address(raw_host.split("%", 1)[0])
     except ValueError:
@@ -207,7 +215,8 @@ def _pdf_fragments(payload: dict[str, Any]) -> tuple[
             "successful pdf_fetch payload must contain a non-empty pages list",
         )
 
-    by_page: dict[int, EvidenceFragment] = {}
+    page_numbers: list[int] = []
+    fragments: list[EvidenceFragment] = []
     for page in pages:
         if not isinstance(page, dict):
             return None, _rejected(
@@ -234,40 +243,35 @@ def _pdf_fragments(payload: dict[str, Any]) -> tuple[
             usable_content = usable_content[
                 len(start_marker):-len(end_marker)
             ].strip()
-        if not usable_content:
-            return None, _rejected(
-                "invalid_pdf_pages",
-                "PDF pages must contain non-empty extractable evidence",
-            )
-        if page_number in by_page:
-            return None, _rejected(
-                "invalid_pdf_pages", "PDF payload contains a repeated page number"
-            )
-        by_page[page_number] = _pdf_page_fragment(page_number, content)
+        page_numbers.append(page_number)
+        if usable_content:
+            fragments.append(_pdf_page_fragment(page_number, content))
 
-    page_numbers = sorted(by_page)
-    for field_name, expected in (
-        ("start_page", page_numbers[0]),
-        ("end_page", page_numbers[-1]),
+    start_page = payload.get("start_page")
+    end_page = payload.get("end_page")
+    if (
+        isinstance(start_page, bool)
+        or not isinstance(start_page, int)
+        or start_page < 1
+        or isinstance(end_page, bool)
+        or not isinstance(end_page, int)
+        or end_page < start_page
+        or len(page_numbers) != end_page - start_page + 1
+        or any(
+            page_number != start_page + offset
+            for offset, page_number in enumerate(page_numbers)
+        )
     ):
-        value = payload.get(field_name)
-        if (
-            field_name not in payload
-            or value is None
-            or (
-                isinstance(value, bool)
-                or not isinstance(value, int)
-                or value != expected
-            )
-        ):
-            return None, _rejected(
-                "invalid_pdf_pages",
-                f"{field_name} does not match the returned PDF pages",
-            )
-    return tuple(
-        by_page[number]
-        for number in page_numbers[:EVIDENCE_PDF_FRAGMENTS_MAX]
-    ), None
+        return None, _rejected(
+            "invalid_pdf_pages",
+            "PDF pages must exactly match the ordered start_page/end_page range",
+        )
+    if not fragments:
+        return None, _rejected(
+            "invalid_pdf_pages",
+            "PDF pages must contain non-empty extractable evidence",
+        )
+    return tuple(fragments[:EVIDENCE_PDF_FRAGMENTS_MAX]), None
 
 
 def inspect_evidence_result(
@@ -415,6 +419,14 @@ def inspect_evidence_result(
             return _rejected(
                 "invalid_content", "fetch content must be a non-empty string"
             )
+        content = content.strip()
+
+    excerpt_limit = max(0, min(excerpt_chars, EVIDENCE_CONTENT_CHARS_MAX))
+    content_excerpt = content[:excerpt_limit].rstrip()
+    if not content_excerpt:
+        return _rejected(
+            "invalid_content", "bounded fetch content must contain usable evidence"
+        )
 
     parsed = urlsplit(canonical)
     record = EvidenceRecord(
@@ -422,7 +434,7 @@ def inspect_evidence_result(
         canonical_url=canonical,
         domain=parsed.hostname or "",
         title=title,
-        content_excerpt=content[:min(excerpt_chars, EVIDENCE_CONTENT_CHARS_MAX)],
+        content_excerpt=content_excerpt,
         published_at=published_at,
         date_status=date_status,
         cutoff=normalized_cutoff,
@@ -510,13 +522,18 @@ def record_research_evidence(
     try:
         loaded = json.loads(output)
     except (TypeError, json.JSONDecodeError):
-        run.recorder.record(
-            "research_result_unparseable",
-            {"tool_name": tool_name, "output_artifact": output_artifact.as_dict()},
-            span_id=span_id,
-            agent_id=run.agent_id,
-        )
-        return
+        if tool_name == "web_search":
+            run.recorder.record(
+                "research_result_unparseable",
+                {
+                    "tool_name": tool_name,
+                    "output_artifact": output_artifact.as_dict(),
+                },
+                span_id=span_id,
+                agent_id=run.agent_id,
+            )
+            return
+        loaded = {}
     payload = loaded if isinstance(loaded, dict) else {}
     if tool_name == "web_search":
         if not isinstance(loaded, dict):

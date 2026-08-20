@@ -81,6 +81,12 @@ def test_canonical_url_and_citation_linkage_are_deterministic():
     )
     assert linked["matched_source_ids"] == ["src_123"]
     assert linked["unmatched_citations"] == []
+    assert canonicalize_url("https://例子.测试/报告") == (
+        "https://xn--fsqu00a.xn--0zwm56d/报告"
+    )
+    assert canonicalize_url("https://[2001:db8::1]:443/report") == (
+        "https://[2001:db8::1]/report"
+    )
 
 
 def test_source_runtime_traces_tool_and_injects_cutoff(tmp_path, monkeypatch):
@@ -501,6 +507,172 @@ def _run_single_fetch_result(tmp_path, run_id, tool_name, output):
     return recorder, outcome, registry, rows, incomplete
 
 
+def test_pdf_range_keeps_usable_pages_and_accepts_blank_neighbors(tmp_path):
+    output = json.dumps({
+        "ok": True,
+        "operation": "pdf_fetch",
+        "url": "https://example.com/report.pdf",
+        "start_page": 1,
+        "end_page": 3,
+        "cutoff": "2025-05-01",
+        "published_at": None,
+        "date_status": "unknown",
+        "pages": [
+            {"page_number": 1, "content": "  \n"},
+            {"page_number": 2, "content": "facts from page two"},
+            {
+                "page_number": 3,
+                "content": "--- PAGE 3 START ---\n \n--- PAGE 3 END ---",
+            },
+        ],
+    })
+    _, outcome, registry, rows, incomplete = _run_single_fetch_result(
+        tmp_path,
+        "pdf-partial-blank",
+        "pdf_fetch",
+        output,
+    )
+
+    assert outcome.final_text == "research notes"
+    assert incomplete is False
+    assert len(registry.records) == 1
+    record = registry.records[0]
+    assert [item.key for item in record.content_fragments] == [
+        "pdf_page:0000000002"
+    ]
+    assert record.content_excerpt == (
+        "--- PAGE 2 START ---\nfacts from page two\n--- PAGE 2 END ---"
+    )
+    terminal = next(row for row in rows if row["event_type"] == "tool_result")
+    registered = next(
+        row for row in rows if row["event_type"] == "source_registered"
+    )
+    assert terminal["sequence"] < registered["sequence"]
+
+
+@pytest.mark.parametrize(
+    ("start_page", "end_page", "pages"),
+    (
+        (
+            1,
+            3,
+            [
+                {"page_number": 1, "content": "page one"},
+                {"page_number": 3, "content": "page three"},
+            ],
+        ),
+        (
+            1,
+            2,
+            [
+                {"page_number": 2, "content": "page two"},
+                {"page_number": 1, "content": "page one"},
+            ],
+        ),
+    ),
+)
+def test_pdf_success_rejects_noncontiguous_or_out_of_order_pages(
+    tmp_path, start_page, end_page, pages
+):
+    output = json.dumps({
+        "ok": True,
+        "operation": "pdf_fetch",
+        "url": "https://example.com/report.pdf",
+        "start_page": start_page,
+        "end_page": end_page,
+        "cutoff": "2025-05-01",
+        "published_at": None,
+        "date_status": "unknown",
+        "pages": pages,
+    })
+    _, outcome, registry, rows, incomplete = _run_single_fetch_result(
+        tmp_path,
+        "pdf-invalid-sequence",
+        "pdf_fetch",
+        output,
+    )
+
+    assert outcome.final_text == "research notes"
+    assert registry.records == ()
+    assert incomplete is False
+    terminal = next(row for row in rows if row["event_type"] == "tool_result")
+    rejected = next(row for row in rows if row["event_type"] == "source_rejected")
+    assert terminal["sequence"] < rejected["sequence"]
+    assert rejected["payload"]["reason_code"] == "invalid_pdf_pages"
+
+
+def test_web_content_is_trimmed_before_the_stored_excerpt_is_bounded(tmp_path):
+    output = json.dumps({
+        "ok": True,
+        "operation": "fetch",
+        "url": "https://example.com/report",
+        "cutoff": "2025-05-01",
+        "published_at": None,
+        "date_status": "unknown",
+        "content": " " * 6000 + "facts",
+    })
+    _, outcome, registry, rows, incomplete = _run_single_fetch_result(
+        tmp_path,
+        "web-trim-before-bound",
+        "web_fetch",
+        output,
+    )
+
+    assert outcome.final_text == "research notes"
+    assert incomplete is False
+    assert len(registry.records) == 1
+    assert registry.records[0].content_excerpt == "facts"
+    terminal = next(row for row in rows if row["event_type"] == "tool_result")
+    registered = next(
+        row for row in rows if row["event_type"] == "source_registered"
+    )
+    assert terminal["sequence"] < registered["sequence"]
+
+
+@pytest.mark.parametrize("tool_name", ("web_fetch", "pdf_fetch"))
+def test_fetch_parse_failure_is_auditable_source_rejection(tmp_path, tool_name):
+    _, outcome, registry, rows, incomplete = _run_single_fetch_result(
+        tmp_path,
+        f"invalid-json-{tool_name}",
+        tool_name,
+        "{not valid JSON",
+    )
+
+    assert outcome.final_text == "research notes"
+    assert registry.records == ()
+    assert incomplete is False
+    terminal = next(row for row in rows if row["event_type"] == "tool_result")
+    rejected = next(row for row in rows if row["event_type"] == "source_rejected")
+    assert terminal["payload"]["success"] is True
+    assert terminal["sequence"] < rejected["sequence"]
+    assert rejected["payload"]["reason_code"] == "invalid_json"
+    assert not any(
+        row["event_type"] == "research_result_unparseable" for row in rows
+    )
+
+
+def test_search_parse_failure_keeps_legacy_unparseable_trace(tmp_path):
+    _, outcome, registry, rows, incomplete = _run_single_fetch_result(
+        tmp_path,
+        "invalid-json-web-search",
+        "web_search",
+        "{not valid JSON",
+    )
+
+    assert outcome.final_text == "research notes"
+    assert registry.records == ()
+    assert incomplete is False
+    terminal = next(row for row in rows if row["event_type"] == "tool_result")
+    unparseable = next(
+        row
+        for row in rows
+        if row["event_type"] == "research_result_unparseable"
+    )
+    assert terminal["payload"]["success"] is True
+    assert terminal["sequence"] < unparseable["sequence"]
+    assert not any(row["event_type"] == "source_rejected" for row in rows)
+
+
 @pytest.mark.parametrize(
     "malformed_url",
     (
@@ -510,6 +682,9 @@ def _run_single_fetch_result(tmp_path, run_id, tool_name, output):
         "https://exa\tmple.com/report",
         "https://-bad.example/report",
         "https://example..com/report",
+        "https://example.com../report",
+        "https://example.com/\u00a0report",
+        "https://example.com/\u0085report",
         "https://999.999.999.999/report",
         "https://example.com:0/report",
         "https://example.com:99999/report",
@@ -545,6 +720,7 @@ def test_invalid_fetch_url_is_rejected_without_losing_terminal_result(
     assert artifact_path.read_text(encoding="utf-8") == malformed_output
     assert len(rejected) == 1
     assert rejected[0]["payload"]["reason_code"] == "invalid_url"
+    assert terminal[0]["sequence"] < rejected[0]["sequence"]
 
 
 @pytest.mark.parametrize(
