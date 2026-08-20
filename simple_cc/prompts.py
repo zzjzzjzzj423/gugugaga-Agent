@@ -4,6 +4,7 @@ import json
 from datetime import datetime
 
 from . import config
+from .evidence import RESEARCH_TOOLS
 from .skills import list_skills, scan_skills
 
 
@@ -118,6 +119,26 @@ def _research_rules(tool_names: tuple[str, ...]) -> str:
     ))
     return "\n".join(lines)
 
+
+def _normalize_research_tool_names(
+    tool_names: tuple[str, ...] | list[str] | None,
+) -> tuple[str, ...]:
+    if not isinstance(tool_names, (tuple, list)):
+        return ()
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for name in tool_names:
+        if (
+            isinstance(name, str)
+            and name
+            and name in RESEARCH_TOOLS
+            and name not in seen
+        ):
+            normalized.append(name)
+            seen.add(name)
+    return tuple(normalized)
+
+
 SUB_SYSTEM = (
     f"You are a workspace subagent at {config.WORKDIR}. "
     "Complete the assigned workspace task, respect permissions, and return "
@@ -201,11 +222,12 @@ def research_execution_prompt(
     tool_names: tuple[str, ...] | None = None,
 ) -> str:
     policy = plan.policy
+    safe_tool_names = _normalize_research_tool_names(tool_names)
     return assemble_system_prompt(
         context,
         identity=RESEARCH_IDENTITY,
         include_research=True,
-        tool_names=tool_names,
+        tool_names=safe_tool_names,
         include_skill_catalog=False,
         include_memories=False,
         stage_context={

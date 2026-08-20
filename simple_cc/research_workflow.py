@@ -1505,7 +1505,7 @@ class ResearchWorkflow:
         self,
         error: Exception,
         state: dict[str, Any],
-    ) -> None:
+    ) -> TraceWriteError | None:
         try:
             plan = state.get("plan")
             budget = state.get("budget")
@@ -1536,10 +1536,34 @@ class ResearchWorkflow:
                 "failure_class": str(failure_class),
                 "failure_message": str(failure_message),
             })
-        except TraceWriteError:
-            raise
+        except TraceWriteError as trace_error:
+            return trace_error
         except Exception:
             pass
+        return None
+
+    def _add_terminal_trace_note(
+        self,
+        error: Exception,
+        trace_error: TraceWriteError,
+    ) -> None:
+        trace_class = _bounded_trace_text(
+            type(trace_error).__name__,
+            _WRITING_FAILURE_CLASS_CHARS_MAX,
+        )
+        trace_message = _bounded_trace_text(
+            trace_error,
+            _WRITING_FAILURE_MESSAGE_CHARS_MAX,
+        )
+        add_note = getattr(error, "add_note", None)
+        if callable(add_note):
+            try:
+                add_note(
+                    "research_workflow_completed trace failed "
+                    f"[{trace_class}]: {trace_message}"
+                )
+            except Exception:
+                pass
 
     def run(
         self,
@@ -1572,5 +1596,9 @@ class ResearchWorkflow:
             raise
         except Exception as error:
             self._capture_consumed_rounds(state)
-            self._record_terminal_failure(error, state)
+            terminal_trace_error = self._record_terminal_failure(error, state)
+            if terminal_trace_error is not None:
+                if error.__cause__ is None:
+                    raise error from terminal_trace_error
+                self._add_terminal_trace_note(error, terminal_trace_error)
             raise

@@ -99,3 +99,42 @@ Clean-status and commit evidence is recorded in the task handoff after commit.
 - `tests/test_context_prompts.py`: covers conditional tool rules, empty intersections, and the absence of research skill/memory catalog work.
 - `tests/test_research_workflow.py`: covers attempt 1/2 provider-plus-trace double failures and direct `TraceWriteError` identity.
 - `.superpowers/sdd/2026-08-19-routed-research-workflow/hardening-e-report.md`: records the review findings, RED/GREEN evidence, implementation boundaries, and final verification.
+
+## Fix Round 2: enforce the policy at its own boundary
+
+### Baseline and root cause
+
+- Verified exact clean baseline `8be4c6177c8a51f449b1da6f0a6929c0ba25a525` before edits.
+- `agent_loop(RESEARCH_ISOLATED)` derived an availability-name set from its input but retained and exposed the original definitions and handlers. A direct caller using omitted or complete default tables therefore exposed all tools and, when permission was approved, could execute `bash`; malformed tables also crashed during the unchecked name comprehension.
+- `research_execution_prompt(tool_names=None)` still selected the complete ordinary research text, and non-research names were rendered without validation or stable deduplication.
+- After an ordinary provider exception, `_record_terminal_failure()` re-raised a terminal `TraceWriteError`, replacing both the primary provider object and any earlier failed-finished trace cause.
+- Production scope remained `simple_cc/agent.py`, `simple_cc/prompts.py`, and `simple_cc/research_workflow.py`. `simple_cc/context.py` and the accepted embedded-scheme scanner limitation were not touched.
+
+### Implementation and call-chain evidence
+
+- `agent_loop()` now resolves passed/default tables and immediately replaces both with `_research_tool_view()` snapshots under `RESEARCH_ISOLATED`, before provider, permission, hook, background, or handler logic. The provider sees only validated configured `RESEARCH_TOOLS`; unavailable names have no retained handler and receive the synchronous stage rejection.
+- `research_execution_prompt()` normalizes omitted/`None` tool names to the empty tuple and accepts only exact non-empty names from the shared `RESEARCH_TOOLS` source, preserving first-seen order while removing duplicates. It always passes this safe tuple into prompt assembly, so it cannot fall back to the complete tool catalog.
+- `_record_terminal_failure()` now returns a terminal trace failure to `run()`. With no existing cause, `run()` re-raises the identical provider exception from that trace error. With an existing failed-finished trace cause, it preserves the first cause and adds one whitespace-normalized, bounded terminal note containing the trace type and message. Direct/standalone `TraceWriteError` behavior is unchanged.
+
+The resulting research boundary is:
+
+`SourceRuntime` or direct caller -> `agent_loop(RESEARCH_ISOLATED)` -> `_research_tool_view(passed/default tables)` -> filtered definitions + filtered handler snapshot -> provider/tool dispatch.
+
+### File-by-file scope
+
+- `simple_cc/agent.py`: enforces the validated research snapshot inside the isolated policy itself and safely rejects malformed top-level tables.
+- `simple_cc/prompts.py`: adds fail-closed research tool-name normalization using `RESEARCH_TOOLS`.
+- `simple_cc/research_workflow.py`: merges terminal audit failures without replacing the provider-primary exception or its first trace cause.
+- `tests/test_agent_loop_source.py`: exercises direct omitted/default, explicit-full, bash-only, and malformed policy inputs, including a permission-approved forbidden handler.
+- `tests/test_context_prompts.py`: exercises omitted, `None`, non-research, and duplicate prompt tool names.
+- `tests/test_research_workflow.py`: exercises attempt 1/2 persistent failed-finished plus terminal trace failures and the terminal-only trace-failure cause path.
+- `.superpowers/sdd/2026-08-19-routed-research-workflow/hardening-e-report.md`: records Fix Round 2 root cause, scope, evidence, and verification.
+
+### TDD and verification
+
+- Focused RED: `9 failed`, covering every newly reviewed path; the direct complete-table cases visibly reached the approved forbidden `bash` handler before the fix.
+- Focused GREEN: `9 passed`.
+- Directly affected test files: `134 passed`.
+- Affected regression suite: `180 passed`.
+- Full suite: `466 passed, 1 deselected`; the only deselection was the approved source-map baseline test, using a unique external basetemp.
+- `python -m compileall -q simple_cc eval tests` and baseline-range `git diff --check` are required final gates; commit and clean-status evidence is included in the handoff.

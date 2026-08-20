@@ -2076,6 +2076,122 @@ def test_provider_error_remains_primary_when_failed_finished_trace_also_fails(
 
 
 @pytest.mark.parametrize("failed_attempt", (1, 2))
+def test_provider_error_keeps_first_trace_cause_when_terminal_trace_also_fails(
+    tmp_path,
+    monkeypatch,
+    failed_attempt,
+):
+    registry = registry_with_two_sources()
+    provider_error = RuntimeError(f"writer {failed_attempt} offline")
+    responses = [
+        light_plan_response(),
+        gate_response(registry, covered=True),
+    ]
+    if failed_attempt == 2:
+        responses.append(ModelResponse("unsupported draft"))
+    responses.append(provider_error)
+    provider = ScriptedProvider(responses)
+    recorder = TraceRecorder(tmp_path / "run", run_id=f"persistent-{failed_attempt}")
+    recorder.start_run(
+        task_id="research-task",
+        question="question",
+        cutoff="2025-05-01",
+        metadata={"task_type": "research"},
+    )
+    run = RunContext(
+        recorder,
+        f"persistent-{failed_attempt}",
+        "research-task",
+        "2025-05-01",
+    )
+    first_trace = TraceWriteError("failed finished trace unavailable")
+    terminal_trace = TraceWriteError("terminal\ntrace " + "x" * 2_000)
+    original_record = recorder.record
+
+    def fail_persistent_trace(event_type, payload, **kwargs):
+        if (
+            event_type == "writing_attempt_finished"
+            and payload.get("status") == "failed"
+        ):
+            raise first_trace
+        if event_type == "research_workflow_completed":
+            raise terminal_trace
+        return original_record(event_type, payload, **kwargs)
+
+    monkeypatch.setattr(recorder, "record", fail_persistent_trace)
+    workflow = ResearchWorkflow(
+        provider,
+        lambda prompt, max_rounds, evidence_registry: AgentLoopOutcome(
+            "completed", "notes", rounds_used=1
+        ),
+        run_context=run,
+    )
+
+    with bind_run_context(run), pytest.raises(RuntimeError) as caught:
+        workflow.run("question", "2025-05-01", registry=registry)
+
+    assert caught.value is provider_error
+    assert caught.value.__cause__ is first_trace
+    terminal_notes = [
+        note
+        for note in getattr(caught.value, "__notes__", ())
+        if "research_workflow_completed trace failed" in note
+    ]
+    assert len(terminal_notes) == 1
+    assert "TraceWriteError" in terminal_notes[0]
+    assert "\n" not in terminal_notes[0]
+    assert len(terminal_notes[0]) <= 600
+
+
+def test_provider_error_uses_terminal_trace_as_cause_when_only_terminal_fails(
+    tmp_path,
+    monkeypatch,
+):
+    registry = registry_with_two_sources()
+    provider_error = RuntimeError("writer offline")
+    provider = ScriptedProvider([
+        light_plan_response(),
+        gate_response(registry, covered=True),
+        provider_error,
+    ])
+    recorder = TraceRecorder(tmp_path / "run", run_id="terminal-only")
+    recorder.start_run(
+        task_id="research-task",
+        question="question",
+        cutoff="2025-05-01",
+        metadata={"task_type": "research"},
+    )
+    run = RunContext(
+        recorder,
+        "terminal-only",
+        "research-task",
+        "2025-05-01",
+    )
+    terminal_trace = TraceWriteError("terminal trace unavailable")
+    original_record = recorder.record
+
+    def fail_terminal_trace(event_type, payload, **kwargs):
+        if event_type == "research_workflow_completed":
+            raise terminal_trace
+        return original_record(event_type, payload, **kwargs)
+
+    monkeypatch.setattr(recorder, "record", fail_terminal_trace)
+    workflow = ResearchWorkflow(
+        provider,
+        lambda prompt, max_rounds, evidence_registry: AgentLoopOutcome(
+            "completed", "notes", rounds_used=1
+        ),
+        run_context=run,
+    )
+
+    with bind_run_context(run), pytest.raises(RuntimeError) as caught:
+        workflow.run("question", "2025-05-01", registry=registry)
+
+    assert caught.value is provider_error
+    assert caught.value.__cause__ is terminal_trace
+
+
+@pytest.mark.parametrize("failed_attempt", (1, 2))
 def test_direct_writing_trace_error_is_rethrown_unchanged(
     tmp_path,
     monkeypatch,

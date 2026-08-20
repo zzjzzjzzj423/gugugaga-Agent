@@ -188,3 +188,47 @@ def test_research_prompt_profile_matches_actual_tools_without_skills_or_memory(
     assert "Skills catalog" not in prompt
     assert "Use load_skill" not in prompt
     assert "PRIVATE MEMORY CATALOG" not in prompt
+
+
+@pytest.mark.parametrize(
+    ("tool_kwargs", "available_line"),
+    (
+        ({}, "Available tools: none."),
+        ({"tool_names": None}, "Available tools: none."),
+        (
+            {
+                "tool_names": (
+                    "bash",
+                    "web_search",
+                    "web_search",
+                    "load_skill",
+                    "",
+                    "web_fetch",
+                )
+            },
+            "Available tools: web_search, web_fetch.",
+        ),
+    ),
+)
+def test_research_prompt_fails_closed_and_normalizes_tool_names(
+    tool_kwargs,
+    available_line,
+):
+    plan = ResearchPlan(ResearchRank.LIGHT, ("primary filings",), "narrow")
+
+    prompt = research_execution_prompt(
+        {"workspace": "C:/repo"},
+        question="What happened?",
+        cutoff="2025-05-01",
+        plan=plan,
+        gaps=(),
+        remaining_rounds=4,
+        **tool_kwargs,
+    )
+
+    assert available_line in prompt
+    available_tools = next(
+        line for line in prompt.splitlines() if line.startswith("Available tools:")
+    )
+    assert "bash" not in available_tools
+    assert "load_skill" not in available_tools

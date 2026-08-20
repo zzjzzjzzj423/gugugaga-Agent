@@ -107,18 +107,20 @@ def _research_tool_view(
     handlers: dict[str, Callable],
 ) -> tuple[list[dict[str, Any]], dict[str, Callable]]:
     """Return the configured, executable subset of code-owned research tools."""
+    if not isinstance(definitions, list) or not isinstance(handlers, dict):
+        return [], {}
     candidates: dict[str, tuple[dict[str, Any], Callable]] = {}
     conflicted: set[str] = set()
     order: list[str] = []
     for definition in definitions:
         if not isinstance(definition, dict):
             continue
-        name = definition.get("name")
+        name = dict.get(definition, "name")
         if not isinstance(name, str) or not name or name not in RESEARCH_TOOLS:
             continue
-        description = definition.get("description")
-        input_schema = definition.get("input_schema")
-        handler = handlers.get(name)
+        description = dict.get(definition, "description")
+        input_schema = dict.get(definition, "input_schema")
+        handler = dict.get(handlers, name)
         if (
             not isinstance(description, str)
             or not isinstance(input_schema, dict)
@@ -484,13 +486,17 @@ def agent_loop(
     global rounds_since_todo
     execution_policy = AgentExecutionPolicy(execution_policy)
     isolated = execution_policy is AgentExecutionPolicy.RESEARCH_ISOLATED
-    if isolated and system_prompt is None:
-        raise ValueError("isolated research execution requires an explicit system prompt")
     tools = tools if tools is not None else TOOL_DEFINITIONS
     handlers = handlers if handlers is not None else TOOL_HANDLERS
-    available_tool_names = (
-        {definition["name"] for definition in tools} if isolated else set()
-    )
+    if isolated:
+        tools, handlers = _research_tool_view(tools, handlers)
+        available_tool_names = set(handlers)
+        if system_prompt is None:
+            raise ValueError(
+                "isolated research execution requires an explicit system prompt"
+            )
+    else:
+        available_tool_names = set()
     permissions = permissions or PermissionPolicy()
     selected_provider = provider or client
     memory_enabled = (

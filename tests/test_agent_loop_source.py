@@ -760,6 +760,101 @@ def test_research_path_rejects_hallucinated_background_tool_synchronously(
     )
 
 
+@pytest.mark.parametrize("explicit_full_tables", (False, True))
+def test_isolated_policy_refilters_default_or_explicit_full_runtime_tables(
+    source_loop,
+    monkeypatch,
+    explicit_full_tables,
+):
+    forbidden_handler_called = False
+
+    def forbidden_bash(**arguments):
+        nonlocal forbidden_handler_called
+        forbidden_handler_called = True
+        return "forbidden"
+
+    provider = ScriptedProvider([
+        ProviderResponse(
+            [ToolUseBlock("bash-direct", "bash", {"command": "echo nope"})],
+            "tool_use",
+        ),
+        ProviderResponse([TextBlock(text="private notes")], "end_turn"),
+    ])
+    monkeypatch.setitem(agent.TOOL_HANDLERS, "bash", forbidden_bash)
+    kwargs = {}
+    if explicit_full_tables:
+        kwargs.update(tools=agent.TOOL_DEFINITIONS, handlers=agent.TOOL_HANDLERS)
+
+    outcome = agent.agent_loop(
+        [{"role": "user", "content": "research"}],
+        {},
+        provider=provider,
+        approval_callback=lambda call: True,
+        system_prompt="RESEARCH SYSTEM",
+        execution_policy=agent.AgentExecutionPolicy.RESEARCH_ISOLATED,
+        **kwargs,
+    )
+
+    assert outcome.status == "completed"
+    assert forbidden_handler_called is False
+    assert [item["name"] for item in provider.requests[0]["tools"]] == [
+        "web_search",
+        "web_fetch",
+        "pdf_fetch",
+    ]
+    result = provider.requests[1]["messages"][-1]["content"][0]
+    assert json.loads(result["content"])["error"]["code"] == (
+        "tool_not_available"
+    )
+
+
+def test_isolated_policy_refilters_bash_only_and_malformed_tables(
+    source_loop,
+):
+    forbidden_handler_called = False
+
+    def forbidden_bash(**arguments):
+        nonlocal forbidden_handler_called
+        forbidden_handler_called = True
+        return "forbidden"
+
+    provider = ScriptedProvider([
+        ProviderResponse(
+            [ToolUseBlock("bash-malicious", "bash", {"command": "echo nope"})],
+            "tool_use",
+        ),
+        ProviderResponse([TextBlock(text="private notes")], "end_turn"),
+    ])
+
+    outcome = agent.agent_loop(
+        [{"role": "user", "content": "research"}],
+        {},
+        provider=provider,
+        approval_callback=lambda call: True,
+        tools=[
+            "not a definition",
+            {"name": [], "description": "bad name", "input_schema": {}},
+            {"name": "bash", "description": "shell", "input_schema": {}},
+            {
+                "name": "web_fetch",
+                "description": "non-callable handler",
+                "input_schema": {},
+            },
+        ],
+        handlers={"bash": forbidden_bash, "web_fetch": "not callable"},
+        system_prompt="RESEARCH SYSTEM",
+        execution_policy=agent.AgentExecutionPolicy.RESEARCH_ISOLATED,
+    )
+
+    assert outcome.status == "completed"
+    assert provider.requests[0]["tools"] == []
+    assert forbidden_handler_called is False
+    result = provider.requests[1]["messages"][-1]["content"][0]
+    assert json.loads(result["content"])["error"]["code"] == (
+        "tool_not_available"
+    )
+
+
 def test_research_tool_view_fails_closed_on_malformed_and_conflicting_entries():
     fetch = lambda **_: "fetch"
     pdf = lambda **_: "pdf"
