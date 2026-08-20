@@ -57,6 +57,16 @@ _GATE_GAPS_MAX = 16
 _WRITING_FAILURE_CLASS_CHARS_MAX = 128
 _WRITING_FAILURE_MESSAGE_CHARS_MAX = 512
 _AUDIT_FAILURE_NOTE_CHARS_MAX = 600
+_EXCEPTION_GRAPH_NODE_LIMIT = 32
+_EXCEPTION_SLOT_DESCRIPTORS = {
+    name: vars(BaseException)[name]
+    for name in (
+        "__cause__",
+        "__context__",
+        "__suppress_context__",
+        "__traceback__",
+    )
+}
 
 
 @dataclass(frozen=True)
@@ -146,6 +156,31 @@ def _read_exception_attribute(
         return default, False
 
 
+def _read_exception_slot(
+    error: BaseException,
+    name: str,
+    default: Any,
+) -> tuple[Any, bool]:
+    try:
+        descriptor = _EXCEPTION_SLOT_DESCRIPTORS[name]
+        return descriptor.__get__(error, BaseException), True
+    except BaseException:
+        return default, False
+
+
+def _write_exception_slot(
+    error: BaseException,
+    name: str,
+    value: Any,
+) -> bool:
+    try:
+        descriptor = _EXCEPTION_SLOT_DESCRIPTORS[name]
+        descriptor.__set__(error, value)
+        return True
+    except BaseException:
+        return False
+
+
 def _safe_exception_type_name(error: BaseException) -> str:
     try:
         name = type.__getattribute__(type(error), "__name__")
@@ -182,12 +217,12 @@ def _safe_failure_details(error: BaseException) -> tuple[str, str]:
 def _capture_exception_diagnostics(
     error: BaseException,
 ) -> _ExceptionDiagnostics:
-    traceback, traceback_readable = _read_exception_attribute(
+    traceback, traceback_readable = _read_exception_slot(
         error,
         "__traceback__",
         None,
     )
-    cause, cause_readable = _read_exception_attribute(
+    cause, cause_readable = _read_exception_slot(
         error,
         "__cause__",
         None,
@@ -195,7 +230,7 @@ def _capture_exception_diagnostics(
     if cause is not None and not isinstance(cause, BaseException):
         cause = None
         cause_readable = False
-    context, context_readable = _read_exception_attribute(
+    context, context_readable = _read_exception_slot(
         error,
         "__context__",
         None,
@@ -203,7 +238,7 @@ def _capture_exception_diagnostics(
     if context is not None and not isinstance(context, BaseException):
         context = None
         context_readable = False
-    suppress_context, _ = _read_exception_attribute(
+    suppress_context, suppress_context_readable = _read_exception_slot(
         error,
         "__suppress_context__",
         False,
@@ -217,6 +252,7 @@ def _capture_exception_diagnostics(
         audit_cause_allowed=(
             cause_readable
             and context_readable
+            and suppress_context_readable
             and cause is None
             and context is None
         ),
@@ -229,11 +265,103 @@ def _restore_exception_traceback(
 ) -> BaseException:
     if not diagnostics.traceback_readable:
         return error
-    try:
-        BaseException.with_traceback(error, diagnostics.traceback)
-    except BaseException:
-        pass
+    _write_exception_slot(error, "__traceback__", diagnostics.traceback)
     return error
+
+
+def _exception_graph_is_safe(
+    root: BaseException,
+    *,
+    forbidden: BaseException,
+) -> bool:
+    visiting: set[int] = set()
+    visited: set[int] = set()
+    stack: list[tuple[BaseException, bool]] = [(root, False)]
+    node_count = 0
+    while stack:
+        node, leaving = stack.pop()
+        if node is forbidden:
+            return False
+        identity = id(node)
+        if leaving:
+            visiting.discard(identity)
+            visited.add(identity)
+            continue
+        if identity in visiting:
+            return False
+        if identity in visited:
+            continue
+        node_count += 1
+        if node_count > _EXCEPTION_GRAPH_NODE_LIMIT:
+            return False
+        cause, cause_readable = _read_exception_slot(
+            node,
+            "__cause__",
+            None,
+        )
+        context, context_readable = _read_exception_slot(
+            node,
+            "__context__",
+            None,
+        )
+        if not cause_readable or not context_readable:
+            return False
+        if cause is not None and not isinstance(cause, BaseException):
+            return False
+        if context is not None and not isinstance(context, BaseException):
+            return False
+        visiting.add(identity)
+        stack.append((node, True))
+        if context is not None:
+            stack.append((context, False))
+        if cause is not None:
+            stack.append((cause, False))
+    return True
+
+
+def _attach_audit_cause(
+    error: BaseException,
+    diagnostics: _ExceptionDiagnostics,
+    trace_error: TraceWriteError,
+) -> bool:
+    if not diagnostics.audit_cause_allowed:
+        return False
+    if not _exception_graph_is_safe(trace_error, forbidden=error):
+        return False
+    if not _write_exception_slot(error, "__cause__", trace_error):
+        return False
+    attached_cause, cause_readable = _read_exception_slot(
+        error,
+        "__cause__",
+        None,
+    )
+    attached_context, context_readable = _read_exception_slot(
+        error,
+        "__context__",
+        None,
+    )
+    attached_suppress, suppress_readable = _read_exception_slot(
+        error,
+        "__suppress_context__",
+        False,
+    )
+    if (
+        cause_readable
+        and context_readable
+        and suppress_readable
+        and attached_cause is trace_error
+        and attached_context is None
+        and attached_suppress is True
+    ):
+        return True
+    _write_exception_slot(error, "__cause__", diagnostics.cause)
+    _write_exception_slot(error, "__context__", diagnostics.context)
+    _write_exception_slot(
+        error,
+        "__suppress_context__",
+        diagnostics.suppress_context,
+    )
+    return False
 
 
 def _add_audit_failure_note(
@@ -970,8 +1098,11 @@ class ResearchWorkflow:
                     provider_error,
                     provider_diagnostics,
                 )
-                if provider_diagnostics.audit_cause_allowed:
-                    raise restored_error from trace_error
+                _attach_audit_cause(
+                    provider_error,
+                    provider_diagnostics,
+                    trace_error,
+                )
                 raise restored_error
             raise _restore_exception_traceback(
                 provider_error,
@@ -1773,8 +1904,12 @@ class ResearchWorkflow:
                 workflow_error,
                 workflow_diagnostics,
             )
-            if workflow_diagnostics.audit_cause_allowed:
-                raise restored_error from terminal_trace_error
+            if _attach_audit_cause(
+                workflow_error,
+                workflow_diagnostics,
+                terminal_trace_error,
+            ):
+                raise restored_error
             self._add_terminal_trace_note(workflow_error, terminal_trace_error)
         raise _restore_exception_traceback(
             workflow_error,

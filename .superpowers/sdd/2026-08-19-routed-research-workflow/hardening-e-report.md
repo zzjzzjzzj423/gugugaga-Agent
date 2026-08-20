@@ -206,3 +206,37 @@ The resulting research boundary is:
 - Affected regression suite: `233 passed`.
 - Full suite: `519 passed, 1 deselected`; the sole deselection was the approved source-map baseline test, using a unique external basetemp.
 - Final compile, baseline-range diff, commit, and clean-status evidence is included in the handoff.
+
+## Fix Round 5: validate exception diagnostics
+
+### Baseline and root cause
+
+- Verified exact clean baseline `338b427c50e22fefb904d471d212de5f0d046ecb` before edits.
+- `BaseException.__getattribute__(error, special_name)` still performs normal attribute resolution and therefore honors a subclass data descriptor. A provider property returning `None` for `__cause__` / `__context__` could hide real values in the BaseException slots, making the workflow overwrite the provider's original diagnostic chain.
+- The previous cause-attachment decision inspected only the provider snapshot. It never validated the candidate `TraceWriteError` graph, so an audit error already pointing to the provider, containing a self/two-node cycle, or carrying an unbounded chain could be attached and make the provider graph cyclic or unsafe to traverse.
+- Production scope remained only `simple_cc/research_workflow.py`; the accepted embedded-scheme scanner limitation was not touched.
+
+### Implementation and graph boundary
+
+- The four special fields now use code-owned exact getset descriptors taken from `BaseException.__dict__`: `__cause__`, `__context__`, `__suppress_context__`, and `__traceback__`. Every direct descriptor read/write is guarded and bypasses subclass properties, `__getattribute__`, `with_traceback`, and `__setattr__` overrides.
+- Provider capture and traceback restoration use only these exact slots. A masked property that returns `None` or raises cannot hide the underlying cause/context/suppress identity or replace the original traceback tail.
+- Before a `TraceWriteError` can become the provider cause, an iterative gray/visited traversal follows exact cause/context slots with a fixed 32-node limit. It fails closed on a provider back-reference, existing cycle, excessive depth, unreadable descriptor, or non-exception child.
+- A safe audit graph is attached through the exact BaseException cause slot and verified through exact slots before the provider is rethrown. An unsafe graph is not attached and is represented only by the existing whitespace-normalized, event-specific, 600-character audit note. Existing provider diagnostics continue to force note-only handling.
+- Failed-finished and terminal audit I/O remain outside the active provider exception scope. Direct `TraceWriteError`, real recorder `TraceWriteError`-from-`OSError`, `KeyboardInterrupt`, and `SystemExit` behavior remains unchanged.
+
+### File-by-file scope
+
+- `simple_cc/research_workflow.py`: adds exact BaseException slot readers/writers, bounded audit-graph validation, verified exact cause attachment, and exact traceback restoration.
+- `tests/test_research_workflow.py`: covers property/data-descriptor masking of provider and audit cause/context slots; provider back-references, self/two-node cycles, excessive depth, clean graphs, and hostile special-field assignment; and attempts 1/2 across failed-only, persistent, and terminal-only audit failure combinations. Existing real-recorder and direct-trace matrices remain active.
+- `.superpowers/sdd/2026-08-19-routed-research-workflow/hardening-e-report.md`: records Fix Round 5 root cause, scope, TDD evidence, and verification.
+
+### TDD and verification
+
+- Corrected focused RED: `36 failed, 18 passed`; six masked return-`None` provider cases lost their real cause, while all thirty ordinary unsafe audit-graph cases were attached. Descriptor-raise, clean-graph, and hostile-special-assignment characterization cases preserved already-correct behavior.
+- Exact-slot mutation RED: temporarily replacing graph reads with `BaseException.__getattribute__` made all `12` masked audit back-reference cases fail; restoring the exact descriptor made the expanded matrix green.
+- Expanded focused GREEN: `66 passed, 126 deselected`.
+- Combined prior exception regressions before the masked-audit expansion: `112 passed, 68 deselected`.
+- Complete workflow file: `192 passed`.
+- Affected regression suite: `299 passed`.
+- Full suite: `585 passed, 1 deselected`; the sole deselection was the approved source-map baseline test, using a unique external basetemp.
+- Final compile, baseline-range diff, commit, and clean-status evidence is included in the handoff.
