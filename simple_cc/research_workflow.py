@@ -52,8 +52,6 @@ EVIDENCE_PACKET_TEXT_CHARS_MAX = 1_200
 EVIDENCE_PACKET_DATE_CHARS_MAX = 64
 EVIDENCE_PACKET_OMITTED_IDS_MAX = 32
 EVIDENCE_PACKET_TRUNCATIONS_MAX = 64
-EVIDENCE_PACKET_SEED_AUTHORITY_CANDIDATES_MAX = 64
-EVIDENCE_PACKET_SEED_DOMAIN_CANDIDATES_MAX = 64
 _GATE_REASON_CHARS_MAX = 512
 _GATE_GAPS_MAX = 16
 
@@ -292,61 +290,99 @@ def _packet_candidates(registry: EvidenceRegistry) -> list[_PacketCandidate]:
 def _deep_minimum_seed(
     candidates: list[_PacketCandidate],
 ) -> tuple[_PacketCandidate, ...]:
-    """Find a bounded deterministic minimum-size deep-policy seed.
+    """Return the exact cheapest seed meeting the fixed deep minima.
 
-    Search is code-owned: at most 64 smallest authority candidates (2,016
-    pairs) and 64 smallest per-domain representatives are considered. Domain
-    completion is additive because exact JSON record sizes plus list separators
-    determine total packet size.
+    The packet JSON cost of every selected record is additive when two list
+    delimiter characters are charged to each record.  For a domain, an optimal
+    seed can only need its cheapest non-authority, cheapest authority, or two
+    cheapest authorities.  Dynamic programming over all domains and the small
+    fixed state (up to four domains and two authorities) is therefore exact,
+    deterministic, and O(records + domains * fixed_state) without candidate
+    truncation.
     """
     policy = RANK_POLICIES[ResearchRank.DEEP]
+    candidate_by_index = {item.index: item for item in candidates}
     by_size = lambda item: (item.serialized_record_chars, item.index)
-    authorities = sorted(
-        (item for item in candidates if item.record.authoritative),
-        key=by_size,
-    )[:EVIDENCE_PACKET_SEED_AUTHORITY_CANDIDATES_MAX]
-    best_by_domain: dict[str, _PacketCandidate] = {}
+    per_domain: dict[str, dict[str, Any]] = {}
     for item in candidates:
         domain = item.record.domain
-        current = best_by_domain.get(domain)
-        if domain and (current is None or by_size(item) < by_size(current)):
-            best_by_domain[domain] = item
-    domain_representatives = sorted(
-        best_by_domain.values(),
-        key=by_size,
-    )[:EVIDENCE_PACKET_SEED_DOMAIN_CANDIDATES_MAX]
-    if (
-        len(authorities) < policy.authoritative_source_count
-        or len(best_by_domain) < policy.distinct_source_count
-    ):
+        if not domain:
+            continue
+        entry = per_domain.setdefault(
+            domain,
+            {"non_authority": None, "authorities": []},
+        )
+        if item.record.authoritative is True:
+            authorities = entry["authorities"]
+            authorities.append(item)
+            authorities.sort(key=by_size)
+            del authorities[2:]
+        else:
+            current = entry["non_authority"]
+            if current is None or by_size(item) < by_size(current):
+                entry["non_authority"] = item
+
+    if len(per_domain) < policy.distinct_source_count:
         return ()
 
-    best_seed: tuple[_PacketCandidate, ...] = ()
-    best_score: tuple[int, tuple[int, ...]] | None = None
-    for left_index, left in enumerate(authorities):
-        for right in authorities[left_index + 1:]:
-            pair = (left, right)
-            selected_ids = {item.record.source_id for item in pair}
-            domains = {item.record.domain for item in pair if item.record.domain}
-            needed = max(0, policy.distinct_source_count - len(domains))
-            options = [
-                item for item in domain_representatives
-                if item.record.source_id not in selected_ids
-                and item.record.domain not in domains
-            ]
-            if len(options) < needed:
+    # State value is (exact serialized cost, registry indexes). Authority and
+    # domain counts saturate at the fixed deep-policy minima.
+    states: dict[tuple[int, int], tuple[int, tuple[int, ...]]] = {
+        (0, 0): (0, ())
+    }
+    for domain in sorted(per_domain):
+        entry = per_domain[domain]
+        choices: list[tuple[_PacketCandidate, ...]] = []
+        non_authority = entry["non_authority"]
+        authorities = entry["authorities"]
+        if non_authority is not None:
+            choices.append((non_authority,))
+        if authorities:
+            choices.append((authorities[0],))
+        if len(authorities) >= 2:
+            choices.append(tuple(sorted(
+                authorities[:2],
+                key=lambda item: item.index,
+            )))
+
+        next_states = dict(states)
+        for (domain_count, authority_count), (cost, indexes) in states.items():
+            if domain_count >= policy.distinct_source_count:
                 continue
-            additions = options[:needed]
-            seed = tuple(sorted((*pair, *additions), key=lambda item: item.index))
-            seed_records = [item.packet_record for item in seed]
-            serialized_chars = _serialized_packet_chars(seed_records)
-            if serialized_chars > EVIDENCE_PACKET_TOTAL_CHARS_MAX:
-                continue
-            score = (serialized_chars, tuple(item.index for item in seed))
-            if best_score is None or score < best_score:
-                best_score = score
-                best_seed = seed
-    return best_seed
+            for choice in choices:
+                choice_indexes = tuple(item.index for item in choice)
+                combined_indexes = tuple(sorted((*indexes, *choice_indexes)))
+                choice_cost = sum(
+                    item.serialized_record_chars + 2 for item in choice
+                )
+                choice_authorities = sum(
+                    item.record.authoritative is True for item in choice
+                )
+                state = (
+                    domain_count + 1,
+                    min(
+                        policy.authoritative_source_count,
+                        authority_count + choice_authorities,
+                    ),
+                )
+                proposal = (cost + choice_cost, combined_indexes)
+                current = next_states.get(state)
+                if current is None or proposal < current:
+                    next_states[state] = proposal
+        states = next_states
+
+    target = states.get((
+        policy.distinct_source_count,
+        policy.authoritative_source_count,
+    ))
+    if target is None or target[0] > EVIDENCE_PACKET_TOTAL_CHARS_MAX:
+        return ()
+    seed = tuple(candidate_by_index[index] for index in target[1])
+    if _serialized_packet_chars(
+        [item.packet_record for item in seed]
+    ) > EVIDENCE_PACKET_TOTAL_CHARS_MAX:
+        return ()
+    return seed
 
 
 def _best_effort_seed(
@@ -357,7 +393,10 @@ def _best_effort_seed(
     ordered: list[_PacketCandidate] = []
     authority_count = 0
     for item in sorted(
-        (candidate for candidate in candidates if candidate.record.authoritative),
+        (
+            candidate for candidate in candidates
+            if candidate.record.authoritative is True
+        ),
         key=by_size,
     ):
         if authority_count >= policy.authoritative_source_count:
@@ -421,7 +460,7 @@ def _select_evidence_packet(
     ]
     deepest_policy = RANK_POLICIES[ResearchRank.DEEP]
     deep_minimum_preserved = (
-        sum(item.authoritative for item in selected_records)
+        sum(item.authoritative is True for item in selected_records)
         >= deepest_policy.authoritative_source_count
         and len({item.domain for item in selected_records if item.domain})
         >= deepest_policy.distinct_source_count
@@ -596,7 +635,9 @@ def parse_research_gate(
             registry.mark_authority(source_id, authoritative, reason)
 
         authoritative_ids = tuple(
-            item.source_id for item in registry.records if item.authoritative
+            item.source_id
+            for item in registry.records
+            if item.authoritative is True
         )
         gaps = [item.strip() for item in raw_gaps if item.strip()]
         if source_count < plan.policy.distinct_source_count:
@@ -748,12 +789,7 @@ class ResearchWorkflow:
             "serialized_chars": selection.serialized_chars,
             "record_limit": EVIDENCE_PACKET_MAX_RECORDS,
             "total_chars_limit": EVIDENCE_PACKET_TOTAL_CHARS_MAX,
-            "seed_authority_candidate_limit": (
-                EVIDENCE_PACKET_SEED_AUTHORITY_CANDIDATES_MAX
-            ),
-            "seed_domain_candidate_limit": (
-                EVIDENCE_PACKET_SEED_DOMAIN_CANDIDATES_MAX
-            ),
+            "seed_optimizer": "exact_domain_dynamic_programming",
             "deep_minimum_feasible": selection.deep_minimum_feasible,
             "deep_minimum_preserved": selection.deep_minimum_preserved,
         })
@@ -1189,7 +1225,7 @@ class ResearchWorkflow:
             "authoritative_source_ids": tuple(
                 item.source_id
                 for item in evidence_registry.records
-                if item.authoritative
+                if item.authoritative is True
             ),
             "supplemental_research_used": supplemental_used,
             "writing_repair_used": False,
@@ -1214,7 +1250,7 @@ class ResearchWorkflow:
             "authoritative_source_ids": tuple(
                 item.source_id
                 for item in evidence_registry.records
-                if item.authoritative
+                if item.authoritative is True
             ),
             "writing_repair_used": False,
         })
@@ -1254,7 +1290,7 @@ class ResearchWorkflow:
                 "authoritative_source_ids": tuple(
                     item.source_id
                     for item in evidence_registry.records
-                    if item.authoritative
+                    if item.authoritative is True
                 ),
                 "writing_repair_used": True,
             })

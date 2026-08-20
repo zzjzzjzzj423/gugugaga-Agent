@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import re
+import sys
 import unicodedata
 from dataclasses import dataclass, replace
 from datetime import date
 from enum import Enum
+from pathlib import PurePosixPath
 from types import MappingProxyType
 from typing import Mapping, Protocol
 from urllib.parse import urlsplit
@@ -15,6 +18,44 @@ EVIDENCE_CONTENT_CHARS_MAX = 6000
 EVIDENCE_PDF_FRAGMENT_CHARS_MAX = 700
 EVIDENCE_PDF_FRAGMENTS_MAX = 8
 EVIDENCE_ARTIFACT_REFERENCES_MAX = 16
+EVIDENCE_ARTIFACT_PATH_CHARS_MAX = 2048
+EVIDENCE_ARTIFACT_MEDIA_TYPE_CHARS_MAX = 255
+EVIDENCE_ARTIFACT_SIZE_BYTES_MAX = 1_000_000_000
+AUTHORITY_REASON_CHARS_MAX = 512
+
+
+def _is_control_safe_text(value: str) -> bool:
+    return not any(
+        unicodedata.category(character).startswith("C")
+        or not character.isprintable()
+        for character in value
+    )
+
+
+def _is_canonical_safe_text(value: object, max_chars: int) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and value == value.strip()
+        and len(value) <= max_chars
+        and unicodedata.normalize("NFC", value) == value
+        and _is_control_safe_text(value)
+    )
+
+
+def _is_safe_artifact_path(value: object) -> bool:
+    if not _is_canonical_safe_text(value, EVIDENCE_ARTIFACT_PATH_CHARS_MAX):
+        return False
+    assert isinstance(value, str)
+    if "\\" in value or ":" in value or value.startswith("/"):
+        return False
+    path = PurePosixPath(value)
+    parts = path.parts
+    return (
+        path.as_posix() == value
+        and bool(parts)
+        and all(part not in {"", ".", ".."} for part in parts)
+    )
 
 
 def _evidence_fragment_sort_key(key: str) -> tuple[int, int, str]:
@@ -149,6 +190,9 @@ class EvidenceRegistry:
         # making the registry the single runtime trust boundary for all callers.
         from .evidence import (
             EVIDENCE_URL_CHARS_MAX,
+            _normalize_evidence_text,
+            _pdf_page_body,
+            _pdf_page_fragment,
             canonicalize_url,
             source_id_for_url,
         )
@@ -181,7 +225,10 @@ class EvidenceRegistry:
                 "domain_mismatch",
                 "evidence domain does not match canonical URL",
             )
-        if record.tool_name not in {"web_fetch", "pdf_fetch"}:
+        if (
+            not isinstance(record.tool_name, str)
+            or record.tool_name not in {"web_fetch", "pdf_fetch"}
+        ):
             cls._reject(
                 "invalid_tool_name",
                 "registered evidence must come from a fetch tool",
@@ -190,7 +237,7 @@ class EvidenceRegistry:
         if (
             not isinstance(content, str)
             or not content
-            or content != content.strip()
+            or _normalize_evidence_text(content) != content
             or len(content) > EVIDENCE_CONTENT_CHARS_MAX
             or not any(
                 not character.isspace()
@@ -213,7 +260,10 @@ class EvidenceRegistry:
             )
         ):
             cls._reject("invalid_metadata", "evidence title is invalid")
-        if record.date_status not in {"unknown", "verified"}:
+        if (
+            not isinstance(record.date_status, str)
+            or record.date_status not in {"unknown", "verified"}
+        ):
             cls._reject("invalid_metadata", "evidence date_status is invalid")
 
         def parsed_iso(value: str | None, field: str) -> date | None:
@@ -266,17 +316,36 @@ class EvidenceRegistry:
             cls._reject("invalid_record", "too many evidence artifacts")
         fragment_keys: set[str] = set()
         for fragment in record.content_fragments:
+            if (
+                not isinstance(fragment.key, str)
+                or not isinstance(fragment.content, str)
+            ):
+                cls._reject("invalid_content", "evidence fragment is invalid")
             page_number = fragment.key.removeprefix("pdf_page:")
             if (
                 not fragment.key.startswith("pdf_page:")
                 or not page_number.isascii()
                 or not page_number.isdecimal()
+                or len(page_number) > len(str(sys.maxsize))
+                or not 1 <= int(page_number) <= sys.maxsize
+                or fragment.key != f"pdf_page:{int(page_number):010d}"
                 or fragment.key in fragment_keys
                 or not fragment.content
                 or len(fragment.content) > EVIDENCE_PDF_FRAGMENT_CHARS_MAX
             ):
                 cls._reject("invalid_content", "evidence fragment is invalid")
+            body = _pdf_page_body(int(page_number), fragment.content)
+            if body is None or _pdf_page_fragment(int(page_number), body) != fragment:
+                cls._reject(
+                    "invalid_content",
+                    "evidence fragment must use the canonical PAGE structure",
+                )
             fragment_keys.add(fragment.key)
+        if record.content_fragments != tuple(sorted(
+            record.content_fragments,
+            key=lambda fragment: _evidence_fragment_sort_key(fragment.key),
+        )):
+            cls._reject("invalid_content", "evidence fragments must be ordered")
         if record.tool_name == "web_fetch" and record.content_fragments:
             cls._reject("invalid_content", "web evidence cannot have PDF fragments")
         if record.tool_name == "pdf_fetch":
@@ -290,6 +359,23 @@ class EvidenceRegistry:
                     "invalid_content",
                     "PDF evidence excerpt does not match its fragments",
                 )
+        artifact_hashes: set[str] = set()
+        for artifact in record.artifact_references:
+            if (
+                not _is_safe_artifact_path(artifact.path)
+                or not _is_canonical_safe_text(
+                    artifact.media_type,
+                    EVIDENCE_ARTIFACT_MEDIA_TYPE_CHARS_MAX,
+                )
+                or not isinstance(artifact.sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", artifact.sha256) is None
+                or artifact.sha256 in artifact_hashes
+                or isinstance(artifact.size_bytes, bool)
+                or not isinstance(artifact.size_bytes, int)
+                or not 0 <= artifact.size_bytes <= EVIDENCE_ARTIFACT_SIZE_BYTES_MAX
+            ):
+                cls._reject("invalid_record", "evidence artifact is invalid")
+            artifact_hashes.add(artifact.sha256)
 
     def register(self, record: EvidenceRecord) -> EvidenceRecord:
         self._validate_record(record)
@@ -373,10 +459,23 @@ class EvidenceRegistry:
         record = self.get_by_id(source_id)
         if record is None:
             raise ValueError(f"unknown evidence source id: {source_id}")
+        if type(authoritative) is not bool:
+            raise ValueError("authoritative decision must be a bool")
+        if not isinstance(reason, str):
+            raise ValueError("authority reason must be a string")
+        cleaned_reason = unicodedata.normalize("NFC", reason.strip())
+        if (
+            not cleaned_reason
+            or len(cleaned_reason) > AUTHORITY_REASON_CHARS_MAX
+            or not _is_control_safe_text(cleaned_reason)
+        ):
+            raise ValueError(
+                "authority reason must be non-empty, control-safe, and bounded"
+            )
         self._records[record.canonical_url] = replace(
             record,
             authoritative=authoritative,
-            authority_reason=reason.strip(),
+            authority_reason=cleaned_reason,
         )
 
 

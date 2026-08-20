@@ -630,7 +630,10 @@ def validate_research_final(
         errors.append(
             f"use at least {policy.distinct_source_count} independent domains"
         )
-    if sum(item.authoritative for item in records) < policy.authoritative_source_count:
+    if (
+        sum(item.authoritative is True for item in records)
+        < policy.authoritative_source_count
+    ):
         errors.append(
             f"use at least {policy.authoritative_source_count} authoritative source"
         )

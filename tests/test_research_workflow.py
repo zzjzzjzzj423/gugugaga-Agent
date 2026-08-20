@@ -238,7 +238,7 @@ def test_evidence_packet_is_deterministic_diverse_and_aggregate_bounded():
         registered = registry.register(record)
         if index >= 198:
             registry.mark_authority(
-                registered.source_id, True, "official source " + "R" * 2000
+                registered.source_id, True, "official source"
             )
 
     first = build_evidence_packet(registry)
@@ -443,6 +443,53 @@ def test_size_aware_seed_stays_bounded_when_no_deep_subset_is_feasible():
         authorities <= selected_ids
         and len({item["domain"] for item in packet}) >= 4
     )
+    assert len(packet) <= EVIDENCE_PACKET_MAX_RECORDS
+    assert len(json.dumps(packet, ensure_ascii=False, sort_keys=True)) <= (
+        EVIDENCE_PACKET_TOTAL_CHARS_MAX
+    )
+
+
+def _escaped_probe_url(domain, label, target_length):
+    prefix = f"https://{domain}/{label}/"
+    return prefix + "\\" * (target_length - len(prefix))
+
+
+def test_exact_seed_optimizer_finds_feasible_authorities_beyond_old_64_cap():
+    registry = EvidenceRegistry()
+    for index in range(64):
+        _register_packet_size_probe(
+            registry,
+            _escaped_probe_url(
+                "crowded.example", f"small-authority-{index}", 3200
+            ),
+            large=True,
+            authoritative=True,
+        )
+    medium_authorities = {
+        _register_packet_size_probe(
+            registry,
+            _escaped_probe_url(
+                f"medium-authority-{index}.example", "authority", 3700
+            ),
+            large=True,
+            authoritative=True,
+        ).source_id
+        for index in range(2)
+    }
+    _register_packet_size_probe(
+        registry,
+        _escaped_probe_url("fourth-domain.example", "evidence", 3700),
+        large=True,
+    )
+
+    packet = build_evidence_packet(registry)
+
+    assert medium_authorities <= {item["source_id"] for item in packet}
+    assert sum(
+        registry.get_by_id(item["source_id"]).authoritative is True
+        for item in packet
+    ) >= 2
+    assert len({item["domain"] for item in packet}) >= 4
     assert len(packet) <= EVIDENCE_PACKET_MAX_RECORDS
     assert len(json.dumps(packet, ensure_ascii=False, sort_keys=True)) <= (
         EVIDENCE_PACKET_TOTAL_CHARS_MAX

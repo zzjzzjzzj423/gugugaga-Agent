@@ -4,6 +4,7 @@ import pytest
 
 from simple_cc.evidence import evidence_record_from_result, source_id_for_url
 from simple_cc.research_models import (
+    EvidenceFragment,
     EvidenceRecord,
     EvidenceRegistrationError,
     EvidenceRegistry,
@@ -14,6 +15,7 @@ from simple_cc.research_models import (
     TaskKind,
     normalize_task_kind,
 )
+from simple_cc.trace import ArtifactRef
 
 
 def test_task_kind_is_explicit_and_defaults_to_normal():
@@ -103,3 +105,134 @@ def test_registry_rejects_untrusted_record_shapes(changes, error_code):
 
     assert caught.value.code == error_code
     assert registry.records == ()
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ("", "   ", "x" * 513, "unsafe\u0000reason"),
+)
+def test_mark_authority_rejects_invalid_reason_without_mutation(reason):
+    record = evidence_record_from_result(
+        "web_fetch",
+        '{"ok":true,"operation":"fetch",'
+        '"url":"https://example.com/report","title":"Report",'
+        '"content":"facts","published_at":"2025-01-02",'
+        '"date_status":"verified","cutoff":"2025-05-01"}',
+    )
+    assert record is not None
+    registry = EvidenceRegistry()
+    registry.register(record)
+
+    with pytest.raises(ValueError):
+        registry.mark_authority(record.source_id, True, reason)
+
+    assert registry.records[0].authoritative is False
+    assert registry.records[0].authority_reason is None
+
+
+def test_mark_authority_requires_bool_known_source_and_never_double_counts():
+    record = evidence_record_from_result(
+        "web_fetch",
+        '{"ok":true,"operation":"fetch",'
+        '"url":"https://example.com/report","title":"Report",'
+        '"content":"facts","published_at":"2025-01-02",'
+        '"date_status":"verified","cutoff":"2025-05-01"}',
+    )
+    assert record is not None
+    registry = EvidenceRegistry()
+    registry.register(record)
+
+    with pytest.raises(ValueError):
+        registry.mark_authority(record.source_id, 1, "numeric truthy")
+    with pytest.raises(ValueError):
+        registry.mark_authority("src_unknown", True, "official")
+    registry.mark_authority(record.source_id, True, "official filing")
+    registry.mark_authority(record.source_id, True, "official filing")
+
+    assert len(registry.records) == 1
+    assert sum(item.authoritative is True for item in registry.records) == 1
+
+
+@pytest.mark.parametrize(
+    "content",
+    ("facts\r\nmore", "e\u0301vidence"),
+)
+def test_registry_rejects_noncanonical_excerpt_normalization(content):
+    record = evidence_record_from_result(
+        "web_fetch",
+        '{"ok":true,"operation":"fetch",'
+        '"url":"https://example.com/report","title":"Report",'
+        '"content":"facts","published_at":"2025-01-02",'
+        '"date_status":"verified","cutoff":"2025-05-01"}',
+    )
+    assert record is not None
+
+    with pytest.raises(EvidenceRegistrationError) as caught:
+        EvidenceRegistry().register(replace(record, content_excerpt=content))
+
+    assert caught.value.code == "invalid_content"
+
+
+@pytest.mark.parametrize(
+    ("key", "content"),
+    (
+        ("pdf_page:1", "--- PAGE 1 START ---\nfacts\n--- PAGE 1 END ---"),
+        ("pdf_page:0000000001", "facts"),
+        (
+            "pdf_page:0000000001",
+            "--- PAGE 2 START ---\nfacts\n--- PAGE 2 END ---",
+        ),
+    ),
+)
+def test_registry_rejects_noncanonical_pdf_fragment_structure(key, content):
+    record = evidence_record_from_result(
+        "pdf_fetch",
+        '{"ok":true,"operation":"pdf_fetch",'
+        '"url":"https://example.com/report.pdf","title":"Report",'
+        '"start_page":1,"end_page":1,"pages":['
+        '{"page_number":1,"content":"facts"}],'
+        '"published_at":"2025-01-02","date_status":"verified",'
+        '"cutoff":"2025-05-01"}',
+    )
+    assert record is not None
+    fragment = EvidenceFragment(key, content)
+    malformed = replace(
+        record,
+        content_fragments=(fragment,),
+        content_excerpt=content,
+    )
+
+    with pytest.raises(EvidenceRegistrationError) as caught:
+        EvidenceRegistry().register(malformed)
+
+    assert caught.value.code == "invalid_content"
+
+
+@pytest.mark.parametrize(
+    "artifact",
+    (
+        ArtifactRef("", "0" * 64, "application/json", 1),
+        ArtifactRef("artifact.json", "not-a-sha", "application/json", 1),
+        ArtifactRef("artifact.json", "0" * 64, "bad\u0000type", 1),
+        ArtifactRef("artifact.json", "0" * 64, "application/json", True),
+        ArtifactRef("artifact.json", "0" * 64, "application/json", -1),
+        ArtifactRef("artifact.json", "0" * 64, "application/json", 1_000_000_001),
+    ),
+)
+def test_registry_rejects_malformed_artifact_references(artifact):
+    record = evidence_record_from_result(
+        "web_fetch",
+        '{"ok":true,"operation":"fetch",'
+        '"url":"https://example.com/report","title":"Report",'
+        '"content":"facts","published_at":"2025-01-02",'
+        '"date_status":"verified","cutoff":"2025-05-01"}',
+    )
+    assert record is not None
+
+    with pytest.raises(EvidenceRegistrationError) as caught:
+        EvidenceRegistry().register(replace(
+            record,
+            artifact_references=(artifact,),
+        ))
+
+    assert caught.value.code == "invalid_record"
