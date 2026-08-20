@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass, replace
+from datetime import date
 from enum import Enum
 from types import MappingProxyType
 from typing import Mapping, Protocol
+from urllib.parse import urlsplit
 
 from .trace import ArtifactRef
 
@@ -136,7 +139,169 @@ class EvidenceRegistry:
     def records(self) -> tuple[EvidenceRecord, ...]:
         return tuple(self._records.values())
 
+    @staticmethod
+    def _reject(code: str, message: str) -> None:
+        raise EvidenceRegistrationError(code, message)
+
+    @classmethod
+    def _validate_record(cls, record: EvidenceRecord) -> None:
+        # Local import keeps evidence extraction dependent on these models while
+        # making the registry the single runtime trust boundary for all callers.
+        from .evidence import (
+            EVIDENCE_URL_CHARS_MAX,
+            canonicalize_url,
+            source_id_for_url,
+        )
+
+        if not isinstance(record, EvidenceRecord):
+            cls._reject("invalid_record", "evidence must be an EvidenceRecord")
+        try:
+            canonical = canonicalize_url(record.canonical_url)
+        except (TypeError, ValueError) as error:
+            cls._reject("invalid_url", str(error))
+        if (
+            canonical != record.canonical_url
+            or len(canonical) > EVIDENCE_URL_CHARS_MAX
+        ):
+            cls._reject(
+                "invalid_url",
+                "evidence URL must be exact canonical HTTP(S) identity",
+            )
+        if (
+            not isinstance(record.source_id, str)
+            or record.source_id != source_id_for_url(canonical)
+        ):
+            cls._reject(
+                "source_id_mismatch",
+                "evidence source_id does not match canonical URL",
+            )
+        expected_domain = urlsplit(canonical).hostname or ""
+        if not isinstance(record.domain, str) or record.domain != expected_domain:
+            cls._reject(
+                "domain_mismatch",
+                "evidence domain does not match canonical URL",
+            )
+        if record.tool_name not in {"web_fetch", "pdf_fetch"}:
+            cls._reject(
+                "invalid_tool_name",
+                "registered evidence must come from a fetch tool",
+            )
+        content = record.content_excerpt
+        if (
+            not isinstance(content, str)
+            or not content
+            or content != content.strip()
+            or len(content) > EVIDENCE_CONTENT_CHARS_MAX
+            or not any(
+                not character.isspace()
+                and not unicodedata.category(character).startswith("C")
+                for character in content
+            )
+        ):
+            cls._reject(
+                "invalid_content",
+                "evidence content must be usable, normalized, and bounded",
+            )
+        if record.title is not None and (
+            not isinstance(record.title, str)
+            or not record.title
+            or record.title != record.title.strip()
+            or len(record.title) > 4096
+            or any(
+                unicodedata.category(character).startswith("C")
+                for character in record.title
+            )
+        ):
+            cls._reject("invalid_metadata", "evidence title is invalid")
+        if record.date_status not in {"unknown", "verified"}:
+            cls._reject("invalid_metadata", "evidence date_status is invalid")
+
+        def parsed_iso(value: str | None, field: str) -> date | None:
+            if value is None:
+                return None
+            if not isinstance(value, str):
+                cls._reject("invalid_metadata", f"evidence {field} is invalid")
+            try:
+                parsed = date.fromisoformat(value)
+            except ValueError:
+                cls._reject("invalid_metadata", f"evidence {field} is invalid")
+            if parsed.isoformat() != value:
+                cls._reject("invalid_metadata", f"evidence {field} is invalid")
+            return parsed
+
+        published = parsed_iso(record.published_at, "published_at")
+        cutoff = parsed_iso(record.cutoff, "cutoff")
+        if (
+            (record.date_status == "verified" and published is None)
+            or (record.date_status == "unknown" and published is not None)
+            or (
+                published is not None
+                and cutoff is not None
+                and published > cutoff
+            )
+        ):
+            cls._reject("invalid_metadata", "evidence date metadata conflicts")
+        if (
+            not isinstance(record.authoritative, bool)
+            or record.authoritative
+            or record.authority_reason is not None
+        ):
+            cls._reject(
+                "untrusted_authority",
+                "authority may only be assigned by the research gate",
+            )
+        if not isinstance(record.content_fragments, tuple) or not all(
+            isinstance(fragment, EvidenceFragment)
+            for fragment in record.content_fragments
+        ):
+            cls._reject("invalid_content", "evidence fragments are invalid")
+        if len(record.content_fragments) > EVIDENCE_PDF_FRAGMENTS_MAX:
+            cls._reject("invalid_content", "too many evidence fragments")
+        if not isinstance(record.artifact_references, tuple) or not all(
+            isinstance(artifact, ArtifactRef)
+            for artifact in record.artifact_references
+        ):
+            cls._reject("invalid_record", "evidence artifacts are invalid")
+        if len(record.artifact_references) > EVIDENCE_ARTIFACT_REFERENCES_MAX:
+            cls._reject("invalid_record", "too many evidence artifacts")
+        fragment_keys: set[str] = set()
+        for fragment in record.content_fragments:
+            page_number = fragment.key.removeprefix("pdf_page:")
+            if (
+                not fragment.key.startswith("pdf_page:")
+                or not page_number.isascii()
+                or not page_number.isdecimal()
+                or fragment.key in fragment_keys
+                or not fragment.content
+                or len(fragment.content) > EVIDENCE_PDF_FRAGMENT_CHARS_MAX
+            ):
+                cls._reject("invalid_content", "evidence fragment is invalid")
+            fragment_keys.add(fragment.key)
+        if record.tool_name == "web_fetch" and record.content_fragments:
+            cls._reject("invalid_content", "web evidence cannot have PDF fragments")
+        if record.tool_name == "pdf_fetch":
+            if not record.content_fragments:
+                cls._reject("invalid_content", "PDF evidence requires fragments")
+            expected_excerpt = "\n\n".join(
+                fragment.content for fragment in record.content_fragments
+            )[:EVIDENCE_CONTENT_CHARS_MAX]
+            if record.content_excerpt != expected_excerpt:
+                cls._reject(
+                    "invalid_content",
+                    "PDF evidence excerpt does not match its fragments",
+                )
+
     def register(self, record: EvidenceRecord) -> EvidenceRecord:
+        self._validate_record(record)
+        colliding = self.get_by_id(record.source_id)
+        if (
+            colliding is not None
+            and colliding.canonical_url != record.canonical_url
+        ):
+            raise EvidenceRegistrationError(
+                "source_id_collision",
+                "evidence source_id is already registered to another URL",
+            )
         existing = self._records.get(record.canonical_url)
         if existing is None:
             self._records[record.canonical_url] = record

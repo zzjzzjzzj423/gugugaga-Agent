@@ -147,7 +147,8 @@ def source_id_for_url(url: str) -> str:
     return f"src_{digest[:16]}"
 
 
-_URL_PATTERN = re.compile(r"https?://[^\s<>\])]+", re.IGNORECASE)
+_URL_PATTERN = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
+_CITATION_PROSE_TRAILING = ".,;:!?\"'"
 
 
 def link_final_answer_sources(
@@ -156,8 +157,17 @@ def link_final_answer_sources(
     cited_urls: list[str] = []
     matched: list[str] = []
     unmatched: list[str] = []
-    for raw in _URL_PATTERN.findall(final_text or ""):
-        raw = raw.rstrip(".,;:!?\"'")
+    answer = final_text or ""
+    for match in _URL_PATTERN.finditer(answer):
+        raw_token = match.group(0)
+        raw = raw_token.rstrip(_CITATION_PROSE_TRAILING)
+        # Only remove a closing parenthesis when syntax proves that it closes a
+        # Markdown link. In plain prose `)` and `]` remain legal URL identity,
+        # preventing a registered prefix from matching a longer unfetched URL.
+        if answer[max(0, match.start() - 2):match.start()] == "](" and raw.endswith(
+            ")"
+        ):
+            raw = raw[:-1]
         try:
             canonical = canonicalize_url(raw)
         except ValueError:

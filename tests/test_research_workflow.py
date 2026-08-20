@@ -348,6 +348,107 @@ def test_packet_reserves_two_same_domain_authorities_before_diverse_fill():
     )
 
 
+def _register_packet_size_probe(
+    registry,
+    url,
+    *,
+    large=False,
+    authoritative=False,
+):
+    record = evidence_record_from_result(
+        "web_fetch",
+        json.dumps({
+            "ok": True,
+            "operation": "fetch",
+            "url": url,
+            "title": "\\" * 1000 if large else "medium",
+            "content": "\\" * 6000 if large else "useful evidence",
+            "published_at": "2025-01-02",
+            "date_status": "verified",
+            "cutoff": "2025-05-01",
+        }),
+    )
+    assert record is not None
+    registered = registry.register(record)
+    if authoritative:
+        registry.mark_authority(registered.source_id, True, "official")
+    return registered
+
+
+def _large_probe_url(domain, label):
+    prefix = f"https://{domain}/{label}/"
+    return prefix + "\\" * (4000 - len(prefix))
+
+
+def test_size_aware_seed_finds_feasible_deep_minimum_before_stable_fill():
+    registry = EvidenceRegistry()
+    authorities = {
+        _register_packet_size_probe(
+            registry,
+            _large_probe_url("official.example", f"authority-{index}"),
+            large=True,
+            authoritative=True,
+        ).source_id
+        for index in range(2)
+    }
+    for index in range(3):
+        _register_packet_size_probe(
+            registry,
+            _large_probe_url(f"large-{index}.example", "large"),
+            large=True,
+        )
+    for index in range(40):
+        _register_packet_size_probe(
+            registry,
+            f"https://official.example/filler-{index}",
+        )
+    for index in range(3):
+        _register_packet_size_probe(
+            registry,
+            f"https://medium-{index}.example/report",
+        )
+
+    packet = build_evidence_packet(registry)
+
+    assert authorities <= {item["source_id"] for item in packet}
+    assert len({item["domain"] for item in packet}) >= 4
+    assert len(packet) <= EVIDENCE_PACKET_MAX_RECORDS
+    assert len(json.dumps(packet, ensure_ascii=False, sort_keys=True)) <= (
+        EVIDENCE_PACKET_TOTAL_CHARS_MAX
+    )
+
+
+def test_size_aware_seed_stays_bounded_when_no_deep_subset_is_feasible():
+    registry = EvidenceRegistry()
+    authorities = {
+        _register_packet_size_probe(
+            registry,
+            _large_probe_url("official.example", f"authority-{index}"),
+            large=True,
+            authoritative=True,
+        ).source_id
+        for index in range(2)
+    }
+    for index in range(3):
+        _register_packet_size_probe(
+            registry,
+            _large_probe_url(f"only-{index}.example", "large"),
+            large=True,
+        )
+
+    packet = build_evidence_packet(registry)
+    selected_ids = {item["source_id"] for item in packet}
+
+    assert not (
+        authorities <= selected_ids
+        and len({item["domain"] for item in packet}) >= 4
+    )
+    assert len(packet) <= EVIDENCE_PACKET_MAX_RECORDS
+    assert len(json.dumps(packet, ensure_ascii=False, sort_keys=True)) <= (
+        EVIDENCE_PACKET_TOTAL_CHARS_MAX
+    )
+
+
 def test_200_record_gate_prompt_and_packet_selection_trace_stay_bounded(tmp_path):
     registry = EvidenceRegistry()
     for index in range(200):

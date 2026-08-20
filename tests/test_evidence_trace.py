@@ -94,6 +94,49 @@ def test_canonical_url_and_citation_linkage_are_deterministic():
     )
 
 
+def test_citation_linkage_supports_legal_brackets_and_rejects_prefix_attack():
+    parenthesis_url = canonicalize_url("https://example.com/a)b")
+    bracket_url = canonicalize_url("https://example.com/a]b")
+    linked = link_final_answer_sources(
+        f"See [paren]({parenthesis_url}). Then {bracket_url}, for comparison.",
+        {
+            parenthesis_url: "src_parenthesis",
+            bracket_url: "src_bracket",
+        },
+    )
+
+    assert linked["matched_source_ids"] == [
+        "src_parenthesis",
+        "src_bracket",
+    ]
+    assert linked["unmatched_citations"] == []
+
+    registered_prefix = canonicalize_url("https://example.com/report")
+    longer_unfetched = canonicalize_url(
+        "https://example.com/report/attacker-copy"
+    )
+    attacked = link_final_answer_sources(
+        f"Do not trust {longer_unfetched}.",
+        {registered_prefix: "src_prefix"},
+    )
+
+    assert attacked["matched_source_ids"] == []
+    assert attacked["unmatched_citations"] == [longer_unfetched]
+
+    delimiter_suffix_attack = canonicalize_url(
+        "https://example.com/report)"
+    )
+    delimiter_attacked = link_final_answer_sources(
+        f"A distinct unfetched identity is {delimiter_suffix_attack}.",
+        {registered_prefix: "src_prefix"},
+    )
+
+    assert delimiter_attacked["matched_source_ids"] == []
+    assert delimiter_attacked["unmatched_citations"] == [
+        delimiter_suffix_attack
+    ]
+
+
 def test_source_runtime_traces_tool_and_injects_cutoff(tmp_path, monkeypatch):
     old_workspace = config.WORKDIR
     config.configure_workspace(tmp_path / "workspace")

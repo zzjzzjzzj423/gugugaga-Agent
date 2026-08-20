@@ -1,7 +1,11 @@
+from dataclasses import replace
+
 import pytest
 
+from simple_cc.evidence import evidence_record_from_result, source_id_for_url
 from simple_cc.research_models import (
     EvidenceRecord,
+    EvidenceRegistrationError,
     EvidenceRegistry,
     RANK_POLICIES,
     ResearchBudget,
@@ -55,18 +59,47 @@ def test_budget_is_shared_and_bounded():
 
 def test_registry_deduplicates_canonical_urls():
     registry = EvidenceRegistry()
-    first = EvidenceRecord(
-        source_id="src_a",
-        canonical_url="https://example.com/report",
-        domain="example.com",
-        title="Report",
-        content_excerpt="facts",
-        published_at="2025-01-02",
-        date_status="verified",
-        cutoff="2025-05-01",
-        tool_name="web_fetch",
+    first = evidence_record_from_result(
+        "web_fetch",
+        '{"ok":true,"operation":"fetch",'
+        '"url":"https://example.com/report","title":"Report",'
+        '"content":"facts","published_at":"2025-01-02",'
+        '"date_status":"verified","cutoff":"2025-05-01"}',
     )
+    assert first is not None
     duplicate = EvidenceRecord(**{**first.__dict__, "title": "Duplicate"})
     assert registry.register(first) is first
     assert registry.register(duplicate) is first
     assert registry.records == (first,)
+
+
+@pytest.mark.parametrize(
+    ("changes", "error_code"),
+    (
+        ({"canonical_url": "javascript:fake"}, "invalid_url"),
+        ({"source_id": "src_forged"}, "source_id_mismatch"),
+        ({"domain": "forged.example"}, "domain_mismatch"),
+        ({"tool_name": "web_search"}, "invalid_tool_name"),
+        ({"content_excerpt": ""}, "invalid_content"),
+        ({"content_excerpt": "x" * 6001}, "invalid_content"),
+        ({"date_status": "claimed"}, "invalid_metadata"),
+        ({"authoritative": True}, "untrusted_authority"),
+    ),
+)
+def test_registry_rejects_untrusted_record_shapes(changes, error_code):
+    record = evidence_record_from_result(
+        "web_fetch",
+        '{"ok":true,"operation":"fetch",'
+        '"url":"https://example.com/report","title":"Report",'
+        '"content":"facts","published_at":"2025-01-02",'
+        '"date_status":"verified","cutoff":"2025-05-01"}',
+    )
+    assert record is not None
+    malformed = replace(record, **changes)
+    registry = EvidenceRegistry()
+
+    with pytest.raises(EvidenceRegistrationError) as caught:
+        registry.register(malformed)
+
+    assert caught.value.code == error_code
+    assert registry.records == ()
