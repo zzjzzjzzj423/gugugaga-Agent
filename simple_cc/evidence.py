@@ -29,7 +29,11 @@ RESEARCH_TOOLS = {"web_search", "web_fetch", "pdf_fetch"}
 EVIDENCE_EXCERPT_CHARS = EVIDENCE_CONTENT_CHARS_MAX
 _HOST_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
 _ALLOWED_DATE_STATUSES = {"unknown", "verified"}
-_MARKER_LIKE_LINE = re.compile(r"^---\s*(PAGE|TABLE)(?:\s|$)", re.IGNORECASE)
+_MARKER_LIKE_LINE = re.compile(
+    r"^---\s*(P(?:A(?:G(?:E)?)?)?|T(?:A(?:B(?:L(?:E)?)?)?)?)"
+    r"(?=\s|[0-9]|$)",
+    re.IGNORECASE,
+)
 _TABLE_MARKER_LINE = re.compile(
     r"--- TABLE ([1-9][0-9]*) (START|END) ---"
 )
@@ -200,7 +204,11 @@ def _parse_iso_date(
     return normalized, parsed, None
 
 
-def _normalize_evidence_text(content: str) -> str:
+def _normalize_evidence_text(
+    content: str,
+    *,
+    strip_outer: bool = True,
+) -> str:
     normalized = unicodedata.normalize("NFC", content)
     normalized = normalized.replace("\r\n", "\n").replace("\r", "\n")
     visible: list[str] = []
@@ -216,18 +224,23 @@ def _normalize_evidence_text(content: str) -> str:
             continue
         else:
             visible.append(character)
-    return unicodedata.normalize("NFC", "".join(visible).strip())
+    filtered = "".join(visible)
+    if strip_outer:
+        filtered = filtered.strip()
+    return unicodedata.normalize("NFC", filtered)
 
 
 def _marker_like_kind(line: str) -> str | None:
     match = _MARKER_LIKE_LINE.match(line.strip())
-    return match.group(1).upper() if match is not None else None
+    if match is None:
+        return None
+    return "PAGE" if match.group(1).upper().startswith("P") else "TABLE"
 
 
 def _pdf_page_body(page_number: int, content: str) -> str | None:
     start_marker = f"--- PAGE {page_number} START ---"
     end_marker = f"--- PAGE {page_number} END ---"
-    normalized = _normalize_evidence_text(content)
+    normalized = _normalize_evidence_text(content, strip_outer=False)
     lines = normalized.split("\n") if normalized else []
 
     page_marker_indexes = [

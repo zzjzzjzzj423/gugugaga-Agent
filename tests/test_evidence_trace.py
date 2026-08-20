@@ -726,6 +726,137 @@ def test_pdf_rejects_marker_like_or_malformed_table_structure(tmp_path, body):
     assert rejected["payload"]["reason_code"] == "invalid_pdf_pages"
 
 
+@pytest.mark.parametrize(
+    "content",
+    (
+        " --- PAGE 1 START ---\nfacts\n--- PAGE 1 END ---",
+        "--- PAGE 1 START ---\nfacts\n--- PAGE 1 END --- ",
+        "\n--- PAGE 1 START ---\nfacts\n--- PAGE 1 END ---",
+        "--- PAGE 1 START ---\nfacts\n--- PAGE 1 END ---\n",
+    ),
+)
+def test_pdf_rejects_padded_or_outer_blank_page_wrappers(tmp_path, content):
+    output = json.dumps({
+        "ok": True,
+        "operation": "pdf_fetch",
+        "url": "https://example.com/padded-wrapper.pdf",
+        "start_page": 1,
+        "end_page": 1,
+        "cutoff": "2025-05-01",
+        "published_at": None,
+        "date_status": "unknown",
+        "pages": [{"page_number": 1, "content": content}],
+    })
+    _, outcome, registry, rows, incomplete = _run_single_fetch_result(
+        tmp_path,
+        "pdf-padded-wrapper",
+        "pdf_fetch",
+        output,
+    )
+
+    assert outcome.final_text == "research notes"
+    assert registry.records == ()
+    assert incomplete is False
+    terminal = next(row for row in rows if row["event_type"] == "tool_result")
+    rejected = next(row for row in rows if row["event_type"] == "source_rejected")
+    assert terminal["sequence"] < rejected["sequence"]
+    assert rejected["payload"]["reason_code"] == "invalid_pdf_pages"
+
+
+@pytest.mark.parametrize(
+    "reserved_line",
+    (
+        "--- PAGE1 START ---",
+        "--- PAG",
+        "--- PA",
+        "--- TABLE1 START ---",
+        "--- TABL",
+        "--- TAB",
+    ),
+)
+def test_pdf_rejects_compact_or_truncated_reserved_marker_prefixes(
+    tmp_path, reserved_line
+):
+    output = json.dumps({
+        "ok": True,
+        "operation": "pdf_fetch",
+        "url": "https://example.com/reserved-prefix.pdf",
+        "start_page": 1,
+        "end_page": 1,
+        "cutoff": "2025-05-01",
+        "published_at": None,
+        "date_status": "unknown",
+        "pages": [{
+            "page_number": 1,
+            "content": (
+                f"--- PAGE 1 START ---\n{reserved_line}\n--- PAGE 1 END ---"
+            ),
+        }],
+    })
+    _, outcome, registry, rows, incomplete = _run_single_fetch_result(
+        tmp_path,
+        "pdf-reserved-prefix",
+        "pdf_fetch",
+        output,
+    )
+
+    assert outcome.final_text == "research notes"
+    assert registry.records == ()
+    assert incomplete is False
+    terminal = next(row for row in rows if row["event_type"] == "tool_result")
+    rejected = next(row for row in rows if row["event_type"] == "source_rejected")
+    assert terminal["sequence"] < rejected["sequence"]
+    assert rejected["payload"]["reason_code"] == "invalid_pdf_pages"
+
+
+@pytest.mark.parametrize(
+    ("content", "expected_body"),
+    (
+        (
+            "--- PAGE 1 START ---\nexact facts\n--- PAGE 1 END ---",
+            "exact facts",
+        ),
+        (
+            "--- DATA 1 BEGIN ---\nOrdinary page/table prose: π ≥ 3.14",
+            "--- DATA 1 BEGIN ---\nOrdinary page/table prose: π ≥ 3.14",
+        ),
+    ),
+)
+def test_pdf_accepts_exact_wrapper_and_nonreserved_delimiter_controls(
+    tmp_path, content, expected_body
+):
+    output = json.dumps({
+        "ok": True,
+        "operation": "pdf_fetch",
+        "url": "https://example.com/marker-controls.pdf",
+        "start_page": 1,
+        "end_page": 1,
+        "cutoff": "2025-05-01",
+        "published_at": None,
+        "date_status": "unknown",
+        "pages": [{"page_number": 1, "content": content}],
+    })
+    _, outcome, registry, rows, incomplete = _run_single_fetch_result(
+        tmp_path,
+        "pdf-marker-controls",
+        "pdf_fetch",
+        output,
+    )
+
+    assert outcome.final_text == "research notes"
+    assert incomplete is False
+    assert len(registry.records) == 1
+    fragment = registry.records[0].content_fragments[0].content
+    assert fragment == (
+        f"--- PAGE 1 START ---\n{expected_body}\n--- PAGE 1 END ---"
+    )
+    terminal = next(row for row in rows if row["event_type"] == "tool_result")
+    registered = next(
+        row for row in rows if row["event_type"] == "source_registered"
+    )
+    assert terminal["sequence"] < registered["sequence"]
+
+
 def test_pdf_strips_valid_table_delimiters_before_fragment_bounding(tmp_path):
     page_start = "--- PAGE 1 START ---"
     page_end = "--- PAGE 1 END ---"
