@@ -674,6 +674,139 @@ def test_pdf_rejects_empty_table_or_punctuation_scaffolding(tmp_path, body):
     assert rejected["payload"]["reason_code"] == "invalid_pdf_pages"
 
 
+@pytest.mark.parametrize(
+    "body",
+    (
+        "--- PAGE 1 BEGIN ---",
+        "--- TABLE 1 BEGIN ---",
+        "--- TABLE 1 START ---\nfacts",
+        "facts\n--- TABLE 1 END ---",
+        "--- TABLE 1 START ---\nfacts\n--- TABLE 2 END ---",
+        (
+            "--- TABLE 1 START ---\n--- TABLE 2 START ---\nfacts\n"
+            "--- TABLE 2 END ---\n--- TABLE 1 END ---"
+        ),
+        (
+            "--- TABLE 1 START ---\nfacts\n--- TABLE 1 END ---\n"
+            "--- TABLE 1 START ---\nmore facts\n--- TABLE 1 END ---"
+        ),
+        "--- TABLE 1 STA",
+    ),
+)
+def test_pdf_rejects_marker_like_or_malformed_table_structure(tmp_path, body):
+    output = json.dumps({
+        "ok": True,
+        "operation": "pdf_fetch",
+        "url": "https://example.com/malformed-structure.pdf",
+        "start_page": 1,
+        "end_page": 1,
+        "cutoff": "2025-05-01",
+        "published_at": None,
+        "date_status": "unknown",
+        "pages": [{
+            "page_number": 1,
+            "content": (
+                f"--- PAGE 1 START ---\n{body}\n--- PAGE 1 END ---"
+            ),
+        }],
+    })
+    _, outcome, registry, rows, incomplete = _run_single_fetch_result(
+        tmp_path,
+        "pdf-malformed-structure",
+        "pdf_fetch",
+        output,
+    )
+
+    assert outcome.final_text == "research notes"
+    assert registry.records == ()
+    assert incomplete is False
+    terminal = next(row for row in rows if row["event_type"] == "tool_result")
+    rejected = next(row for row in rows if row["event_type"] == "source_rejected")
+    assert terminal["sequence"] < rejected["sequence"]
+    assert rejected["payload"]["reason_code"] == "invalid_pdf_pages"
+
+
+def test_pdf_strips_valid_table_delimiters_before_fragment_bounding(tmp_path):
+    page_start = "--- PAGE 1 START ---"
+    page_end = "--- PAGE 1 END ---"
+    available_body_chars = (
+        EVIDENCE_PDF_FRAGMENT_CHARS_MAX
+        - len(page_start)
+        - len(page_end)
+        - 2
+    )
+    table_row = "Revenue\t120"
+    prefix = "." * (available_body_chars - len(table_row) - 1)
+    output = json.dumps({
+        "ok": True,
+        "operation": "pdf_fetch",
+        "url": "https://example.com/boundary-table.pdf",
+        "start_page": 1,
+        "end_page": 1,
+        "cutoff": "2025-05-01",
+        "published_at": None,
+        "date_status": "unknown",
+        "pages": [{
+            "page_number": 1,
+            "content": (
+                f"{page_start}\n{prefix}\n"
+                f"--- TABLE 1 START ---\n{table_row}\n"
+                f"--- TABLE 1 END ---\n{page_end}"
+            ),
+        }],
+    })
+    _, outcome, registry, rows, incomplete = _run_single_fetch_result(
+        tmp_path,
+        "pdf-boundary-table",
+        "pdf_fetch",
+        output,
+    )
+
+    assert outcome.final_text == "research notes"
+    assert incomplete is False
+    assert len(registry.records) == 1
+    fragment = registry.records[0].content_fragments[0].content
+    assert table_row in fragment
+    assert "--- TABLE" not in fragment
+    assert len(fragment) == EVIDENCE_PDF_FRAGMENT_CHARS_MAX
+    terminal = next(row for row in rows if row["event_type"] == "tool_result")
+    registered = next(
+        row for row in rows if row["event_type"] == "source_registered"
+    )
+    assert terminal["sequence"] < registered["sequence"]
+
+
+def test_pdf_preserves_unmarked_page_table_prose_math_and_unicode(tmp_path):
+    content = "This page compares table values: π ≥ 3.14；研究完成。"
+    output = json.dumps({
+        "ok": True,
+        "operation": "pdf_fetch",
+        "url": "https://example.com/ordinary-prose.pdf",
+        "start_page": 1,
+        "end_page": 1,
+        "cutoff": "2025-05-01",
+        "published_at": None,
+        "date_status": "unknown",
+        "pages": [{"page_number": 1, "content": content}],
+    })
+    _, outcome, registry, rows, incomplete = _run_single_fetch_result(
+        tmp_path,
+        "pdf-ordinary-prose",
+        "pdf_fetch",
+        output,
+    )
+
+    assert outcome.final_text == "research notes"
+    assert incomplete is False
+    assert len(registry.records) == 1
+    assert content in registry.records[0].content_fragments[0].content
+    terminal = next(row for row in rows if row["event_type"] == "tool_result")
+    registered = next(
+        row for row in rows if row["event_type"] == "source_registered"
+    )
+    assert terminal["sequence"] < registered["sequence"]
+
+
 def test_pdf_fragment_merge_orders_cross_width_page_keys_numerically():
     page_numbers = (
         10_000_000_004,

@@ -29,8 +29,10 @@ RESEARCH_TOOLS = {"web_search", "web_fetch", "pdf_fetch"}
 EVIDENCE_EXCERPT_CHARS = EVIDENCE_CONTENT_CHARS_MAX
 _HOST_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
 _ALLOWED_DATE_STATUSES = {"unknown", "verified"}
-_PAGE_MARKER = re.compile(r"--- PAGE [0-9]+ (?:START|END) ---")
-_TABLE_MARKER = re.compile(r"--- TABLE [0-9]+ (?:START|END) ---")
+_MARKER_LIKE_LINE = re.compile(r"^---\s*(PAGE|TABLE)(?:\s|$)", re.IGNORECASE)
+_TABLE_MARKER_LINE = re.compile(
+    r"--- TABLE ([1-9][0-9]*) (START|END) ---"
+)
 
 
 class CutoffMismatch(ValueError):
@@ -217,26 +219,63 @@ def _normalize_evidence_text(content: str) -> str:
     return unicodedata.normalize("NFC", "".join(visible).strip())
 
 
+def _marker_like_kind(line: str) -> str | None:
+    match = _MARKER_LIKE_LINE.match(line.strip())
+    return match.group(1).upper() if match is not None else None
+
+
 def _pdf_page_body(page_number: int, content: str) -> str | None:
     start_marker = f"--- PAGE {page_number} START ---"
     end_marker = f"--- PAGE {page_number} END ---"
-    body = _normalize_evidence_text(content)
-    if _PAGE_MARKER.search(body):
-        start_wrapper = f"{start_marker}\n"
-        end_wrapper = f"\n{end_marker}"
-        if not body.startswith(start_wrapper) or not body.endswith(end_wrapper):
+    normalized = _normalize_evidence_text(content)
+    lines = normalized.split("\n") if normalized else []
+
+    page_marker_indexes = [
+        index
+        for index, line in enumerate(lines)
+        if _marker_like_kind(line) == "PAGE"
+    ]
+    if page_marker_indexes:
+        if (
+            page_marker_indexes != [0, len(lines) - 1]
+            or lines[0] != start_marker
+            or lines[-1] != end_marker
+        ):
             return None
-        body = body[len(start_wrapper):-len(end_wrapper)].strip()
-        if _PAGE_MARKER.search(body):
+        lines = lines[1:-1]
+
+    real_content: list[str] = []
+    open_table: str | None = None
+    next_table_number = 1
+    for line in lines:
+        marker_kind = _marker_like_kind(line)
+        if marker_kind == "PAGE":
             return None
-    return body
+        if marker_kind != "TABLE":
+            real_content.append(line)
+            continue
+        match = _TABLE_MARKER_LINE.fullmatch(line)
+        if match is None:
+            return None
+        table_number, boundary = match.groups()
+        if boundary == "START":
+            if open_table is not None or table_number != str(next_table_number):
+                return None
+            open_table = table_number
+        else:
+            if open_table != table_number:
+                return None
+            open_table = None
+            next_table_number += 1
+    if open_table is not None:
+        return None
+    return "\n".join(real_content).strip()
 
 
 def _has_substantive_evidence(content: str) -> bool:
-    without_table_markers = _TABLE_MARKER.sub("", content)
     return any(
         unicodedata.category(character)[0] in {"L", "N", "S"}
-        for character in without_table_markers
+        for character in content
     )
 
 
