@@ -261,6 +261,85 @@ def test_exact_registered_url_identity_keeps_trailing_punctuation(punctuation):
     assert linked["unmatched_citations"] == []
 
 
+def test_adjacent_angle_citations_are_all_discovered():
+    first = canonicalize_url("https://first.example/report")
+    second = canonicalize_url("https://second.example/report")
+
+    linked = link_final_answer_sources(
+        f"<{first}><{second}>",
+        {
+            first: "src_first",
+            second: "src_second",
+        },
+    )
+
+    assert linked["matched_source_ids"] == ["src_first", "src_second"]
+    assert linked["unmatched_citations"] == []
+
+
+def test_adjacent_mixed_citations_resume_after_structural_delimiters():
+    markdown = canonicalize_url("https://markdown.example/report")
+    angle = canonicalize_url("https://angle.example/report")
+    unfetched = canonicalize_url("https://unfetched.example/report")
+
+    linked = link_final_answer_sources(
+        f"[ordinary label]({markdown}){unfetched}<{angle}>",
+        {
+            markdown: "src_markdown",
+            angle: "src_angle",
+        },
+    )
+
+    assert linked["matched_source_ids"] == ["src_markdown", "src_angle"]
+    assert linked["unmatched_citations"] == [unfetched]
+
+
+def test_fake_markdown_opener_does_not_register_a_source_prefix():
+    registered = canonicalize_url("https://example.com/report")
+    complete_token = canonicalize_url(
+        "https://example.com/report)attacker"
+    )
+
+    linked = link_final_answer_sources(
+        f"not-a-link]({registered})attacker",
+        {registered: "src_registered"},
+    )
+
+    assert linked["matched_source_ids"] == []
+    assert linked["unmatched_citations"] == [complete_token]
+
+
+def test_empty_markdown_label_is_not_treated_as_proven_structure():
+    registered = canonicalize_url("https://example.com/report")
+    complete_token = canonicalize_url(
+        "https://example.com/report)attacker"
+    )
+
+    linked = link_final_answer_sources(
+        f"[]({registered})attacker",
+        {registered: "src_registered"},
+    )
+
+    assert linked["matched_source_ids"] == []
+    assert linked["unmatched_citations"] == [complete_token]
+
+
+def test_adjacent_and_repeated_bare_schemes_emit_bounded_invalid_markers():
+    linked = link_final_answer_sources(
+        "http://https:// then http:// and https://",
+        {},
+    )
+
+    assert linked["matched_source_ids"] == []
+    assert linked["cited_urls"] == []
+    assert len(linked["unmatched_citations"]) == 2
+    assert all(
+        marker.startswith("invalid_http_url:sha256:")
+        and len(marker) == len("invalid_http_url:sha256:") + 64
+        for marker in linked["unmatched_citations"]
+    )
+
+
 def test_source_runtime_traces_tool_and_injects_cutoff(tmp_path, monkeypatch):
     old_workspace = config.WORKDIR
     config.configure_workspace(tmp_path / "workspace")

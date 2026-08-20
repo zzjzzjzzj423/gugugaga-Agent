@@ -6,6 +6,7 @@ import json
 import re
 import sys
 import unicodedata
+from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from datetime import date
 from typing import Any
@@ -148,24 +149,74 @@ def source_id_for_url(url: str) -> str:
     return f"src_{digest[:16]}"
 
 
-_URL_PATTERN = re.compile(r"https?://[^\s]+", re.IGNORECASE)
+_URL_SCHEME_PATTERN = re.compile(r"https?://", re.IGNORECASE)
+_WHITESPACE_PATTERN = re.compile(r"\s")
 _INVALID_CITATION_PREFIX = "invalid_http_url:sha256:"
 
 
-def _citation_identity_candidate(
+def _markdown_label_opening_start(answer: str, url_start: int) -> int | None:
+    if url_start < 3 or answer[url_start - 2:url_start] != "](":
+        return None
+    close_bracket = url_start - 2
+    open_bracket = answer.rfind("[", 0, close_bracket)
+    if open_bracket < 0:
+        return None
+    label = answer[open_bracket + 1:close_bracket]
+    if not label or any(character in "[]\r\n" for character in label):
+        return None
+    return open_bracket
+
+
+def _candidate_limit(
     answer: str,
-    match: re.Match[str],
-) -> tuple[str, str]:
-    raw_token = match.group(0)
-    if answer[max(0, match.start() - 2):match.start()] == "](":
-        closing = raw_token.rfind(")")
-        if closing >= 0:
-            return raw_token[:closing], raw_token
-    if match.start() > 0 and answer[match.start() - 1] == "<":
-        closing = raw_token.find(">")
-        if closing >= 0:
-            return raw_token[:closing], raw_token
-    return raw_token, raw_token
+    scheme_match: re.Match[str],
+) -> int:
+    limit = len(answer)
+    whitespace = _WHITESPACE_PATTERN.search(answer, scheme_match.end())
+    if whitespace is not None:
+        limit = whitespace.start()
+    following = _URL_SCHEME_PATTERN.search(answer, scheme_match.end())
+    if following is not None and following.start() < limit:
+        following_opening = _markdown_label_opening_start(
+            answer,
+            following.start(),
+        )
+        if following_opening is not None:
+            limit = following_opening
+        elif (
+            following.start() > scheme_match.end()
+            and answer[following.start() - 1] == "<"
+        ):
+            limit = following.start() - 1
+        else:
+            limit = following.start()
+    return limit
+
+
+def _iter_citation_candidates(answer: str) -> Iterator[tuple[str, str]]:
+    position = 0
+    while position < len(answer):
+        match = _URL_SCHEME_PATTERN.search(answer, position)
+        if match is None:
+            return
+        start = match.start()
+        limit = _candidate_limit(answer, match)
+        markdown_opening = _markdown_label_opening_start(answer, start)
+        if markdown_opening is not None:
+            closing = answer.rfind(")", start, limit)
+            if closing >= 0:
+                yield answer[start:closing], answer[start:closing + 1]
+                position = closing + 1
+                continue
+        if start > 0 and answer[start - 1] == "<":
+            closing = answer.find(">", start, limit)
+            if closing >= 0:
+                yield answer[start:closing], answer[start:closing + 1]
+                position = closing + 1
+                continue
+        end = max(limit, match.end())
+        yield answer[start:end], answer[start:end]
+        position = end
 
 
 def _invalid_citation_marker(raw_token: str) -> str:
@@ -192,8 +243,7 @@ def link_final_answer_sources(
     matched: list[str] = []
     unmatched: list[str] = []
     answer = final_text or ""
-    for match in _URL_PATTERN.finditer(answer):
-        candidate, raw_token = _citation_identity_candidate(answer, match)
+    for candidate, raw_token in _iter_citation_candidates(answer):
         canonical = _canonical_citation_identity(candidate)
         if canonical is None:
             marker = _invalid_citation_marker(raw_token)
