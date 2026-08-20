@@ -5,6 +5,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Callable
 
 from . import config
@@ -16,6 +17,7 @@ from .background import (
 )
 from .context import (
     ContextManager,
+    LocalContextLimitExceeded,
     build_user_content,
     compact_history,
     inject_background_notifications,
@@ -101,25 +103,56 @@ class FixedToolRegistry:
 
 
 def _research_tool_view(
-    definitions: list[dict[str, Any]],
+    definitions: list[Any],
     handlers: dict[str, Callable],
 ) -> tuple[list[dict[str, Any]], dict[str, Callable]]:
     """Return the configured, executable subset of code-owned research tools."""
-    selected_definitions: list[dict[str, Any]] = []
-    selected_names: list[str] = []
+    candidates: dict[str, tuple[dict[str, Any], Callable]] = {}
+    conflicted: set[str] = set()
+    order: list[str] = []
     for definition in definitions:
+        if not isinstance(definition, dict):
+            continue
         name = definition.get("name")
+        if not isinstance(name, str) or not name or name not in RESEARCH_TOOLS:
+            continue
+        description = definition.get("description")
+        input_schema = definition.get("input_schema")
+        handler = handlers.get(name)
         if (
-            name in RESEARCH_TOOLS
-            and name in handlers
-            and name not in selected_names
+            not isinstance(description, str)
+            or not isinstance(input_schema, dict)
+            or not callable(handler)
         ):
-            selected_definitions.append(definition)
-            selected_names.append(name)
+            conflicted.add(name)
+            candidates.pop(name, None)
+            continue
+        if name in conflicted:
+            continue
+        previous = candidates.get(name)
+        if previous is None:
+            candidates[name] = (definition, handler)
+            order.append(name)
+            continue
+        previous_definition, previous_handler = previous
+        try:
+            same_definition = definition == previous_definition
+        except Exception:
+            same_definition = False
+        if same_definition is not True or handler is not previous_handler:
+            conflicted.add(name)
+            candidates.pop(name, None)
+
+    selected_names = [name for name in order if name in candidates]
     return (
-        selected_definitions,
-        {name: handlers[name] for name in selected_names},
+        [candidates[name][0] for name in selected_names],
+        {name: candidates[name][1] for name in selected_names},
     )
+
+
+class AgentExecutionPolicy(str, Enum):
+    ORDINARY = "ordinary"
+    RESEARCH_ISOLATED = "research_isolated"
 
 
 @dataclass(frozen=True)
@@ -286,7 +319,10 @@ class SourceRuntime:
                     )
                     gaps = tuple(stage.get("research_gaps") or ())
                     system_prompt = research_execution_prompt(
-                        self.state_builder(),
+                        {
+                            "workspace": str(config.WORKDIR),
+                            "tools": ", ".join(research_tool_names),
+                        },
                         question=str(stage.get("question") or query),
                         cutoff=stage.get("cutoff", cutoff),
                         plan=plan,
@@ -312,7 +348,7 @@ class SourceRuntime:
                         evidence_registry=registry,
                         research_cutoff=cutoff,
                         finalize_user_turn=False,
-                        strict_tool_allowlist=True,
+                        execution_policy=AgentExecutionPolicy.RESEARCH_ISOLATED,
                     )
 
                 workflow = ResearchWorkflow(
@@ -443,21 +479,25 @@ def agent_loop(
     evidence_registry: EvidenceRegistry | None = None,
     research_cutoff: str | None = None,
     finalize_user_turn: bool = True,
-    strict_tool_allowlist: bool = False,
+    execution_policy: AgentExecutionPolicy = AgentExecutionPolicy.ORDINARY,
 ) -> AgentLoopOutcome:
     global rounds_since_todo
+    execution_policy = AgentExecutionPolicy(execution_policy)
+    isolated = execution_policy is AgentExecutionPolicy.RESEARCH_ISOLATED
+    if isolated and system_prompt is None:
+        raise ValueError("isolated research execution requires an explicit system prompt")
     tools = tools if tools is not None else TOOL_DEFINITIONS
     handlers = handlers if handlers is not None else TOOL_HANDLERS
-    available_tool_names = {
-        definition.get("name")
-        for definition in tools
-        if isinstance(definition, dict)
-    }
+    available_tool_names = (
+        {definition["name"] for definition in tools} if isolated else set()
+    )
     permissions = permissions or PermissionPolicy()
     selected_provider = provider or client
     memory_enabled = (
         config.MEMORY_ENABLED if memory_enabled is None else memory_enabled
     )
+    if isolated:
+        memory_enabled = False
     registered_sources = registered_sources if registered_sources is not None else {}
     required_cutoff = None
     if evidence_registry is not None:
@@ -502,31 +542,32 @@ def agent_loop(
         )
         turn_prompt = memory_store.turn_prompt(messages)
     for _round_index in range(max_rounds):
-        fired = consume_cron_queue()
-        for job in fired:
-            messages.append(
-                {"role": "user", "content": f"[Scheduled] {job.prompt}"}
-            )
-            print(f"  \033[35m[cron inject] {job.prompt[:60]}\033[0m")
+        if not isolated:
+            fired = consume_cron_queue()
+            for job in fired:
+                messages.append(
+                    {"role": "user", "content": f"[Scheduled] {job.prompt}"}
+                )
+                print(f"  \033[35m[cron inject] {job.prompt[:60]}\033[0m")
 
-        inject_background_notifications(messages)
+            inject_background_notifications(messages)
 
-        todo_rounds = (
-            todo_state["rounds_since_todo"]
-            if todo_state is not None
-            else rounds_since_todo
-        )
-        if todo_rounds >= 3:
-            messages.append(
-                {
-                    "role": "user",
-                    "content": "<reminder>Update your todos.</reminder>",
-                }
+            todo_rounds = (
+                todo_state["rounds_since_todo"]
+                if todo_state is not None
+                else rounds_since_todo
             )
-            if todo_state is not None:
-                todo_state["rounds_since_todo"] = 0
-            else:
-                rounds_since_todo = 0
+            if todo_rounds >= 3:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": "<reminder>Update your todos.</reminder>",
+                    }
+                )
+                if todo_state is not None:
+                    todo_state["rounds_since_todo"] = 0
+                else:
+                    rounds_since_todo = 0
 
         if memory_store is not None and not memory_ready:
             # 这是压缩前快照，供本轮结束后的记忆提取使用。
@@ -540,7 +581,20 @@ def agent_loop(
                 relevant_memories = ""
             memory_ready = True
 
-        prepare_context(messages, on_compaction=record_compaction)
+        try:
+            prepare_context(
+                messages,
+                on_compaction=record_compaction,
+                allow_model_summary=not isolated,
+            )
+        except LocalContextLimitExceeded as error:
+            return AgentLoopOutcome(
+                "failed",
+                "",
+                type(error).__name__,
+                str(error),
+                _round_index,
+            )
         context = update_context(context, messages)
 
         try:
@@ -570,9 +624,20 @@ def agent_loop(
                 is_prompt_too_long_error(error)
                 and not state.has_attempted_reactive_compact
             ):
-                messages[:] = reactive_compact(
-                    messages, on_compaction=record_compaction
-                )
+                try:
+                    messages[:] = reactive_compact(
+                        messages,
+                        on_compaction=record_compaction,
+                        allow_model_summary=not isolated,
+                    )
+                except LocalContextLimitExceeded as compaction_error:
+                    return AgentLoopOutcome(
+                        "failed",
+                        "",
+                        type(compaction_error).__name__,
+                        str(compaction_error),
+                        _round_index + 1,
+                    )
                 state.has_attempted_reactive_compact = True
                 continue
             messages.append(
@@ -671,7 +736,7 @@ def agent_loop(
                     agent_id=run_context.agent_id,
                 )
 
-            if strict_tool_allowlist and block.name not in available_tool_names:
+            if isolated and block.name not in available_tool_names:
                 message = f"Tool '{block.name}' is not available in this stage."
                 if run_context is not None:
                     run_context.recorder.record(
@@ -1002,16 +1067,17 @@ def agent_loop(
             trigger_hooks("PostToolUse", block, output)
             print(str(output)[:300])
 
-            if block.name == "todo_write":
-                if todo_state is not None:
-                    todo_state["rounds_since_todo"] = 0
+            if not isolated:
+                if block.name == "todo_write":
+                    if todo_state is not None:
+                        todo_state["rounds_since_todo"] = 0
+                    else:
+                        rounds_since_todo = 0
                 else:
-                    rounds_since_todo = 0
-            else:
-                if todo_state is not None:
-                    todo_state["rounds_since_todo"] += 1
-                else:
-                    rounds_since_todo += 1
+                    if todo_state is not None:
+                        todo_state["rounds_since_todo"] += 1
+                    else:
+                        rounds_since_todo += 1
 
             results.append(
                 {
@@ -1024,9 +1090,10 @@ def agent_loop(
         if compacted_now:
             continue
 
-        messages.append(
-            {"role": "user", "content": build_user_content(results)}
-        )
+        messages.append({
+            "role": "user",
+            "content": list(results) if isolated else build_user_content(results),
+        })
     return AgentLoopOutcome(
         "max_rounds",
         "",

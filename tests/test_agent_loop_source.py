@@ -684,7 +684,10 @@ def test_default_source_runtime_research_path_uses_only_configured_research_tool
     expected_names = ["web_search", "web_fetch", "pdf_fetch"]
     assert [item["name"] for item in captured["tools"]] == expected_names
     assert list(captured["handlers"]) == expected_names
-    assert captured["strict_tool_allowlist"] is True
+    assert captured["execution_policy"] is (
+        agent.AgentExecutionPolicy.RESEARCH_ISOLATED
+    )
+    assert "strict_tool_allowlist" not in captured
     available_line = next(
         line
         for line in captured["system_prompt"].splitlines()
@@ -727,6 +730,11 @@ def test_research_path_rejects_hallucinated_background_tool_synchronously(
         "start_background_task",
         lambda *args, **kwargs: pytest.fail("research started an async tool"),
     )
+    monkeypatch.setattr(
+        agent,
+        "build_user_content",
+        lambda results: pytest.fail("research drained background results"),
+    )
     monkeypatch.setattr(agent, "ResearchWorkflow", _single_execution_workflow())
     runtime = agent.SourceRuntime(
         provider,
@@ -750,6 +758,283 @@ def test_research_path_rejects_hallucinated_background_tool_synchronously(
     assert json.loads(result["content"])["error"]["code"] == (
         "tool_not_available"
     )
+
+
+def test_research_tool_view_fails_closed_on_malformed_and_conflicting_entries():
+    fetch = lambda **_: "fetch"
+    pdf = lambda **_: "pdf"
+    definitions = [
+        "not a definition",
+        ["also", "invalid"],
+        {"name": [], "description": "bad name", "input_schema": {}},
+        {"name": "web_fetch", "description": "fetch", "input_schema": {}},
+        {
+            "name": "web_search",
+            "description": "search",
+            "input_schema": {},
+        },
+        {"name": "pdf_fetch", "description": "pdf one", "input_schema": {}},
+        {"name": "pdf_fetch", "description": "pdf two", "input_schema": {}},
+        {
+            "name": "pdf_fetch",
+            "description": "bad schema",
+            "input_schema": [],
+        },
+        {"name": "web_search", "input_schema": {}},
+    ]
+
+    selected, handlers = agent._research_tool_view(
+        definitions,
+        {"web_fetch": fetch, "web_search": "not callable", "pdf_fetch": pdf},
+    )
+
+    assert selected == [
+        {"name": "web_fetch", "description": "fetch", "input_schema": {}}
+    ]
+    assert handlers == {"web_fetch": fetch}
+
+
+def test_research_tool_view_deduplicates_only_identical_safe_entries():
+    fetch = lambda **_: "fetch"
+    definition = {
+        "name": "web_fetch",
+        "description": "fetch",
+        "input_schema": {"type": "object"},
+    }
+
+    selected, handlers = agent._research_tool_view(
+        [definition, copy.deepcopy(definition)],
+        {"web_fetch": fetch},
+    )
+
+    assert selected == [definition]
+    assert handlers == {"web_fetch": fetch}
+    assert agent._research_tool_view([], {"web_fetch": fetch}) == ([], {})
+
+
+def test_research_prompt_does_not_touch_malformed_full_runtime_registry(
+    monkeypatch,
+):
+    runtime = agent.SourceRuntime(
+        ScriptedProvider([]),
+        tool_definitions=[
+            "malformed",
+            {"name": [], "description": "bad", "input_schema": {}},
+            {"name": "web_fetch", "description": "fetch", "input_schema": {}},
+        ],
+        tool_handlers={"web_fetch": lambda **_: "unused"},
+        memory_enabled=False,
+    )
+    captured = {}
+
+    def fake_agent_loop(messages, context, permissions, approval_callback, **kwargs):
+        captured.update(kwargs)
+        return agent.AgentLoopOutcome("completed", "private notes", rounds_used=1)
+
+    monkeypatch.setattr(
+        runtime,
+        "state_builder",
+        lambda: pytest.fail("research prompt read the full malformed registry"),
+    )
+    monkeypatch.setattr(agent, "agent_loop", fake_agent_loop)
+    monkeypatch.setattr(agent, "ResearchWorkflow", _single_execution_workflow())
+    monkeypatch.setattr(agent, "trigger_hooks", lambda *args: None)
+
+    assert runtime.run_turn(
+        "question",
+        run_metadata={"task_type": "research"},
+    ) == "public report"
+    assert [item["name"] for item in captured["tools"]] == ["web_fetch"]
+
+
+def test_research_execution_policy_ignores_memory_queues_and_shared_todo(
+    monkeypatch,
+):
+    side_effects = []
+
+    class ObservedMemoryStore:
+        def __init__(self, *args, **kwargs):
+            side_effects.append("memory:init")
+
+        def turn_prompt(self, messages):
+            side_effects.append("memory:turn_prompt")
+            return "memory target"
+
+        def load_relevant(self, messages):
+            side_effects.append("memory:load")
+            return "PRIVATE MEMORY"
+
+        def inject(self, messages, memories, target_text=""):
+            side_effects.append("memory:inject")
+            return messages
+
+        def extract(self, messages, final_text):
+            side_effects.append("memory:extract")
+
+        def consolidate_if_needed(self):
+            side_effects.append("memory:consolidate")
+
+    class QueuedJob:
+        prompt = "external scheduled work"
+
+    provider = ScriptedProvider([
+        ProviderResponse([TextBlock(text="private notes")], "end_turn")
+    ])
+    monkeypatch.setattr(agent.config, "MEMORY_ENABLED", True)
+    monkeypatch.setattr(agent, "MemoryStore", ObservedMemoryStore)
+    monkeypatch.setattr(
+        agent,
+        "consume_cron_queue",
+        lambda: side_effects.append("cron:drained") or [QueuedJob()],
+    )
+    monkeypatch.setattr(
+        agent,
+        "inject_background_notifications",
+        lambda messages: side_effects.append("background:drained"),
+    )
+    monkeypatch.setattr(agent, "ResearchWorkflow", _single_execution_workflow())
+    runtime = agent.SourceRuntime(provider)
+    runtime.todo_state["rounds_since_todo"] = 3
+
+    assert runtime.run_turn(
+        "question",
+        run_metadata={"task_type": "research"},
+    ) == "public report"
+
+    assert side_effects == []
+    assert runtime.todo_state == {"rounds_since_todo": 3}
+    assert len(provider.requests) == 1
+    assert len(provider.requests[0]["messages"]) == 1
+    assert provider.requests[0]["messages"][0]["role"] == "user"
+    assert "external scheduled work" not in repr(provider.requests[0]["messages"])
+    assert "PRIVATE MEMORY" not in repr(provider.requests[0]["messages"])
+
+
+def test_research_policy_proactive_compaction_is_local_only(
+    source_loop,
+    monkeypatch,
+):
+    provider = ScriptedProvider([
+        ProviderResponse([TextBlock(text="private notes")], "end_turn")
+    ])
+    summary_calls = []
+    monkeypatch.setattr(agent.config, "CONTEXT_LIMIT", 450)
+    monkeypatch.setattr(
+        context,
+        "summarize_history",
+        lambda messages: summary_calls.append(messages) or "MODEL SUMMARY",
+    )
+    messages = [
+        {"role": "user", "content": f"message-{index}-" + "x" * 100}
+        for index in range(8)
+    ]
+
+    outcome = agent.agent_loop(
+        messages,
+        {},
+        provider=provider,
+        tools=[],
+        handlers={},
+        memory_enabled=True,
+        system_prompt="RESEARCH SYSTEM",
+        execution_policy=agent.AgentExecutionPolicy.RESEARCH_ISOLATED,
+    )
+
+    assert outcome.status == "completed"
+    assert summary_calls == []
+    assert len(provider.requests) == 1
+    assert "Locally compacted" in repr(provider.requests[0]["messages"])
+    assert "MODEL SUMMARY" not in repr(provider.requests[0]["messages"])
+
+
+def test_research_policy_reactive_compaction_uses_only_main_provider_calls(
+    source_loop,
+    monkeypatch,
+):
+    class ReactiveProvider:
+        def __init__(self):
+            self.requests = []
+
+        def create(self, messages, system, tools, max_tokens, model=None):
+            self.requests.append({
+                "messages": copy.deepcopy(messages),
+                "system": system,
+                "tools": copy.deepcopy(tools),
+            })
+            if len(self.requests) == 1:
+                raise ContextLengthError("maximum context length exceeded")
+            if system == "" and tools == []:
+                return ProviderResponse(
+                    [TextBlock(text="MODEL COMPACTION SUMMARY")],
+                    "end_turn",
+                )
+            return ProviderResponse([TextBlock(text="private notes")], "end_turn")
+
+    provider = ReactiveProvider()
+    monkeypatch.setattr(context, "client", provider)
+    messages = [
+        {"role": "user", "content": f"message-{index}"}
+        for index in range(7)
+    ]
+
+    outcome = agent.agent_loop(
+        messages,
+        {},
+        provider=provider,
+        tools=[],
+        handlers={},
+        system_prompt="RESEARCH SYSTEM",
+        execution_policy=agent.AgentExecutionPolicy.RESEARCH_ISOLATED,
+    )
+
+    assert outcome.status == "completed"
+    assert outcome.final_text == "private notes"
+    assert len(provider.requests) == 2
+    assert all(request["system"] != "" for request in provider.requests)
+    assert "MODEL COMPACTION SUMMARY" not in repr(messages)
+
+
+def test_research_policy_fails_controlled_when_local_compaction_cannot_fit(
+    source_loop,
+    monkeypatch,
+):
+    provider = ScriptedProvider([
+        ProviderResponse([TextBlock(text="must not run")], "end_turn")
+    ])
+    monkeypatch.setattr(agent.config, "CONTEXT_LIMIT", 20)
+    messages = [{"role": "user", "content": "x" * 1_000}]
+
+    outcome = agent.agent_loop(
+        messages,
+        {},
+        provider=provider,
+        tools=[],
+        handlers={},
+        system_prompt="RESEARCH SYSTEM",
+        execution_policy=agent.AgentExecutionPolicy.RESEARCH_ISOLATED,
+    )
+
+    assert outcome.status == "failed"
+    assert outcome.failure_class == "LocalContextLimitExceeded"
+    assert provider.requests == []
+
+
+def test_research_policy_requires_explicit_stage_prompt():
+    provider = ScriptedProvider([
+        ProviderResponse([TextBlock(text="must not run")], "end_turn")
+    ])
+
+    with pytest.raises(ValueError, match="explicit system prompt"):
+        agent.agent_loop(
+            [{"role": "user", "content": "research"}],
+            {},
+            provider=provider,
+            tools=[],
+            handlers={},
+            execution_policy=agent.AgentExecutionPolicy.RESEARCH_ISOLATED,
+        )
+
+    assert provider.requests == []
 
 
 def _single_execution_workflow():
@@ -810,6 +1095,7 @@ def test_untraced_explicit_research_injects_cutoff(monkeypatch):
         run_metadata={"task_type": "research"},
     ) == "public report"
     assert seen == [{"query": "q", "cutoff": "2025-05-01"}]
+    assert runtime.todo_state == {"rounds_since_todo": 0}
 
 
 def test_untraced_explicit_research_rejects_cutoff_mismatch(monkeypatch):

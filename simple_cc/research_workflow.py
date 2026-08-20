@@ -800,20 +800,36 @@ class ResearchWorkflow:
         except TraceWriteError:
             raise
         except Exception as error:
-            self._record_during_error("writing_attempt_finished", {
-                "attempt": attempt,
-                "repair": repair,
-                "status": "failed",
-                "failure_class": _bounded_trace_text(
-                    getattr(error, "failure_class", None)
-                    or type(error).__name__,
-                    _WRITING_FAILURE_CLASS_CHARS_MAX,
-                ),
-                "failure_message": _bounded_trace_text(
-                    getattr(error, "failure_message", None) or error,
-                    _WRITING_FAILURE_MESSAGE_CHARS_MAX,
-                ),
-            })
+            try:
+                self._record_during_error("writing_attempt_finished", {
+                    "attempt": attempt,
+                    "repair": repair,
+                    "status": "failed",
+                    "failure_class": _bounded_trace_text(
+                        getattr(error, "failure_class", None)
+                        or type(error).__name__,
+                        _WRITING_FAILURE_CLASS_CHARS_MAX,
+                    ),
+                    "failure_message": _bounded_trace_text(
+                        getattr(error, "failure_message", None) or error,
+                        _WRITING_FAILURE_MESSAGE_CHARS_MAX,
+                    ),
+                })
+            except TraceWriteError as trace_error:
+                note = (
+                    "writing_attempt_finished trace failed: "
+                    + _bounded_trace_text(
+                        trace_error,
+                        _WRITING_FAILURE_MESSAGE_CHARS_MAX,
+                    )
+                )
+                add_note = getattr(error, "add_note", None)
+                if callable(add_note):
+                    try:
+                        add_note(note)
+                    except Exception:
+                        pass
+                raise error from trace_error
             raise
         self._record("writing_attempt_finished", {
             "attempt": attempt,

@@ -26,12 +26,12 @@ The prompt had a separate mismatch: `research_execution_prompt()` delegated to `
 - Imports the existing `simple_cc.evidence.RESEARCH_TOOLS` as the single allowlist source.
 - Builds a deterministic definition/handler key intersection from the current runtime; it never reinjects a missing global tool.
 - Passes that same intersection to the research `agent_loop()` and its prompt.
-- Enables a research-only strict allowlist check before cutoff processing, permissions, hooks, background dispatch, or handler lookup. Hallucinated non-stage tools receive a synchronous `tool_not_available` result and cannot execute.
+- Enables the explicit research-isolated execution policy before cutoff processing, permissions, hooks, background dispatch, or handler lookup. Hallucinated non-stage tools receive a synchronous `tool_not_available` result and cannot execute.
 - Leaves the ordinary route on the complete runtime definitions/handlers and the default non-strict loop behavior.
 
 Call chain after the change:
 
-`SourceRuntime.run_turn(research)` -> `_research_tool_view(runtime tables)` -> `research_execution_prompt(tool_names)` + `agent_loop(tools, handlers, strict_tool_allowlist=True)` -> foreground-only `web_search` / `web_fetch` / `pdf_fetch` configured intersection -> research gate.
+`SourceRuntime.run_turn(research)` -> `_research_tool_view(runtime tables)` -> `research_execution_prompt(tool_names)` + `agent_loop(tools, handlers, execution_policy=RESEARCH_ISOLATED)` -> foreground-only `web_search` / `web_fetch` / `pdf_fetch` configured intersection -> research gate.
 
 ### `simple_cc/prompts.py`
 
@@ -63,3 +63,39 @@ Covered behaviors include custom-runtime intersection, default SourceRuntime tab
 - `git diff --check`: clean (Git emitted only configured LF-to-CRLF warnings).
 
 Clean-status and commit evidence is recorded in the task handoff after commit.
+
+## Fix Round 1: close remaining isolation gaps
+
+### Baseline and review findings
+
+- Verified exact clean baseline `535e2ccb98568de83fdfd36fc95df77f9547b8e9` before the fix round.
+- The independent review found four gaps: conditional prompt content still named unavailable tools and loaded skills/memory; the research agent loop still shared memory/cron/background/todo and model compaction; malformed/duplicate tool definitions were not fail-closed; and a failed-event `TraceWriteError` could replace the provider exception.
+- Production scope expanded, as approved, only to `simple_cc/context.py` for explicit model-summary suppression and bounded local compaction.
+- The accepted embedded-scheme scanner limitation remained untouched.
+
+### Final implementation
+
+- Research prompt rules are generated from the exact validated tool tuple. Cutoff instructions enumerate only present tools, and PDF instructions exist only when `pdf_fetch` exists. The research profile neither scans/lists skills nor injects memories; ordinary prompt defaults remain unchanged.
+- `AgentExecutionPolicy.RESEARCH_ISOLATED` now owns the complete stage boundary. It requires an explicit research system prompt, forces memory off, does not drain cron/background queues, does not inject notifications or todo reminders, does not mutate shared todo state, and bypasses background-result collection at the end of tool rounds.
+- Proactive and reactive research compaction call only local bounded transforms (`allow_model_summary=False`). They retain a complete recent tail where possible and return controlled `LocalContextLimitExceeded` without another provider call if the newest complete unit cannot fit. Ordinary compaction defaults remain model-enabled.
+- `_research_tool_view()` validates dict shape, non-empty allowed string names, string descriptions, dict schemas, callable configured handlers, and duplicate consistency before exposing a tool. Malformed/unhashable entries are skipped; a conflicting same-name occurrence excludes that name. Research prompt construction no longer touches `state_builder()` or the unvalidated full registry.
+- When a provider error and failed-finished trace write both fail, the identical provider exception remains primary, receives a bounded audit note when supported, and has the `TraceWriteError` as `__cause__`. Standalone trace failures and direct write/rewrite `TraceWriteError` objects still propagate unchanged.
+
+### Fix Round 1 TDD and verification
+
+- Initial focused RED: `13 failed, 3 passed`, with failures covering all four review findings. The three passes characterized already-correct direct trace identity and safe identical-duplicate/empty behavior.
+- Additional explicit-prompt RED: `1 failed` before the fail-closed system-prompt requirement.
+- Focused GREEN after all safeguards: `20 passed`.
+- Affected modules: `171 passed`.
+- Full suite: `457 passed, 1 deselected` using only the approved linked-worktree source-map deselection.
+
+### Fix Round 1 file-by-file scope
+
+- `simple_cc/agent.py`: validates the configured research-tool intersection, constructs the prompt from that validated view, and enforces the explicit isolated execution policy around memory, queues, todo state, tool dispatch, and compaction.
+- `simple_cc/context.py`: adds the opt-out from model-generated summaries plus a bounded local-only compactor; existing callers retain model compaction by default.
+- `simple_cc/prompts.py`: conditionally renders research rules from the exact tool tuple and disables skill/memory catalogs only for the research execution profile.
+- `simple_cc/research_workflow.py`: preserves the provider exception as primary when writing its failed-attempt event also raises `TraceWriteError`.
+- `tests/test_agent_loop_source.py`: covers malformed and conflicting registries, default-runtime isolation, unavailable-tool rejection, memory/queue/todo separation, and proactive/reactive/local-limit behavior.
+- `tests/test_context_prompts.py`: covers conditional tool rules, empty intersections, and the absence of research skill/memory catalog work.
+- `tests/test_research_workflow.py`: covers attempt 1/2 provider-plus-trace double failures and direct `TraceWriteError` identity.
+- `.superpowers/sdd/2026-08-19-routed-research-workflow/hardening-e-report.md`: records the review findings, RED/GREEN evidence, implementation boundaries, and final verification.

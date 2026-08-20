@@ -26,6 +26,10 @@ class CompactionReport:
     transcript_path: str
 
 
+class LocalContextLimitExceeded(RuntimeError):
+    """The isolated local compactor could not produce a provider-safe context."""
+
+
 class SkillStore:
     def __init__(self, roots: list[Path]):
         self.roots = [Path(root) for root in roots]
@@ -324,7 +328,14 @@ def compact_history(
     *,
     on_compaction: Callable[[CompactionReport], None] | None = None,
     method: str = "manual",
+    allow_model_summary: bool = True,
 ) -> list:
+    if not allow_model_summary:
+        return _local_compact_history(
+            messages,
+            on_compaction=on_compaction,
+            method=method,
+        )
     original_count = len(messages)
     original_chars = estimate_size(messages)
     transcript = write_transcript(messages)
@@ -345,11 +356,76 @@ def compact_history(
     return retained
 
 
+def _local_compact_history(
+    messages: list,
+    *,
+    on_compaction: Callable[[CompactionReport], None] | None,
+    method: str,
+) -> list:
+    original_count = len(messages)
+    original_chars = estimate_size(messages)
+    transcript = write_transcript(messages)
+    print(f"  \033[36m[local compact] transcript saved: {transcript}\033[0m")
+    tail_start = max(0, len(messages) - 5)
+    if (
+        tail_start > 0
+        and tail_start < len(messages)
+        and is_tool_result_message(messages[tail_start])
+        and message_has_tool_use(messages[tail_start - 1])
+    ):
+        tail_start -= 1
+    tail = list(messages[tail_start:])
+    marker = {
+        "role": "user",
+        "content": (
+            "[Locally compacted]\n\n"
+            "Earlier messages were archived without a model-generated summary."
+        ),
+    }
+    retained = [marker, *tail]
+    while len(tail) > 1 and estimate_size(retained) > config.CONTEXT_LIMIT:
+        remove_count = 1
+        if message_has_tool_use(tail[0]):
+            while (
+                remove_count < len(tail)
+                and is_tool_result_message(tail[remove_count])
+            ):
+                remove_count += 1
+        if remove_count >= len(tail):
+            break
+        del tail[:remove_count]
+        retained = [marker, *tail]
+    retained_chars = estimate_size(retained)
+    if retained_chars > config.CONTEXT_LIMIT:
+        raise LocalContextLimitExceeded(
+            "isolated context remains over the local compaction limit"
+        )
+    if on_compaction is not None:
+        on_compaction(
+            CompactionReport(
+                method,
+                original_count,
+                len(retained),
+                original_chars,
+                retained_chars,
+                str(transcript),
+            )
+        )
+    return retained
+
+
 def reactive_compact(
     messages: list,
     *,
     on_compaction: Callable[[CompactionReport], None] | None = None,
+    allow_model_summary: bool = True,
 ) -> list:
+    if not allow_model_summary:
+        return _local_compact_history(
+            messages,
+            on_compaction=on_compaction,
+            method="reactive",
+        )
     original_count = len(messages)
     original_chars = estimate_size(messages)
     transcript = write_transcript(messages)
@@ -392,6 +468,7 @@ def prepare_context(
     messages: list,
     *,
     on_compaction: Callable[[CompactionReport], None] | None = None,
+    allow_model_summary: bool = True,
 ) -> list:
     """Run every model turn through S20's layered context budget."""
     messages[:] = tool_result_budget(messages)
@@ -399,7 +476,10 @@ def prepare_context(
     messages[:] = micro_compact(messages)
     if estimate_size(messages) > config.CONTEXT_LIMIT:
         messages[:] = compact_history(
-            messages, on_compaction=on_compaction, method="proactive"
+            messages,
+            on_compaction=on_compaction,
+            method="proactive",
+            allow_model_summary=allow_model_summary,
         )
     return messages
 

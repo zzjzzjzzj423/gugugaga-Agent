@@ -72,6 +72,52 @@ PROMPT_SECTIONS = {
     ),
 }
 
+
+def _research_rules(tool_names: tuple[str, ...]) -> str:
+    available = set(tool_names)
+    lines = ["Web research rules:"]
+    if not available:
+        lines.append("- No research tools are available in this stage.")
+        return "\n".join(lines)
+
+    if "web_search" in available and "web_fetch" in available:
+        lines.extend((
+            "- Use web_search to find candidate sources, then use web_fetch to "
+            "inspect candidate pages before making claims.",
+            "- Search snippets are leads, not evidence.",
+        ))
+    elif "web_search" in available:
+        lines.extend((
+            "- Use web_search to find candidate sources.",
+            "- Search snippets are leads, not verified evidence.",
+        ))
+    elif "web_fetch" in available:
+        lines.append(
+            "- Use web_fetch to inspect supplied candidate pages before making claims."
+        )
+
+    cutoff_tools = ", ".join(tool_names)
+    lines.append(
+        "- If the user provides a cutoff date, pass the same cutoff to "
+        f"{cutoff_tools}."
+    )
+    if "pdf_fetch" in available:
+        lines.extend((
+            "- Use pdf_fetch for PDF URLs and read bounded page ranges; continue "
+            "only when has_more is true and more evidence is needed.",
+            "- Cite PDF evidence with its source URL and page number.",
+            "- If pdf_fetch reports ocr_required, explain that scanned PDFs are "
+            "unsupported.",
+        ))
+    lines.extend((
+        "- Do not use evidence with a verified publication date after the cutoff.",
+        "- Treat an unknown publication date as uncertain evidence and disclose "
+        "that limitation in the answer.",
+        "- Include source URLs for research claims. Live search is non-strict PIT "
+        "and is not equivalent to a frozen historical corpus.",
+    ))
+    return "\n".join(lines)
+
 SUB_SYSTEM = (
     f"You are a workspace subagent at {config.WORKDIR}. "
     "Complete the assigned workspace task, respect permissions, and return "
@@ -96,8 +142,11 @@ def assemble_system_prompt(
     include_research: bool = False,
     stage_context: dict | None = None,
     tool_names: tuple[str, ...] | None = None,
+    include_skill_catalog: bool = True,
+    include_memories: bool = True,
 ) -> str:
-    scan_skills()
+    if include_skill_catalog:
+        scan_skills()
     tools_section = PROMPT_SECTIONS["tools"]
     if tool_names is not None:
         tools_section = "Available tools: " + (
@@ -109,7 +158,11 @@ def assemble_system_prompt(
         f"Working directory: {config.WORKDIR}",
     ]
     if include_research:
-        sections.append(PROMPT_SECTIONS["research"])
+        sections.append(
+            PROMPT_SECTIONS["research"]
+            if tool_names is None
+            else _research_rules(tool_names)
+        )
     if stage_context is not None:
         sections.append(
             "Research stage context (JSON):\n"
@@ -118,12 +171,13 @@ def assemble_system_prompt(
     sections.append(
         f"Current time: {datetime.now().isoformat(timespec='seconds')}"
     )
-    sections.append(
-        "Skills catalog:\n"
-        + list_skills()
-        + "\nUse load_skill(name) when a skill is relevant."
-    )
-    if context.get("memories"):
+    if include_skill_catalog:
+        sections.append(
+            "Skills catalog:\n"
+            + list_skills()
+            + "\nUse load_skill(name) when a skill is relevant."
+        )
+    if include_memories and context.get("memories"):
         sections.append(
             f"Relevant memories:\n{context['memories']}\n\n"
             "This is a lightweight availability catalog; entries are not "
@@ -152,6 +206,8 @@ def research_execution_prompt(
         identity=RESEARCH_IDENTITY,
         include_research=True,
         tool_names=tool_names,
+        include_skill_catalog=False,
+        include_memories=False,
         stage_context={
             "question": question,
             "cutoff": cutoff,

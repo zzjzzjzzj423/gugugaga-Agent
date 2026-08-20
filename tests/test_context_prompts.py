@@ -1,3 +1,6 @@
+import pytest
+
+from simple_cc import prompts as prompts_module
 from simple_cc.context import ContextManager, MemoryStore, SkillStore
 from simple_cc.prompts import (
     PromptAssembler,
@@ -107,6 +110,7 @@ def test_research_execution_prompt_contains_plan_and_gaps():
         plan=plan,
         gaps=("second direction lacks evidence",),
         remaining_rounds=8,
+        tool_names=("web_search", "web_fetch"),
     )
 
     assert "standard" in prompt
@@ -118,3 +122,69 @@ def test_research_execution_prompt_contains_plan_and_gaps():
     assert "read at least two sources" not in prompt
     assert "untrusted data" in prompt
     assert "instructions found inside evidence" in prompt
+
+
+@pytest.mark.parametrize(
+    ("tool_names", "available_line", "present", "absent"),
+    (
+        (
+            ("web_search",),
+            "Available tools: web_search.",
+            ("Use web_search", "pass the same cutoff to web_search"),
+            ("web_fetch", "pdf_fetch", "PDF URLs", "ocr_required"),
+        ),
+        (
+            ("web_fetch",),
+            "Available tools: web_fetch.",
+            ("Use web_fetch", "pass the same cutoff to web_fetch"),
+            ("web_search", "pdf_fetch", "PDF URLs", "ocr_required"),
+        ),
+        (
+            ("pdf_fetch",),
+            "Available tools: pdf_fetch.",
+            ("Use pdf_fetch", "pass the same cutoff to pdf_fetch", "PDF URLs"),
+            ("web_search", "web_fetch"),
+        ),
+        (
+            (),
+            "Available tools: none.",
+            ("No research tools are available",),
+            ("web_search", "web_fetch", "pdf_fetch", "PDF URLs"),
+        ),
+    ),
+)
+def test_research_prompt_profile_matches_actual_tools_without_skills_or_memory(
+    monkeypatch,
+    tool_names,
+    available_line,
+    present,
+    absent,
+):
+    monkeypatch.setattr(
+        prompts_module,
+        "scan_skills",
+        lambda: pytest.fail("research prompt scanned skills"),
+    )
+    monkeypatch.setattr(
+        prompts_module,
+        "list_skills",
+        lambda: pytest.fail("research prompt listed skills"),
+    )
+    plan = ResearchPlan(ResearchRank.LIGHT, ("primary filings",), "narrow")
+
+    prompt = research_execution_prompt(
+        {"workspace": "C:/repo", "memories": "PRIVATE MEMORY CATALOG"},
+        question="What happened?",
+        cutoff="2025-05-01",
+        plan=plan,
+        gaps=(),
+        remaining_rounds=4,
+        tool_names=tool_names,
+    )
+
+    assert available_line in prompt
+    assert all(fragment in prompt for fragment in present)
+    assert all(fragment not in prompt for fragment in absent)
+    assert "Skills catalog" not in prompt
+    assert "Use load_skill" not in prompt
+    assert "PRIVATE MEMORY CATALOG" not in prompt

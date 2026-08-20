@@ -2015,6 +2015,124 @@ def test_writing_finished_trace_failure_preserves_identity_and_skips_gate(
     assert not [row for row in rows if row["event_type"] == "writing_gate"]
 
 
+@pytest.mark.parametrize("failed_attempt", (1, 2))
+def test_provider_error_remains_primary_when_failed_finished_trace_also_fails(
+    tmp_path,
+    monkeypatch,
+    failed_attempt,
+):
+    registry = registry_with_two_sources()
+    provider_error = RuntimeError(f"writer {failed_attempt} offline")
+    responses = [
+        light_plan_response(),
+        gate_response(registry, covered=True),
+    ]
+    if failed_attempt == 2:
+        responses.append(ModelResponse("unsupported draft"))
+    responses.append(provider_error)
+    provider = ScriptedProvider(responses)
+    recorder = TraceRecorder(tmp_path / "run", run_id=f"writing-{failed_attempt}-double")
+    recorder.start_run(
+        task_id="research-task",
+        question="question",
+        cutoff="2025-05-01",
+        metadata={"task_type": "research"},
+    )
+    run = RunContext(
+        recorder,
+        f"writing-{failed_attempt}-double",
+        "research-task",
+        "2025-05-01",
+    )
+    trace_error = TraceWriteError("failed finished trace unavailable")
+    original_record = recorder.record
+
+    def fail_failed_finished(event_type, payload, **kwargs):
+        if (
+            event_type == "writing_attempt_finished"
+            and payload.get("status") == "failed"
+        ):
+            raise trace_error
+        return original_record(event_type, payload, **kwargs)
+
+    monkeypatch.setattr(recorder, "record", fail_failed_finished)
+    workflow = ResearchWorkflow(
+        provider,
+        lambda prompt, max_rounds, evidence_registry: AgentLoopOutcome(
+            "completed", "notes", rounds_used=1
+        ),
+        run_context=run,
+    )
+
+    with bind_run_context(run), pytest.raises(RuntimeError) as caught:
+        workflow.run("question", "2025-05-01", registry=registry)
+
+    assert caught.value is provider_error
+    assert caught.value.__cause__ is trace_error
+    assert any(
+        "writing_attempt_finished trace failed" in note
+        for note in getattr(caught.value, "__notes__", ())
+    )
+
+
+@pytest.mark.parametrize("failed_attempt", (1, 2))
+def test_direct_writing_trace_error_is_rethrown_unchanged(
+    tmp_path,
+    monkeypatch,
+    failed_attempt,
+):
+    registry = registry_with_two_sources()
+    responses = [
+        light_plan_response(),
+        gate_response(registry, covered=True),
+    ]
+    if failed_attempt == 2:
+        responses.append(ModelResponse("unsupported draft"))
+    provider = ScriptedProvider(responses)
+    recorder = TraceRecorder(tmp_path / "run", run_id=f"writing-{failed_attempt}-direct")
+    recorder.start_run(
+        task_id="research-task",
+        question="question",
+        cutoff="2025-05-01",
+        metadata={"task_type": "research"},
+    )
+    run = RunContext(
+        recorder,
+        f"writing-{failed_attempt}-direct",
+        "research-task",
+        "2025-05-01",
+    )
+    workflow = ResearchWorkflow(
+        provider,
+        lambda prompt, max_rounds, evidence_registry: AgentLoopOutcome(
+            "completed", "notes", rounds_used=1
+        ),
+        run_context=run,
+    )
+    trace_error = TraceWriteError(f"writing attempt {failed_attempt} trace failure")
+
+    def fail_directly(*args, **kwargs):
+        raise trace_error
+
+    monkeypatch.setattr(
+        workflow,
+        "write" if failed_attempt == 1 else "rewrite",
+        fail_directly,
+    )
+
+    with bind_run_context(run), pytest.raises(TraceWriteError) as caught:
+        workflow.run("question", "2025-05-01", registry=registry)
+
+    assert caught.value is trace_error
+    rows, incomplete = read_trace_lines(recorder.trajectory_path)
+    assert incomplete is False
+    assert not [
+        row for row in rows
+        if row["event_type"] == "writing_attempt_finished"
+        and row["payload"]["attempt"] == failed_attempt
+    ]
+
+
 def test_research_and_writing_retry_flags_are_independent():
     registry = EvidenceRegistry()
     provider = ScriptedProvider([
