@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Callable
 
 from . import config
-from .evidence import validate_research_final
+from .evidence import EVIDENCE_URL_CHARS_MAX, validate_research_final
 from .models import ChatProvider
 from .research_models import (
     DirectionAssessment,
@@ -17,6 +17,7 @@ from .research_models import (
     ResearchPlan,
     ResearchRank,
     ResearchWorkflowResult,
+    RANK_POLICIES,
 )
 from .telemetry import model_call_scope
 from .trace import RunContext
@@ -44,7 +45,7 @@ _FENCED_JSON = re.compile(
 EVIDENCE_PACKET_MAX_RECORDS = 32
 EVIDENCE_PACKET_TOTAL_CHARS_MAX = 48_000
 EVIDENCE_PACKET_SOURCE_ID_CHARS_MAX = 80
-EVIDENCE_PACKET_URL_CHARS_MAX = 2_048
+EVIDENCE_PACKET_URL_CHARS_MAX = EVIDENCE_URL_CHARS_MAX
 EVIDENCE_PACKET_DOMAIN_CHARS_MAX = 255
 EVIDENCE_PACKET_TITLE_CHARS_MAX = 512
 EVIDENCE_PACKET_TEXT_CHARS_MAX = 1_200
@@ -197,13 +198,10 @@ def _packet_record(
     ) or ""
     return {
         "source_id": source_id,
-        "url": _bounded_packet_value(
-            item.canonical_url,
-            EVIDENCE_PACKET_URL_CHARS_MAX,
-            source_id=source_id,
-            field_name="url",
-            truncations=truncations,
-        ) or "",
+        # Canonical source identity is never truncated. Ingested records are
+        # bounded before registration; defensive custom over-limit records are
+        # excluded by packet selection instead of mutated here.
+        "url": item.canonical_url,
         "domain": _bounded_packet_value(
             item.domain,
             EVIDENCE_PACKET_DOMAIN_CHARS_MAX,
@@ -250,30 +248,43 @@ def _packet_record(
 
 
 def _ordered_packet_records(registry: EvidenceRegistry) -> list[Any]:
-    records = list(registry.records)
+    records = [
+        item for item in registry.records
+        if (
+            isinstance(item.canonical_url, str)
+            and bool(item.canonical_url)
+            and len(item.canonical_url) <= EVIDENCE_PACKET_URL_CHARS_MAX
+        )
+    ]
     ordered: list[Any] = []
     seen_ids: set[str] = set()
     seen_domains: set[str] = set()
 
-    def add(item: Any) -> None:
+    def add(item: Any) -> bool:
         if item.source_id in seen_ids:
-            return
+            return False
         ordered.append(item)
         seen_ids.add(item.source_id)
         if item.domain:
             seen_domains.add(item.domain)
+        return True
 
-    # Preserve authoritative evidence and domain diversity before filling by
-    # stable registry order. This keeps deep-rank minima representable even in
-    # a registry dominated by repeated domains.
+    deepest_policy = RANK_POLICIES[ResearchRank.DEEP]
+    authoritative_selected = 0
     for item in records:
-        if item.authoritative and item.domain not in seen_domains:
-            add(item)
+        if (
+            item.authoritative
+            and authoritative_selected
+            < deepest_policy.authoritative_source_count
+        ):
+            if add(item):
+                authoritative_selected += 1
     for item in records:
-        if item.domain not in seen_domains:
-            add(item)
-    for item in records:
-        if item.authoritative:
+        if (
+            len(seen_domains) < deepest_policy.distinct_source_count
+            and item.domain
+            and item.domain not in seen_domains
+        ):
             add(item)
     for item in records:
         add(item)
@@ -292,6 +303,12 @@ def _select_evidence_packet(
     for item in ordered:
         if len(packet) >= EVIDENCE_PACKET_MAX_RECORDS:
             break
+        if (
+            not isinstance(item.canonical_url, str)
+            or not item.canonical_url
+            or len(item.canonical_url) > EVIDENCE_PACKET_URL_CHARS_MAX
+        ):
+            continue
         candidate_truncations: list[str] = []
         candidate = _packet_record(item, candidate_truncations)
         tentative = [*packet, candidate]

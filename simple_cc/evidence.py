@@ -27,6 +27,7 @@ from .trace import ArtifactRef, RunContext
 
 RESEARCH_TOOLS = {"web_search", "web_fetch", "pdf_fetch"}
 EVIDENCE_EXCERPT_CHARS = EVIDENCE_CONTENT_CHARS_MAX
+EVIDENCE_URL_CHARS_MAX = 4096
 _HOST_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
 _ALLOWED_DATE_STATUSES = {"unknown", "verified"}
 _MARKER_LIKE_LINE = re.compile(
@@ -418,10 +419,20 @@ def inspect_evidence_result(
     raw_url = payload.get("url")
     if not isinstance(raw_url, str) or not raw_url.strip():
         return _rejected("invalid_url", "fetch URL must be a non-empty string")
+    if len(raw_url) > EVIDENCE_URL_CHARS_MAX:
+        return _rejected(
+            "url_too_long",
+            f"fetch URL exceeds {EVIDENCE_URL_CHARS_MAX} characters",
+        )
     try:
         canonical = canonicalize_url(raw_url)
     except (TypeError, ValueError) as error:
         return _rejected("invalid_url", str(error))
+    if len(canonical) > EVIDENCE_URL_CHARS_MAX:
+        return _rejected(
+            "url_too_long",
+            f"canonical fetch URL exceeds {EVIDENCE_URL_CHARS_MAX} characters",
+        )
 
     title = payload.get("title")
     if title is not None and not isinstance(title, str):
@@ -682,13 +693,24 @@ def record_research_evidence(
     if ingestion is None:
         ingestion = inspect_evidence_result(tool_name, output)
     if ingestion.record is None:
+        raw_rejected_url = (
+            payload.get("url")
+            if isinstance(payload.get("url"), str)
+            else None
+        )
         run.recorder.record(
             "source_rejected",
             {
                 "tool_name": tool_name,
-                "url": payload.get("url")
-                if isinstance(payload.get("url"), str)
-                else None,
+                "url_preview": (
+                    raw_rejected_url[:2048]
+                    if raw_rejected_url is not None
+                    else None
+                ),
+                "url_preview_truncated": bool(
+                    raw_rejected_url is not None
+                    and len(raw_rejected_url) > 2048
+                ),
                 "cutoff": payload.get("cutoff")
                 if isinstance(payload.get("cutoff"), str)
                 else None,
@@ -707,7 +729,7 @@ def record_research_evidence(
         "source_registered",
         {
             "source_id": record.source_id,
-            "canonical_url": record.canonical_url[:2048],
+            "canonical_url": record.canonical_url,
             "domain": record.domain[:255],
             "title": record.title[:512] if record.title is not None else None,
             "tool_name": record.tool_name[:64],

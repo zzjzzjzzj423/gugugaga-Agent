@@ -6,7 +6,11 @@ import pytest
 
 from simple_cc import agent, config
 from simple_cc.agent import AgentLoopOutcome
-from simple_cc.evidence import evidence_record_from_result, source_id_for_url
+from simple_cc.evidence import (
+    evidence_record_from_result,
+    source_id_for_url,
+    validate_research_final,
+)
 from simple_cc.models import ModelResponse, ToolCall
 from simple_cc.research_models import EvidenceRegistry, ResearchPlan, ResearchRank
 from simple_cc.research_workflow import (
@@ -255,6 +259,92 @@ def test_evidence_packet_is_deterministic_diverse_and_aggregate_bounded():
         and len(item["title"] or "") <= EVIDENCE_PACKET_TITLE_CHARS_MAX
         and len(item["content_excerpt"]) <= EVIDENCE_PACKET_TEXT_CHARS_MAX
         for item in first
+    )
+
+
+def test_packet_preserves_2070_character_canonical_url_and_citation_linkage():
+    long_url = "https://example.com/" + "a" * 2050
+    other_url = "https://other.example/report"
+    assert len(long_url) == 2070
+    registry = EvidenceRegistry()
+    for url in (long_url, other_url):
+        record = evidence_record_from_result(
+            "web_fetch",
+            json.dumps({
+                "ok": True,
+                "operation": "fetch",
+                "url": url,
+                "title": "Exact URL evidence",
+                "content": "direct evidence",
+                "published_at": "2025-01-02",
+                "date_status": "verified",
+                "cutoff": "2025-05-01",
+            }),
+        )
+        assert record is not None
+        registry.register(record)
+    registry.mark_authority(
+        source_id_for_url(long_url), True, "official first-party record"
+    )
+
+    packet = build_evidence_packet(registry)
+
+    assert EVIDENCE_PACKET_URL_CHARS_MAX >= len(long_url)
+    assert long_url in {item["url"] for item in packet}
+    assert validate_research_final(
+        f"Report {long_url} {other_url}", registry, light_plan()
+    ) == []
+    assert len(json.dumps(packet, ensure_ascii=False, sort_keys=True)) <= (
+        EVIDENCE_PACKET_TOTAL_CHARS_MAX
+    )
+
+
+def test_packet_reserves_two_same_domain_authorities_before_diverse_fill():
+    registry = EvidenceRegistry()
+    authority_ids = set()
+    for index in range(2):
+        url = f"https://official.example/filing-{index}"
+        record = evidence_record_from_result(
+            "web_fetch",
+            json.dumps({
+                "ok": True,
+                "operation": "fetch",
+                "url": url,
+                "title": f"Official filing {index}",
+                "content": "authoritative evidence",
+                "published_at": "2025-01-02",
+                "date_status": "verified",
+                "cutoff": "2025-05-01",
+            }),
+        )
+        assert record is not None
+        registered = registry.register(record)
+        registry.mark_authority(registered.source_id, True, "official filing")
+        authority_ids.add(registered.source_id)
+    for index in range(38):
+        record = evidence_record_from_result(
+            "web_fetch",
+            json.dumps({
+                "ok": True,
+                "operation": "fetch",
+                "url": f"https://domain-{index}.example/report",
+                "title": "Independent evidence",
+                "content": "independent evidence",
+                "published_at": "2025-01-02",
+                "date_status": "verified",
+                "cutoff": "2025-05-01",
+            }),
+        )
+        assert record is not None
+        registry.register(record)
+
+    packet = build_evidence_packet(registry)
+
+    assert authority_ids <= {item["source_id"] for item in packet}
+    assert len({item["domain"] for item in packet}) >= 4
+    assert len(packet) <= EVIDENCE_PACKET_MAX_RECORDS
+    assert len(json.dumps(packet, ensure_ascii=False, sort_keys=True)) <= (
+        EVIDENCE_PACKET_TOTAL_CHARS_MAX
     )
 
 

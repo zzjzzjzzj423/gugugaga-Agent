@@ -518,6 +518,70 @@ def _run_single_fetch_result(tmp_path, run_id, tool_name, output):
     return recorder, outcome, registry, rows, incomplete
 
 
+def test_overlong_canonical_url_is_rejected_and_traced(tmp_path):
+    url = "https://example.com/" + "x" * (4097 - 20)
+    assert len(url) == 4097
+    output = json.dumps({
+        "ok": True,
+        "operation": "fetch",
+        "url": url,
+        "title": "Too long identity",
+        "content": "evidence that must not register",
+        "published_at": "2025-01-02",
+        "date_status": "verified",
+        "cutoff": "2025-05-01",
+    })
+
+    _, outcome, registry, rows, incomplete = _run_single_fetch_result(
+        tmp_path,
+        "overlong-url",
+        "web_fetch",
+        output,
+    )
+
+    assert incomplete is False
+    assert outcome.status == "completed"
+    assert registry.records == ()
+    assert not any(row["event_type"] == "source_registered" for row in rows)
+    rejected = next(
+        row for row in rows if row["event_type"] == "source_rejected"
+    )
+    assert rejected["payload"]["reason_code"] == "url_too_long"
+    assert "4096" in rejected["payload"]["reason"]
+    assert len(rejected["payload"]["url_preview"]) == 2048
+    assert rejected["payload"]["url_preview_truncated"] is True
+
+
+def test_2070_character_registered_canonical_url_trace_is_exact(tmp_path):
+    url = "https://example.com/" + "x" * 2050
+    assert len(url) == 2070
+    output = json.dumps({
+        "ok": True,
+        "operation": "fetch",
+        "url": url,
+        "title": "Long exact identity",
+        "content": "registered evidence",
+        "published_at": "2025-01-02",
+        "date_status": "verified",
+        "cutoff": "2025-05-01",
+    })
+
+    _, outcome, registry, rows, incomplete = _run_single_fetch_result(
+        tmp_path,
+        "long-exact-url",
+        "web_fetch",
+        output,
+    )
+
+    assert incomplete is False
+    assert outcome.status == "completed"
+    assert registry.records[0].canonical_url == url
+    registered = next(
+        row for row in rows if row["event_type"] == "source_registered"
+    )
+    assert registered["payload"]["canonical_url"] == url
+
+
 def test_pdf_range_keeps_usable_pages_and_accepts_blank_neighbors(tmp_path):
     output = json.dumps({
         "ok": True,
