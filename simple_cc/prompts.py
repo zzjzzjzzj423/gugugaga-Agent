@@ -95,11 +95,17 @@ def assemble_system_prompt(
     identity: str = ORDINARY_IDENTITY,
     include_research: bool = False,
     stage_context: dict | None = None,
+    tool_names: tuple[str, ...] | None = None,
 ) -> str:
     scan_skills()
+    tools_section = PROMPT_SECTIONS["tools"]
+    if tool_names is not None:
+        tools_section = "Available tools: " + (
+            ", ".join(tool_names) if tool_names else "none"
+        ) + "."
     sections = [
         identity,
-        PROMPT_SECTIONS["tools"],
+        tools_section,
         f"Working directory: {config.WORKDIR}",
     ]
     if include_research:
@@ -138,12 +144,14 @@ def research_execution_prompt(
     plan,
     gaps: tuple[str, ...],
     remaining_rounds: int,
+    tool_names: tuple[str, ...] | None = None,
 ) -> str:
     policy = plan.policy
     return assemble_system_prompt(
         context,
         identity=RESEARCH_IDENTITY,
         include_research=True,
+        tool_names=tool_names,
         stage_context={
             "question": question,
             "cutoff": cutoff,

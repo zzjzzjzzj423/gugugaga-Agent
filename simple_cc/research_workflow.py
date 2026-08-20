@@ -54,6 +54,8 @@ EVIDENCE_PACKET_OMITTED_IDS_MAX = 32
 EVIDENCE_PACKET_TRUNCATIONS_MAX = 64
 _GATE_REASON_CHARS_MAX = 512
 _GATE_GAPS_MAX = 16
+_WRITING_FAILURE_CLASS_CHARS_MAX = 128
+_WRITING_FAILURE_MESSAGE_CHARS_MAX = 512
 
 
 @dataclass(frozen=True)
@@ -96,6 +98,14 @@ def _safe_repr(value: Any) -> str:
         return repr(value)
     except Exception:
         return f"<{type(value).__name__}>"
+
+
+def _bounded_trace_text(value: Any, max_chars: int) -> str:
+    try:
+        text = str(value)
+    except Exception:
+        text = f"<{type(value).__name__}>"
+    return " ".join(text.split())[:max_chars]
 
 
 def _trace_round_count(value: Any) -> int | str | bool | None:
@@ -779,6 +789,41 @@ class ResearchWorkflow:
         except Exception:
             pass
 
+    def _call_writing_attempt(
+        self,
+        attempt: int,
+        repair: bool,
+        call: Callable[[], str],
+    ) -> str:
+        try:
+            text = call()
+        except TraceWriteError:
+            raise
+        except Exception as error:
+            self._record_during_error("writing_attempt_finished", {
+                "attempt": attempt,
+                "repair": repair,
+                "status": "failed",
+                "failure_class": _bounded_trace_text(
+                    getattr(error, "failure_class", None)
+                    or type(error).__name__,
+                    _WRITING_FAILURE_CLASS_CHARS_MAX,
+                ),
+                "failure_message": _bounded_trace_text(
+                    getattr(error, "failure_message", None) or error,
+                    _WRITING_FAILURE_MESSAGE_CHARS_MAX,
+                ),
+            })
+            raise
+        self._record("writing_attempt_finished", {
+            "attempt": attempt,
+            "repair": repair,
+            "status": "completed",
+            "failure_class": None,
+            "failure_message": None,
+        })
+        return text
+
     def _record_packet_selection(
         self,
         stage: str,
@@ -1327,14 +1372,18 @@ class ResearchWorkflow:
             "supplemental_research_used": supplemental_used,
             "writing_repair_used": False,
         })
-        draft = self.write(
-            question,
-            cutoff,
-            plan,
-            evidence_registry,
-            gate.gaps,
-            _evidence_selection=final_selection,
-            _gate_attempt=final_gate_attempt,
+        draft = self._call_writing_attempt(
+            1,
+            False,
+            lambda: self.write(
+                question,
+                cutoff,
+                plan,
+                evidence_registry,
+                gate.gaps,
+                _evidence_selection=final_selection,
+                _gate_attempt=final_gate_attempt,
+            ),
         )
         errors = validate_research_final(
             draft,
@@ -1370,16 +1419,20 @@ class ResearchWorkflow:
                 "supplemental_research_used": supplemental_used,
                 "writing_repair_used": True,
             })
-            draft = self.rewrite(
-                question,
-                cutoff,
-                plan,
-                evidence_registry,
-                gate.gaps,
-                draft,
-                errors,
-                _evidence_selection=final_selection,
-                _gate_attempt=final_gate_attempt,
+            draft = self._call_writing_attempt(
+                2,
+                True,
+                lambda: self.rewrite(
+                    question,
+                    cutoff,
+                    plan,
+                    evidence_registry,
+                    gate.gaps,
+                    draft,
+                    errors,
+                    _evidence_selection=final_selection,
+                    _gate_attempt=final_gate_attempt,
+                ),
             )
             errors = validate_research_final(
                 draft,

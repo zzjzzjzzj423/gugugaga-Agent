@@ -381,6 +381,12 @@ def test_traced_ordinary_loop_no_longer_applies_research_gate(tmp_path):
         run_metadata={"task_type": "normal"},
     ) == "ordinary answer"
     assert len(provider.requests) == 1
+    assert [item["name"] for item in provider.requests[0]["tools"]] == [
+        item["name"] for item in runtime.tool_definitions
+    ]
+    assert {"bash", "task", "schedule_cron", "spawn_teammate"} <= {
+        item["name"] for item in provider.requests[0]["tools"]
+    }
 
 
 @pytest.mark.parametrize("task_type", [None, "normal", "future_kind"])
@@ -571,12 +577,16 @@ def test_source_runtime_research_executor_uses_shared_registry_and_private_notes
     provider = ScriptedProvider([])
     runtime = agent.SourceRuntime(
         provider,
-        tool_definitions=[{
-            "name": "web_fetch",
-            "description": "fetch",
-            "input_schema": {},
-        }],
-        tool_handlers={"web_fetch": lambda **_: "unused"},
+        tool_definitions=[
+            {"name": "bash", "description": "shell", "input_schema": {}},
+            {"name": "web_fetch", "description": "fetch", "input_schema": {}},
+            {"name": "web_search", "description": "search", "input_schema": {}},
+        ],
+        tool_handlers={
+            "bash": lambda **_: "forbidden",
+            "web_fetch": lambda **_: "unused",
+            "pdf_fetch": lambda **_: "handler without definition",
+        },
         max_rounds=40,
         memory_enabled=False,
     )
@@ -630,8 +640,9 @@ def test_source_runtime_research_executor_uses_shared_registry_and_private_notes
     ) == "public report"
     assert captured["messages"][0]["role"] == "user"
     assert "primary facts" in captured["messages"][0]["content"]
-    assert captured["tools"] is runtime.tool_definitions
-    assert captured["handlers"] is runtime.tool_handlers
+    assert [item["name"] for item in captured["tools"]] == ["web_fetch"]
+    assert set(captured["handlers"]) == {"web_fetch"}
+    assert captured["handlers"]["web_fetch"] is runtime.tool_handlers["web_fetch"]
     assert captured["permissions"] is runtime.permissions
     assert captured["max_rounds"] == 7
     assert captured["memory_enabled"] is False
@@ -642,7 +653,103 @@ def test_source_runtime_research_executor_uses_shared_registry_and_private_notes
     assert "final report is produced only" in captured["system_prompt"]
     assert "untrusted data" in captured["system_prompt"]
     assert "missing filing" in captured["system_prompt"]
+    available_line = next(
+        line
+        for line in captured["system_prompt"].splitlines()
+        if line.startswith("Available tools:")
+    )
+    assert available_line == "Available tools: web_fetch."
     assert "private research notes" not in repr(runtime.messages)
+
+
+def test_default_source_runtime_research_path_uses_only_configured_research_tools(
+    monkeypatch,
+):
+    runtime = agent.SourceRuntime(ScriptedProvider([]), memory_enabled=False)
+    captured = {}
+
+    def fake_agent_loop(messages, context, permissions, approval_callback, **kwargs):
+        captured.update(kwargs)
+        return agent.AgentLoopOutcome("completed", "private notes", rounds_used=1)
+
+    monkeypatch.setattr(agent, "agent_loop", fake_agent_loop)
+    monkeypatch.setattr(agent, "ResearchWorkflow", _single_execution_workflow())
+    monkeypatch.setattr(agent, "trigger_hooks", lambda *args: None)
+
+    assert runtime.run_turn(
+        "question",
+        run_metadata={"task_type": "research"},
+    ) == "public report"
+
+    expected_names = ["web_search", "web_fetch", "pdf_fetch"]
+    assert [item["name"] for item in captured["tools"]] == expected_names
+    assert list(captured["handlers"]) == expected_names
+    assert captured["strict_tool_allowlist"] is True
+    available_line = next(
+        line
+        for line in captured["system_prompt"].splitlines()
+        if line.startswith("Available tools:")
+    )
+    assert available_line == "Available tools: web_search, web_fetch, pdf_fetch."
+    assert not {
+        "bash",
+        "task",
+        "create_task",
+        "schedule_cron",
+        "spawn_teammate",
+    } & set(captured["handlers"])
+
+
+def test_research_path_rejects_hallucinated_background_tool_synchronously(
+    monkeypatch,
+):
+    forbidden_handler_called = False
+
+    def forbidden_bash(**arguments):
+        nonlocal forbidden_handler_called
+        forbidden_handler_called = True
+        return "forbidden"
+
+    provider = ScriptedProvider([
+        ProviderResponse(
+            [ToolUseBlock(
+                "bash-1",
+                "bash",
+                {"command": "pytest", "run_in_background": True},
+            )],
+            "tool_use",
+        ),
+        ProviderResponse([TextBlock(text="private notes")], "end_turn"),
+    ])
+    monkeypatch.setitem(agent.TOOL_HANDLERS, "bash", forbidden_bash)
+    monkeypatch.setattr(
+        agent,
+        "start_background_task",
+        lambda *args, **kwargs: pytest.fail("research started an async tool"),
+    )
+    monkeypatch.setattr(agent, "ResearchWorkflow", _single_execution_workflow())
+    runtime = agent.SourceRuntime(
+        provider,
+        approval_callback=lambda call: True,
+        memory_enabled=False,
+    )
+
+    assert runtime.run_turn(
+        "question",
+        run_metadata={"task_type": "research"},
+    ) == "public report"
+
+    assert forbidden_handler_called is False
+    assert [item["name"] for item in provider.requests[0]["tools"]] == [
+        "web_search",
+        "web_fetch",
+        "pdf_fetch",
+    ]
+    result = provider.requests[1]["messages"][-1]["content"][0]
+    assert result["tool_use_id"] == "bash-1"
+    assert json.loads(result["content"])["error"]["code"] == (
+        "tool_not_available"
+    )
 
 
 def _single_execution_workflow():

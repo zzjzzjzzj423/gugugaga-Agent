@@ -1445,6 +1445,7 @@ def test_routed_trace_orders_phases_shares_budget_and_links_sources(
         "research_attempt_finished",
         "research_gate",
         "writing_attempt_started",
+        "writing_attempt_finished",
         "writing_gate",
         "research_workflow_completed",
     }
@@ -1462,6 +1463,7 @@ def test_routed_trace_orders_phases_shares_budget_and_links_sources(
         "research_attempt_finished",
         "research_gate",
         "writing_attempt_started",
+        "writing_attempt_finished",
         "writing_gate",
         "research_workflow_completed",
     ]
@@ -1581,6 +1583,27 @@ def test_routed_trace_caps_research_and_writing_retries(tmp_path):
         row for row in rows
         if row["event_type"] == "writing_gate"
     ]) == 2
+    writing_finished = [
+        row["payload"]
+        for row in rows
+        if row["event_type"] == "writing_attempt_finished"
+    ]
+    assert writing_finished == [
+        {
+            "attempt": 1,
+            "repair": False,
+            "status": "completed",
+            "failure_class": None,
+            "failure_message": None,
+        },
+        {
+            "attempt": 2,
+            "repair": True,
+            "status": "completed",
+            "failure_class": None,
+            "failure_message": None,
+        },
+    ]
     assert final_answer.startswith("INSUFFICIENT_EVIDENCE")
 
 
@@ -1784,6 +1807,7 @@ def test_trace_reconstructs_forward_only_workflow_with_active_agent(tmp_path):
         "research_gate",
         "supplemental_research_skipped",
         "writing_attempt_started",
+        "writing_attempt_finished",
         "writing_gate",
         "writing_repair_started",
         "research_workflow_completed",
@@ -1797,6 +1821,7 @@ def test_trace_reconstructs_forward_only_workflow_with_active_agent(tmp_path):
         "research_gate",
         "supplemental_research_skipped",
         "writing_attempt_started",
+        "writing_attempt_finished",
         "writing_gate",
         "research_workflow_completed",
     ]
@@ -1814,7 +1839,180 @@ def test_trace_reconstructs_forward_only_workflow_with_active_agent(tmp_path):
     assert started["directions"] == ["primary filings"]
     assert finished["used_rounds"] == 3
     assert finished["remaining_rounds"] == 7
+    writing_finished = next(
+        row["payload"] for row in phase_rows
+        if row["event_type"] == "writing_attempt_finished"
+    )
+    assert writing_finished == {
+        "attempt": 1,
+        "repair": False,
+        "status": "completed",
+        "failure_class": None,
+        "failure_message": None,
+    }
     json.dumps([row["payload"] for row in phase_rows])
+
+
+@pytest.mark.parametrize("failed_attempt", (1, 2))
+def test_writing_provider_failure_records_bounded_finished_then_reraises(
+    tmp_path,
+    failed_attempt,
+):
+    registry = registry_with_two_sources()
+    provider_error = RuntimeError("writer offline\n" + "x" * 900)
+    responses = [
+        light_plan_response(),
+        gate_response(registry, covered=True),
+    ]
+    if failed_attempt == 2:
+        responses.append(ModelResponse("unsupported draft"))
+    responses.append(provider_error)
+    provider = ScriptedProvider(responses)
+    recorder = TraceRecorder(tmp_path / "run", run_id=f"writing-{failed_attempt}-failure")
+    recorder.start_run(
+        task_id="research-task",
+        question="question",
+        cutoff="2025-05-01",
+        metadata={"task_type": "research"},
+    )
+    run = RunContext(
+        recorder,
+        f"writing-{failed_attempt}-failure",
+        "research-task",
+        "2025-05-01",
+    )
+    workflow = ResearchWorkflow(
+        provider,
+        lambda prompt, max_rounds, evidence_registry: AgentLoopOutcome(
+            "completed", "notes", rounds_used=1
+        ),
+        run_context=run,
+    )
+
+    with bind_run_context(run), pytest.raises(RuntimeError) as caught:
+        workflow.run("question", "2025-05-01", registry=registry)
+
+    assert caught.value is provider_error
+    rows, incomplete = read_trace_lines(recorder.trajectory_path)
+    assert incomplete is False
+    finished = [
+        row["payload"]
+        for row in rows
+        if row["event_type"] == "writing_attempt_finished"
+    ]
+    if failed_attempt == 2:
+        assert finished[0] == {
+            "attempt": 1,
+            "repair": False,
+            "status": "completed",
+            "failure_class": None,
+            "failure_message": None,
+        }
+    failed = finished[-1]
+    assert set(failed) == {
+        "attempt",
+        "repair",
+        "status",
+        "failure_class",
+        "failure_message",
+    }
+    assert failed["attempt"] == failed_attempt
+    assert failed["repair"] is (failed_attempt == 2)
+    assert failed["status"] == "failed"
+    assert failed["failure_class"] == "RuntimeError"
+    assert failed["failure_message"].startswith("writer offline x")
+    assert "\n" not in failed["failure_message"]
+    assert len(failed["failure_message"]) <= 512
+
+
+def test_writing_trace_error_preserves_identity_without_finished_event(tmp_path):
+    registry = registry_with_two_sources()
+    trace_error = TraceWriteError("writing provider trace unavailable")
+    provider = ScriptedProvider([
+        light_plan_response(),
+        gate_response(registry, covered=True),
+        trace_error,
+    ])
+    recorder = TraceRecorder(tmp_path / "run", run_id="writing-trace-failure")
+    recorder.start_run(
+        task_id="research-task",
+        question="question",
+        cutoff="2025-05-01",
+        metadata={"task_type": "research"},
+    )
+    run = RunContext(
+        recorder,
+        "writing-trace-failure",
+        "research-task",
+        "2025-05-01",
+    )
+    workflow = ResearchWorkflow(
+        provider,
+        lambda prompt, max_rounds, evidence_registry: AgentLoopOutcome(
+            "completed", "notes", rounds_used=1
+        ),
+        run_context=run,
+    )
+
+    with bind_run_context(run), pytest.raises(TraceWriteError) as caught:
+        workflow.run("question", "2025-05-01", registry=registry)
+
+    assert caught.value is trace_error
+    rows, incomplete = read_trace_lines(recorder.trajectory_path)
+    assert incomplete is False
+    assert not [
+        row for row in rows
+        if row["event_type"] == "writing_attempt_finished"
+    ]
+
+
+def test_writing_finished_trace_failure_preserves_identity_and_skips_gate(
+    tmp_path,
+    monkeypatch,
+):
+    registry = registry_with_two_sources()
+    provider = ScriptedProvider([
+        light_plan_response(),
+        gate_response(registry, covered=True),
+        valid_light_report(),
+    ])
+    recorder = TraceRecorder(tmp_path / "run", run_id="writing-finished-trace-failure")
+    recorder.start_run(
+        task_id="research-task",
+        question="question",
+        cutoff="2025-05-01",
+        metadata={"task_type": "research"},
+    )
+    run = RunContext(
+        recorder,
+        "writing-finished-trace-failure",
+        "research-task",
+        "2025-05-01",
+    )
+    trace_error = TraceWriteError("writing finished trace unavailable")
+    original_record = recorder.record
+
+    def fail_writing_finished(event_type, payload, **kwargs):
+        if event_type == "writing_attempt_finished":
+            raise trace_error
+        return original_record(event_type, payload, **kwargs)
+
+    monkeypatch.setattr(recorder, "record", fail_writing_finished)
+    workflow = ResearchWorkflow(
+        provider,
+        lambda prompt, max_rounds, evidence_registry: AgentLoopOutcome(
+            "completed", "notes", rounds_used=1
+        ),
+        run_context=run,
+    )
+
+    with bind_run_context(run), pytest.raises(TraceWriteError) as caught:
+        workflow.run("question", "2025-05-01", registry=registry)
+
+    assert caught.value is trace_error
+    rows, incomplete = read_trace_lines(recorder.trajectory_path)
+    assert incomplete is False
+    assert not [row for row in rows if row["event_type"] == "writing_gate"]
 
 
 def test_research_and_writing_retry_flags_are_independent():

@@ -41,6 +41,7 @@ from .subagents import extract_text, has_tool_use
 from .evidence import (
     CutoffMismatch,
     EvidenceIngestionResult,
+    RESEARCH_TOOLS,
     attach_evidence_artifacts,
     inspect_evidence_result,
     link_final_answer_sources,
@@ -97,6 +98,28 @@ class FixedToolRegistry:
         return str(
             call_tool_handler(self.handlers.get(name), arguments, name)
         )
+
+
+def _research_tool_view(
+    definitions: list[dict[str, Any]],
+    handlers: dict[str, Callable],
+) -> tuple[list[dict[str, Any]], dict[str, Callable]]:
+    """Return the configured, executable subset of code-owned research tools."""
+    selected_definitions: list[dict[str, Any]] = []
+    selected_names: list[str] = []
+    for definition in definitions:
+        name = definition.get("name")
+        if (
+            name in RESEARCH_TOOLS
+            and name in handlers
+            and name not in selected_names
+        ):
+            selected_definitions.append(definition)
+            selected_names.append(name)
+    return (
+        selected_definitions,
+        {name: handlers[name] for name in selected_names},
+    )
 
 
 @dataclass(frozen=True)
@@ -242,6 +265,13 @@ class SourceRuntime:
 
                 evidence_registry = EvidenceRegistry()
                 research_sources: dict[str, str] = {}
+                research_tools, research_handlers = _research_tool_view(
+                    self.tool_definitions,
+                    self.tool_handlers,
+                )
+                research_tool_names = tuple(
+                    definition["name"] for definition in research_tools
+                )
 
                 def execute_research(
                     prompt: str,
@@ -262,6 +292,7 @@ class SourceRuntime:
                         plan=plan,
                         gaps=gaps,
                         remaining_rounds=max_rounds,
+                        tool_names=research_tool_names,
                     )
                     research_messages = [{"role": "user", "content": prompt}]
                     return agent_loop(
@@ -270,8 +301,8 @@ class SourceRuntime:
                         self.permissions,
                         self.approval_callback,
                         provider=self.tracing_provider,
-                        tools=self.tool_definitions,
-                        handlers=self.tool_handlers,
+                        tools=research_tools,
+                        handlers=research_handlers,
                         max_rounds=max_rounds,
                         memory_enabled=self.memory_enabled,
                         run_context=run,
@@ -281,6 +312,7 @@ class SourceRuntime:
                         evidence_registry=registry,
                         research_cutoff=cutoff,
                         finalize_user_turn=False,
+                        strict_tool_allowlist=True,
                     )
 
                 workflow = ResearchWorkflow(
@@ -411,10 +443,16 @@ def agent_loop(
     evidence_registry: EvidenceRegistry | None = None,
     research_cutoff: str | None = None,
     finalize_user_turn: bool = True,
+    strict_tool_allowlist: bool = False,
 ) -> AgentLoopOutcome:
     global rounds_since_todo
     tools = tools if tools is not None else TOOL_DEFINITIONS
     handlers = handlers if handlers is not None else TOOL_HANDLERS
+    available_tool_names = {
+        definition.get("name")
+        for definition in tools
+        if isinstance(definition, dict)
+    }
     permissions = permissions or PermissionPolicy()
     selected_provider = provider or client
     memory_enabled = (
@@ -632,6 +670,32 @@ def agent_loop(
                     span_id=span_id,
                     agent_id=run_context.agent_id,
                 )
+
+            if strict_tool_allowlist and block.name not in available_tool_names:
+                message = f"Tool '{block.name}' is not available in this stage."
+                if run_context is not None:
+                    run_context.recorder.record(
+                        "tool_result",
+                        {
+                            "success": False,
+                            "error_code": "tool_not_available",
+                            "message": message,
+                        },
+                        span_id=span_id,
+                        agent_id=run_context.agent_id,
+                    )
+                results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": json.dumps({
+                        "ok": False,
+                        "error": {
+                            "code": "tool_not_available",
+                            "message": message,
+                        },
+                    }),
+                })
+                continue
 
             try:
                 prepared = prepare_research_arguments(
