@@ -88,11 +88,12 @@ def canonicalize_url(url: str) -> str:
         or not url
         or any(
             character.isspace()
+            or character in {"<", ">"}
             or unicodedata.category(character).startswith("C")
             for character in url
         )
     ):
-        raise ValueError(f"not a canonicalizable HTTP URL: {url}")
+        raise ValueError("not a canonicalizable HTTP URL")
     try:
         parsed = urlsplit(url)
     except ValueError as error:
@@ -147,7 +148,41 @@ def source_id_for_url(url: str) -> str:
     return f"src_{digest[:16]}"
 
 
-_URL_PATTERN = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
+_URL_PATTERN = re.compile(r"https?://[^\s]+", re.IGNORECASE)
+_INVALID_CITATION_PREFIX = "invalid_http_url:sha256:"
+
+
+def _citation_identity_candidate(
+    answer: str,
+    match: re.Match[str],
+) -> tuple[str, str]:
+    raw_token = match.group(0)
+    if answer[max(0, match.start() - 2):match.start()] == "](":
+        closing = raw_token.rfind(")")
+        if closing >= 0:
+            return raw_token[:closing], raw_token
+    if match.start() > 0 and answer[match.start() - 1] == "<":
+        closing = raw_token.find(">")
+        if closing >= 0:
+            return raw_token[:closing], raw_token
+    return raw_token, raw_token
+
+
+def _invalid_citation_marker(raw_token: str) -> str:
+    digest = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    return f"{_INVALID_CITATION_PREFIX}{digest}"
+
+
+def _canonical_citation_identity(candidate: str) -> str | None:
+    if len(candidate) > EVIDENCE_URL_CHARS_MAX:
+        return None
+    try:
+        canonical = canonicalize_url(candidate)
+    except ValueError:
+        return None
+    if len(canonical) > EVIDENCE_URL_CHARS_MAX:
+        return None
+    return canonical
 
 
 def link_final_answer_sources(
@@ -158,41 +193,17 @@ def link_final_answer_sources(
     unmatched: list[str] = []
     answer = final_text or ""
     for match in _URL_PATTERN.finditer(answer):
-        raw_token = match.group(0)
-        canonical: str | None = None
-        try:
-            canonical = canonicalize_url(raw_token)
-        except ValueError:
-            pass
-
-        # An exact registered identity wins, including URL-valid trailing
-        # punctuation. Only proven Markdown syntax may remove a structural
-        # closing parenthesis; plain-text punctuation is never guessed away.
-        source_id = (
-            registered_sources.get(canonical)
-            if canonical is not None
-            else None
-        )
-        if (
-            source_id is None
-            and answer[max(0, match.start() - 2):match.start()] == "]("
-        ):
-            closing = raw_token.rfind(")")
-            if closing >= 0:
-                try:
-                    canonical = canonicalize_url(raw_token[:closing])
-                except ValueError:
-                    canonical = None
-                source_id = (
-                    registered_sources.get(canonical)
-                    if canonical is not None
-                    else None
-                )
+        candidate, raw_token = _citation_identity_candidate(answer, match)
+        canonical = _canonical_citation_identity(candidate)
         if canonical is None:
+            marker = _invalid_citation_marker(raw_token)
+            if marker not in unmatched:
+                unmatched.append(marker)
             continue
         if canonical in cited_urls:
             continue
         cited_urls.append(canonical)
+        source_id = registered_sources.get(canonical)
         if source_id is None:
             unmatched.append(canonical)
         elif source_id not in matched:

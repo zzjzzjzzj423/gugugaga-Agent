@@ -94,6 +94,104 @@ def test_canonical_url_and_citation_linkage_are_deterministic():
     )
 
 
+@pytest.mark.parametrize("delimiter", ("<", ">"))
+def test_raw_angle_delimiters_are_rejected_from_url_identities(delimiter):
+    raw_url = f"https://example.com/a{delimiter}b"
+
+    with pytest.raises(ValueError):
+        canonicalize_url(raw_url)
+    record = evidence_record_from_result(
+        "web_fetch",
+        json.dumps({
+            "ok": True,
+            "operation": "fetch",
+            "url": raw_url,
+            "title": "Invalid identity",
+            "content": "facts",
+            "published_at": "2025-01-02",
+            "date_status": "verified",
+            "cutoff": "2025-05-01",
+        }),
+    )
+
+    assert record is None
+    assert canonicalize_url("https://example.com/a%3Eb") == (
+        "https://example.com/a%3Eb"
+    )
+
+
+def test_markdown_closer_is_resolved_before_registered_identity_lookup():
+    report = canonicalize_url("https://example.com/report")
+    report_with_parenthesis = canonicalize_url("https://example.com/report)")
+
+    ordinary = link_final_answer_sources(
+        f"See [report]({report})",
+        {
+            report: "src_report",
+            report_with_parenthesis: "src_wrong_identity",
+        },
+    )
+    genuine_parenthesis = link_final_answer_sources(
+        f"See [parenthesis]({report_with_parenthesis})",
+        {report_with_parenthesis: "src_parenthesis"},
+    )
+
+    assert ordinary["matched_source_ids"] == ["src_report"]
+    assert ordinary["unmatched_citations"] == []
+    assert genuine_parenthesis["matched_source_ids"] == ["src_parenthesis"]
+    assert genuine_parenthesis["unmatched_citations"] == []
+
+
+def test_angle_citation_is_structural_but_plain_greater_than_token_fails_closed():
+    registered = canonicalize_url("https://example.com/a")
+    angle = link_final_answer_sources(
+        f"See <{registered}>.",
+        {registered: "src_registered"},
+    )
+    attacked = link_final_answer_sources(
+        f"Do not accept {registered}>attacker as the fetched URL.",
+        {registered: "src_registered"},
+    )
+
+    assert angle["matched_source_ids"] == ["src_registered"]
+    assert angle["unmatched_citations"] == []
+    assert attacked["matched_source_ids"] == []
+    assert len(attacked["unmatched_citations"]) == 1
+    assert attacked["unmatched_citations"][0].startswith(
+        "invalid_http_url:sha256:"
+    )
+
+
+@pytest.mark.parametrize(
+    "invalid_url",
+    (
+        "https://user:supersecret@example.com/report",
+        "https://bad_host.example/report",
+        "https://example.com:99999/report",
+        "https://example.com/a>attacker",
+    ),
+)
+def test_invalid_http_tokens_emit_bounded_secret_safe_unmatched_marker(
+    invalid_url,
+):
+    valid = canonicalize_url("https://example.com/valid")
+
+    linked = link_final_answer_sources(
+        f"Invalid {invalid_url} but valid <{valid}>.",
+        {valid: "src_valid"},
+    )
+
+    assert linked["matched_source_ids"] == ["src_valid"]
+    assert len(linked["unmatched_citations"]) == 1
+    marker = linked["unmatched_citations"][0]
+    prefix = "invalid_http_url:sha256:"
+    assert marker.startswith(prefix)
+    assert len(marker) == len(prefix) + 64
+    digest = marker[len(prefix):]
+    assert all(character in "0123456789abcdef" for character in digest)
+    assert "supersecret" not in json.dumps(linked)
+
+
 def test_citation_linkage_supports_legal_brackets_and_rejects_prefix_attack():
     parenthesis_url = canonicalize_url("https://example.com/a)b")
     bracket_url = canonicalize_url("https://example.com/a]b")
