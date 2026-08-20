@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from simple_cc import agent, config, context, subagents, teams, tools
+from simple_cc import agent, config, context, recovery, subagents, teams, tools
 from simple_cc.provider import (
     ContextLengthError,
     ProviderResponse,
@@ -452,6 +452,119 @@ def test_source_runtime_routes_research_aliases(monkeypatch, task_type):
     ]
 
 
+def test_research_stop_hook_follows_successful_final_answer_trace(
+    tmp_path, monkeypatch
+):
+    runtime_events = []
+    recorder = TraceRecorder(tmp_path / "run", run_id="publication-order-run")
+    recorder.start_run(
+        task_id="research-task",
+        question="q",
+        cutoff=None,
+        metadata={"task_type": "research"},
+    )
+    original_record = recorder.record
+
+    def record_with_order(event_type, payload, **kwargs):
+        if event_type == "final_answer":
+            runtime_events.append("trace:final_answer")
+        return original_record(event_type, payload, **kwargs)
+
+    class SuccessfulWorkflow:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self, question, cutoff, *, registry=None):
+            return ResearchWorkflowResult(
+                "research answer",
+                ResearchPlan(ResearchRank.LIGHT, ("facts",), "narrow"),
+                0,
+                False,
+                False,
+            )
+
+    monkeypatch.setattr(recorder, "record", record_with_order)
+    monkeypatch.setattr(agent, "ResearchWorkflow", SuccessfulWorkflow)
+    monkeypatch.setattr(
+        agent,
+        "trigger_hooks",
+        lambda event, *args: runtime_events.append(f"hook:{event}"),
+    )
+    runtime = agent.SourceRuntime(
+        ScriptedProvider([]),
+        recorder=recorder,
+        memory_enabled=False,
+    )
+
+    assert runtime.run_turn(
+        "q",
+        task_id="research-task",
+        run_metadata={"task_type": "research"},
+    ) == "research answer"
+
+    assert runtime_events == [
+        "hook:UserPromptSubmit",
+        "trace:final_answer",
+        "hook:Stop",
+    ]
+
+
+def test_final_answer_trace_failure_rolls_back_without_stop(tmp_path, monkeypatch):
+    events = []
+    recorder = TraceRecorder(tmp_path / "run", run_id="publication-failure-run")
+    recorder.start_run(
+        task_id="research-task",
+        question="q",
+        cutoff=None,
+        metadata={"task_type": "research"},
+    )
+    original_record = recorder.record
+    trace_error = TraceWriteError("final answer trace unavailable")
+
+    def fail_final_answer(event_type, payload, **kwargs):
+        if event_type == "final_answer":
+            raise trace_error
+        return original_record(event_type, payload, **kwargs)
+
+    class SuccessfulWorkflow:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self, question, cutoff, *, registry=None):
+            return ResearchWorkflowResult(
+                "research answer",
+                ResearchPlan(ResearchRank.LIGHT, ("facts",), "narrow"),
+                0,
+                False,
+                False,
+            )
+
+    monkeypatch.setattr(recorder, "record", fail_final_answer)
+    monkeypatch.setattr(agent, "ResearchWorkflow", SuccessfulWorkflow)
+    monkeypatch.setattr(
+        agent,
+        "trigger_hooks",
+        lambda event, *args: events.append(event),
+    )
+    runtime = agent.SourceRuntime(
+        ScriptedProvider([]),
+        recorder=recorder,
+        memory_enabled=False,
+    )
+
+    with pytest.raises(TraceWriteError) as caught:
+        runtime.run_turn(
+            "q",
+            task_id="research-task",
+            run_metadata={"task_type": "research"},
+        )
+
+    assert caught.value is trace_error
+    assert events == ["UserPromptSubmit"]
+    assert runtime.messages == []
+    assert runtime.last_outcome is None
+
+
 def test_source_runtime_research_executor_uses_shared_registry_and_private_notes(
     monkeypatch,
 ):
@@ -879,15 +992,13 @@ def test_failed_research_turn_is_rolled_back_before_the_next_provider_request(
 
     class FailedWorkflow:
         def __init__(self, *args, **kwargs):
-            pass
+            self.consumed_rounds = 3
 
         def run(self, question, cutoff, *, registry=None):
-            error = ResearchWorkflowError(
+            raise ResearchWorkflowError(
                 "ProviderUnavailable",
                 "secret upstream detail",
             )
-            error.rounds_used = 3
-            raise error
 
     monkeypatch.setattr(agent, "ResearchWorkflow", FailedWorkflow)
     monkeypatch.setattr(
@@ -923,6 +1034,90 @@ def test_failed_research_turn_is_rolled_back_before_the_next_provider_request(
     )
     assert "secret upstream detail" not in repr(runtime.messages)
     assert events == ["UserPromptSubmit", "UserPromptSubmit", "Stop"]
+
+
+def test_planning_failure_cannot_forge_consumed_rounds():
+    forged = RuntimeError("planner failed")
+    forged.rounds_used = 999
+    runtime = agent.SourceRuntime(
+        ScriptedProvider([forged]),
+        memory_enabled=False,
+    )
+
+    assert runtime.run_turn(
+        "research question",
+        run_metadata={"task_type": "research"},
+    ) == ""
+
+    assert runtime.last_outcome == agent.AgentLoopOutcome(
+        "failed",
+        "",
+        "RuntimeError",
+        "planner failed",
+        0,
+    )
+    assert runtime.messages == []
+
+
+def test_research_failure_reports_code_owned_consumed_budget():
+    provider = ScriptedProvider([
+        ProviderResponse(
+            [TextBlock(text=json.dumps({
+                "rank": "light",
+                "directions": ["primary facts"],
+                "reason": "narrow",
+            }))],
+            "end_turn",
+        ),
+        RuntimeError("research provider offline"),
+    ])
+    runtime = agent.SourceRuntime(provider, memory_enabled=False)
+
+    assert runtime.run_turn(
+        "research question",
+        run_metadata={"task_type": "research"},
+    ) == ""
+
+    assert runtime.last_outcome == agent.AgentLoopOutcome(
+        "failed",
+        "",
+        "RuntimeError",
+        "research provider offline",
+        1,
+    )
+    assert runtime.last_outcome.rounds_used <= 10
+    assert runtime.messages == []
+
+
+def test_agent_retry_layer_preserves_trace_failure_identity(monkeypatch):
+    trace_error = TraceWriteError("trace unavailable: overloaded 429 529")
+
+    class FailingProvider:
+        def __init__(self):
+            self.calls = 0
+
+        def create(self, messages, system, tools, max_tokens, model=None):
+            self.calls += 1
+            raise trace_error
+
+    provider = FailingProvider()
+    monkeypatch.setattr(recovery, "retry_delay", lambda attempt: 0)
+    monkeypatch.setattr(recovery.time, "sleep", lambda delay: None)
+
+    with pytest.raises(TraceWriteError) as caught:
+        agent.agent_loop(
+            [{"role": "user", "content": "research question"}],
+            {},
+            provider=provider,
+            tools=[],
+            handlers={},
+            memory_enabled=False,
+            evidence_registry=EvidenceRegistry(),
+            finalize_user_turn=False,
+        )
+
+    assert caught.value is trace_error
+    assert provider.calls == 1
 
 
 def test_research_agent_memory_trace_failure_is_not_downgraded(monkeypatch):

@@ -688,6 +688,16 @@ class ResearchWorkflow:
         self.provider = provider
         self.research_executor = research_executor
         self.run_context = run_context
+        self._consumed_rounds = 0
+
+    @property
+    def consumed_rounds(self) -> int:
+        """Code-owned research rounds consumed by the most recent run."""
+        return self._consumed_rounds
+
+    def _capture_consumed_rounds(self, state: dict[str, Any]) -> None:
+        budget = state.get("budget")
+        self._consumed_rounds = budget.used_rounds if budget is not None else 0
 
     def _call_text(self, kind: str, system: str, user_content: str) -> str:
         if kind not in _MODEL_CALL_KINDS:
@@ -1470,6 +1480,7 @@ class ResearchWorkflow:
         registry: EvidenceRegistry | None = None,
     ) -> ResearchWorkflowResult:
         evidence_registry = registry if registry is not None else EvidenceRegistry()
+        self._consumed_rounds = 0
         state: dict[str, Any] = {
             "plan": None,
             "budget": None,
@@ -1479,22 +1490,18 @@ class ResearchWorkflow:
             "errors": (),
         }
         try:
-            return self._run_forward(
+            result = self._run_forward(
                 question,
                 cutoff,
                 registry=evidence_registry,
                 state=state,
             )
+            self._capture_consumed_rounds(state)
+            return result
         except TraceWriteError:
+            self._capture_consumed_rounds(state)
             raise
         except Exception as error:
-            budget = state.get("budget")
-            try:
-                if not hasattr(error, "rounds_used"):
-                    error.rounds_used = (
-                        budget.used_rounds if budget is not None else 0
-                    )
-            except Exception:
-                pass
+            self._capture_consumed_rounds(state)
             self._record_terminal_failure(error, state)
             raise

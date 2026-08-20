@@ -1712,7 +1712,8 @@ def test_failed_executor_preserves_failure_class_and_message():
     assert getattr(caught.value, "failure_message", None) == (
         "upstream timed out"
     )
-    assert getattr(caught.value, "rounds_used", None) == 2
+    assert not hasattr(caught.value, "rounds_used")
+    assert workflow.consumed_rounds == 2
 
 
 def test_max_rounds_consumes_supplied_budget_and_still_writes():

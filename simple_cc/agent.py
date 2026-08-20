@@ -283,16 +283,21 @@ class SourceRuntime:
                         finalize_user_turn=False,
                     )
 
+                workflow = ResearchWorkflow(
+                    self.tracing_provider,
+                    execute_research,
+                    run_context=run,
+                )
                 try:
-                    result = ResearchWorkflow(
-                        self.tracing_provider,
-                        execute_research,
-                        run_context=run,
-                    ).run(query, cutoff, registry=evidence_registry)
+                    result = workflow.run(
+                        query,
+                        cutoff,
+                        registry=evidence_registry,
+                    )
                 except TraceWriteError:
                     raise
                 except Exception as error:
-                    rounds_used = getattr(error, "rounds_used", 0)
+                    rounds_used = getattr(workflow, "consumed_rounds", 0)
                     if (
                         isinstance(rounds_used, bool)
                         or not isinstance(rounds_used, int)
@@ -317,7 +322,6 @@ class SourceRuntime:
                     "role": "assistant",
                     "content": [{"type": "text", "text": result.final_text}],
                 })
-                trigger_hooks("Stop", self.messages)
                 return outcome, registered_source_map(evidence_registry)
 
             try:
@@ -347,6 +351,11 @@ class SourceRuntime:
                         )
                 else:
                     outcome, _ = execute_routed_turn()
+                if (
+                    task_kind is TaskKind.RESEARCH
+                    and outcome.status == "completed"
+                ):
+                    trigger_hooks("Stop", self.messages)
             except Exception:
                 if task_kind is TaskKind.RESEARCH:
                     del self.messages[turn_start:]

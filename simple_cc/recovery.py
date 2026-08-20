@@ -5,6 +5,7 @@ import time
 
 from . import config
 from .provider import is_context_length_error
+from .trace import TraceWriteError
 
 
 class RecoveryState:
@@ -27,6 +28,8 @@ def with_retry(fn, state: RecoveryState):
             result = fn()
             state.consecutive_529 = 0
             return result
+        except TraceWriteError:
+            raise
         except Exception as error:
             name = type(error).__name__.lower()
             message = str(error).lower()

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .telemetry import model_call_scope
+from .trace import TraceWriteError
 
 
 MEMORY_TYPES = frozenset({"user", "feedback", "project", "reference"})
@@ -525,6 +526,8 @@ class MemoryStore:
             if not all(isinstance(name, str) and name in allowed for name in selected):
                 raise MemoryValidationError("selector returned an unknown filename")
             return list(dict.fromkeys(selected))[: self.max_selected]
+        except TraceWriteError:
+            raise
         except Exception as error:
             self._warn(f"selector failed; using keyword fallback: {error}")
             return self._keyword_select(recent)
@@ -675,6 +678,8 @@ class MemoryStore:
             if count:
                 print(f"  \033[33m[memory] saved {count} item(s)\033[0m")
             return count
+        except TraceWriteError:
+            raise
         except Exception as error:
             self._warn(f"extraction failed: {error}")
             return 0
@@ -759,6 +764,8 @@ class MemoryStore:
                 f"{len(candidates)} item(s)\033[0m"
             )
             return True
+        except TraceWriteError:
+            raise
         except Exception as error:
             if backup is not None and backup.exists():
                 backup_names = {path.name for path in backup.glob("*.md")}
