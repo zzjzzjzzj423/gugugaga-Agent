@@ -11,6 +11,7 @@ from simple_cc.evidence import (
     evidence_record_from_result,
     link_final_answer_sources,
     prepare_research_arguments,
+    source_id_for_url,
     validate_research_final,
 )
 from simple_cc.models import ModelResponse, ToolCall
@@ -94,6 +95,41 @@ def test_canonical_url_and_citation_linkage_are_deterministic():
     )
 
 
+@pytest.mark.parametrize(
+    "invalid_query",
+    ("%", "%G0", "%0G", "%FF", "%FE"),
+)
+def test_canonical_url_rejects_malformed_or_non_utf8_query(invalid_query):
+    url = f"https://example.com/report?q={invalid_query}"
+
+    with pytest.raises(ValueError, match="query"):
+        canonicalize_url(url)
+    with pytest.raises(ValueError, match="query"):
+        source_id_for_url(url)
+
+
+def test_canonical_url_keeps_valid_utf8_query_sorting():
+    assert canonicalize_url(
+        "https://example.com/report?z=%E4%B8%AD&a=1"
+    ) == "https://example.com/report?a=1&z=%E4%B8%AD"
+
+
+def test_non_utf8_query_citations_remain_distinct_and_unmatched():
+    first = "https://example.com/report?q=%FF"
+    second = "https://example.com/report?q=%FE"
+
+    linked = link_final_answer_sources(f"<{first}><{second}>", {})
+
+    assert linked["cited_urls"] == []
+    assert linked["matched_source_ids"] == []
+    assert len(linked["unmatched_citations"]) == 2
+    assert len(set(linked["unmatched_citations"])) == 2
+    assert all(
+        marker.startswith("invalid_http_url:sha256:")
+        for marker in linked["unmatched_citations"]
+    )
+
+
 @pytest.mark.parametrize("delimiter", ("<", ">"))
 def test_raw_angle_delimiters_are_rejected_from_url_identities(delimiter):
     raw_url = f"https://example.com/a{delimiter}b"
@@ -140,6 +176,90 @@ def test_markdown_closer_is_resolved_before_registered_identity_lookup():
     assert ordinary["unmatched_citations"] == []
     assert genuine_parenthesis["matched_source_ids"] == ["src_parenthesis"]
     assert genuine_parenthesis["unmatched_citations"] == []
+
+
+def test_escaped_citation_openers_do_not_match_registered_prefixes():
+    registered = canonicalize_url("https://example.com/report")
+    markdown_suffix = canonicalize_url(
+        "https://example.com/report)attacker"
+    )
+    escaped_markdown = f"\\[label]({registered})attacker"
+    escaped_angle = f"\\<{registered}>attacker"
+    assert escaped_markdown.startswith("\\[")
+    assert not escaped_markdown.startswith("\\\\[")
+    assert escaped_angle.startswith("\\<")
+    assert not escaped_angle.startswith("\\\\<")
+
+    markdown = link_final_answer_sources(
+        escaped_markdown,
+        {registered: "src_registered"},
+    )
+    angle = link_final_answer_sources(
+        escaped_angle,
+        {registered: "src_registered"},
+    )
+
+    assert markdown["matched_source_ids"] == []
+    assert markdown["unmatched_citations"] == [markdown_suffix]
+    assert angle["matched_source_ids"] == []
+    assert len(angle["unmatched_citations"]) == 1
+    assert angle["unmatched_citations"][0].startswith(
+        "invalid_http_url:sha256:"
+    )
+
+
+def test_escaped_citation_closers_do_not_match_registered_prefixes():
+    registered = canonicalize_url("https://example.com/report\\")
+    markdown_suffix = canonicalize_url(
+        "https://example.com/report\\)attacker"
+    )
+
+    markdown = link_final_answer_sources(
+        f"[label]({registered})attacker",
+        {registered: "src_registered"},
+    )
+    angle = link_final_answer_sources(
+        f"<{registered}>attacker",
+        {registered: "src_registered"},
+    )
+
+    assert markdown["matched_source_ids"] == []
+    assert markdown["unmatched_citations"] == [markdown_suffix]
+    assert angle["matched_source_ids"] == []
+    assert len(angle["unmatched_citations"]) == 1
+    assert angle["unmatched_citations"][0].startswith(
+        "invalid_http_url:sha256:"
+    )
+
+
+def test_even_backslashes_keep_citation_delimiters_structural():
+    plain = canonicalize_url("https://example.com/plain")
+    with_backslashes = canonicalize_url(
+        "https://example.com/report\\\\"
+    )
+    markdown_open = f"\\\\[label]({plain})"
+    angle_open = f"\\\\<{plain}>"
+    assert markdown_open.startswith("\\\\[")
+    assert angle_open.startswith("\\\\<")
+
+    linked = link_final_answer_sources(
+        " ".join((
+            markdown_open,
+            angle_open,
+            f"[label]({with_backslashes})",
+            f"<{with_backslashes}>",
+        )),
+        {
+            plain: "src_plain",
+            with_backslashes: "src_backslashes",
+        },
+    )
+
+    assert linked["matched_source_ids"] == [
+        "src_plain",
+        "src_backslashes",
+    ]
+    assert linked["unmatched_citations"] == []
 
 
 def test_angle_citation_is_structural_but_plain_greater_than_token_fails_closed():
@@ -787,6 +907,38 @@ def _run_single_fetch_result(tmp_path, run_id, tool_name, output):
     )
     rows, incomplete = read_trace_lines(recorder.trajectory_path)
     return recorder, outcome, registry, rows, incomplete
+
+
+@pytest.mark.parametrize("invalid_octet", ("%FF", "%FE"))
+def test_non_utf8_query_fetch_is_rejected_without_consuming_registry_quota(
+    tmp_path,
+    invalid_octet,
+):
+    output = json.dumps({
+        "ok": True,
+        "operation": "fetch",
+        "url": f"https://example.com/report?q={invalid_octet}",
+        "title": "Invalid query identity",
+        "content": "must not become registered evidence",
+        "published_at": "2025-01-02",
+        "date_status": "verified",
+        "cutoff": "2025-05-01",
+    })
+
+    _, outcome, registry, rows, incomplete = _run_single_fetch_result(
+        tmp_path,
+        f"invalid-query-{invalid_octet[1:].lower()}",
+        "web_fetch",
+        output,
+    )
+
+    assert incomplete is False
+    assert outcome.final_text == "research notes"
+    assert registry.records == ()
+    assert not any(row["event_type"] == "source_registered" for row in rows)
+    rejected = [row for row in rows if row["event_type"] == "source_rejected"]
+    assert len(rejected) == 1
+    assert rejected[0]["payload"]["reason_code"] == "invalid_url"
 
 
 def test_overlong_canonical_url_is_rejected_and_traced(tmp_path):

@@ -30,6 +30,7 @@ RESEARCH_TOOLS = {"web_search", "web_fetch", "pdf_fetch"}
 EVIDENCE_EXCERPT_CHARS = EVIDENCE_CONTENT_CHARS_MAX
 EVIDENCE_URL_CHARS_MAX = 4096
 _HOST_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
+_MALFORMED_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 _ALLOWED_DATE_STATUSES = {"unknown", "verified"}
 _MARKER_LIKE_LINE = re.compile(
     r"^---\s*(P(?:A(?:G(?:E)?)?)?|T(?:A(?:B(?:L(?:E)?)?)?)?)"
@@ -139,7 +140,18 @@ def canonicalize_url(url: str) -> str:
         raise ValueError(f"invalid HTTP URL port: {url}")
     if port is not None and port != (443 if scheme == "https" else 80):
         host = f"{host}:{port}"
-    query = urlencode(sorted(parse_qsl(parsed.query, keep_blank_values=True)))
+    if _MALFORMED_PERCENT_ESCAPE.search(parsed.query):
+        raise ValueError("HTTP URL query contains a malformed percent escape")
+    try:
+        query_pairs = parse_qsl(
+            parsed.query,
+            keep_blank_values=True,
+            encoding="utf-8",
+            errors="strict",
+        )
+    except UnicodeDecodeError as error:
+        raise ValueError("HTTP URL query is not valid UTF-8") from error
+    query = urlencode(sorted(query_pairs))
     return urlunsplit((scheme, host, parsed.path or "/", query, ""))
 
 
@@ -154,11 +166,55 @@ _WHITESPACE_PATTERN = re.compile(r"\s")
 _INVALID_CITATION_PREFIX = "invalid_http_url:sha256:"
 
 
+def _delimiter_is_unescaped(answer: str, index: int) -> bool:
+    backslashes = 0
+    cursor = index - 1
+    while cursor >= 0 and answer[cursor] == "\\":
+        backslashes += 1
+        cursor -= 1
+    return backslashes % 2 == 0
+
+
+def _find_unescaped_delimiter(
+    answer: str,
+    delimiter: str,
+    start: int,
+    end: int,
+) -> int:
+    index = answer.find(delimiter, start, end)
+    while index >= 0 and not _delimiter_is_unescaped(answer, index):
+        index = answer.find(delimiter, index + 1, end)
+    return index
+
+
+def _rfind_unescaped_delimiter(
+    answer: str,
+    delimiter: str,
+    start: int,
+    end: int,
+) -> int:
+    index = answer.rfind(delimiter, start, end)
+    while index >= 0 and not _delimiter_is_unescaped(answer, index):
+        index = answer.rfind(delimiter, start, index)
+    return index
+
+
 def _markdown_label_opening_start(answer: str, url_start: int) -> int | None:
     if url_start < 3 or answer[url_start - 2:url_start] != "](":
         return None
     close_bracket = url_start - 2
-    open_bracket = answer.rfind("[", 0, close_bracket)
+    open_parenthesis = url_start - 1
+    if (
+        not _delimiter_is_unescaped(answer, close_bracket)
+        or not _delimiter_is_unescaped(answer, open_parenthesis)
+    ):
+        return None
+    open_bracket = _rfind_unescaped_delimiter(
+        answer,
+        "[",
+        0,
+        close_bracket,
+    )
     if open_bracket < 0:
         return None
     label = answer[open_bracket + 1:close_bracket]
@@ -182,14 +238,25 @@ def _candidate_limit(
             following.start(),
         )
         if following_opening is not None:
-            closing = answer.rfind(")", following.start(), limit)
+            closing = _rfind_unescaped_delimiter(
+                answer,
+                ")",
+                following.start(),
+                limit,
+            )
             if closing >= 0:
                 limit = following_opening
         elif (
             following.start() > scheme_match.end()
             and answer[following.start() - 1] == "<"
+            and _delimiter_is_unescaped(answer, following.start() - 1)
         ):
-            closing = answer.find(">", following.start(), limit)
+            closing = _find_unescaped_delimiter(
+                answer,
+                ">",
+                following.start(),
+                limit,
+            )
             if closing >= 0:
                 limit = following.start() - 1
         else:
@@ -207,13 +274,27 @@ def _iter_citation_candidates(answer: str) -> Iterator[tuple[str, str]]:
         limit = _candidate_limit(answer, match)
         markdown_opening = _markdown_label_opening_start(answer, start)
         if markdown_opening is not None:
-            closing = answer.rfind(")", start, limit)
+            closing = _rfind_unescaped_delimiter(
+                answer,
+                ")",
+                start,
+                limit,
+            )
             if closing >= 0:
                 yield answer[start:closing], answer[start:closing + 1]
                 position = closing + 1
                 continue
-        if start > 0 and answer[start - 1] == "<":
-            closing = answer.find(">", start, limit)
+        if (
+            start > 0
+            and answer[start - 1] == "<"
+            and _delimiter_is_unescaped(answer, start - 1)
+        ):
+            closing = _find_unescaped_delimiter(
+                answer,
+                ">",
+                start,
+                limit,
+            )
             if closing >= 0:
                 yield answer[start:closing], answer[start:closing + 1]
                 position = closing + 1
