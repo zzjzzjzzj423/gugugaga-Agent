@@ -56,6 +56,7 @@ _GATE_REASON_CHARS_MAX = 512
 _GATE_GAPS_MAX = 16
 _WRITING_FAILURE_CLASS_CHARS_MAX = 128
 _WRITING_FAILURE_MESSAGE_CHARS_MAX = 512
+_AUDIT_FAILURE_NOTE_CHARS_MAX = 600
 
 
 @dataclass(frozen=True)
@@ -82,6 +83,16 @@ class _PacketCandidate:
     serialized_record_chars: int
 
 
+@dataclass(frozen=True)
+class _ExceptionDiagnostics:
+    traceback: Any
+    traceback_readable: bool
+    cause: BaseException | None
+    context: BaseException | None
+    suppress_context: bool
+    audit_cause_allowed: bool
+
+
 class ResearchWorkflowError(RuntimeError):
     """Terminal research-execution failure with benchmark-safe details."""
 
@@ -103,9 +114,146 @@ def _safe_repr(value: Any) -> str:
 def _bounded_trace_text(value: Any, max_chars: int) -> str:
     try:
         text = str(value)
-    except Exception:
-        text = f"<{type(value).__name__}>"
-    return " ".join(text.split())[:max_chars]
+    except BaseException:
+        text = "<unprintable exception>"
+    try:
+        printable = "".join(
+            character if character.isprintable() else " "
+            for character in text
+        )
+        return " ".join(printable.split())[:max_chars]
+    except BaseException:
+        return "<unprintable exception>"[:max_chars]
+
+
+def _safe_exception_attribute(
+    error: BaseException,
+    name: str,
+    default: Any,
+) -> Any:
+    value, _ = _read_exception_attribute(error, name, default)
+    return value
+
+
+def _read_exception_attribute(
+    error: BaseException,
+    name: str,
+    default: Any,
+) -> tuple[Any, bool]:
+    try:
+        return BaseException.__getattribute__(error, name), True
+    except BaseException:
+        return default, False
+
+
+def _safe_exception_type_name(error: BaseException) -> str:
+    try:
+        name = type.__getattribute__(type(error), "__name__")
+    except BaseException:
+        return "Exception"
+    if type(name) is not str or not name:
+        return "Exception"
+    return name
+
+
+def _safe_failure_details(error: BaseException) -> tuple[str, str]:
+    failure_class = _safe_exception_attribute(error, "failure_class", None)
+    if failure_class is None or (
+        type(failure_class) is str and not failure_class
+    ):
+        failure_class = _safe_exception_type_name(error)
+    failure_message = _safe_exception_attribute(error, "failure_message", None)
+    if failure_message is None or (
+        type(failure_message) is str and not failure_message
+    ):
+        failure_message = error
+    return (
+        _bounded_trace_text(
+            failure_class,
+            _WRITING_FAILURE_CLASS_CHARS_MAX,
+        ),
+        _bounded_trace_text(
+            failure_message,
+            _WRITING_FAILURE_MESSAGE_CHARS_MAX,
+        ),
+    )
+
+
+def _capture_exception_diagnostics(
+    error: BaseException,
+) -> _ExceptionDiagnostics:
+    traceback, traceback_readable = _read_exception_attribute(
+        error,
+        "__traceback__",
+        None,
+    )
+    cause, cause_readable = _read_exception_attribute(
+        error,
+        "__cause__",
+        None,
+    )
+    if cause is not None and not isinstance(cause, BaseException):
+        cause = None
+        cause_readable = False
+    context, context_readable = _read_exception_attribute(
+        error,
+        "__context__",
+        None,
+    )
+    if context is not None and not isinstance(context, BaseException):
+        context = None
+        context_readable = False
+    suppress_context, _ = _read_exception_attribute(
+        error,
+        "__suppress_context__",
+        False,
+    )
+    return _ExceptionDiagnostics(
+        traceback=traceback,
+        traceback_readable=traceback_readable,
+        cause=cause,
+        context=context,
+        suppress_context=suppress_context is True,
+        audit_cause_allowed=(
+            cause_readable
+            and context_readable
+            and cause is None
+            and context is None
+        ),
+    )
+
+
+def _restore_exception_traceback(
+    error: BaseException,
+    diagnostics: _ExceptionDiagnostics,
+) -> BaseException:
+    if not diagnostics.traceback_readable:
+        return error
+    try:
+        BaseException.with_traceback(error, diagnostics.traceback)
+    except BaseException:
+        pass
+    return error
+
+
+def _add_audit_failure_note(
+    error: BaseException,
+    event_type: str,
+    trace_error: TraceWriteError,
+) -> None:
+    trace_class = _safe_exception_type_name(trace_error)
+    trace_message = _bounded_trace_text(
+        trace_error,
+        _WRITING_FAILURE_MESSAGE_CHARS_MAX,
+    )
+    note = _bounded_trace_text(
+        f"{event_type} trace failed [{trace_class}]: {trace_message}",
+        _AUDIT_FAILURE_NOTE_CHARS_MAX,
+    )
+    try:
+        BaseException.add_note(error, note)
+    except BaseException:
+        pass
 
 
 def _trace_round_count(value: Any) -> int | str | bool | None:
@@ -796,39 +944,39 @@ class ResearchWorkflow:
         call: Callable[[], str],
     ) -> str:
         provider_error: Exception | None = None
-        provider_traceback = None
+        provider_diagnostics: _ExceptionDiagnostics | None = None
         try:
             text = call()
         except TraceWriteError:
             raise
         except Exception as error:
             provider_error = error
-            provider_traceback = error.__traceback__
+            provider_diagnostics = _capture_exception_diagnostics(error)
 
         if provider_error is not None:
+            assert provider_diagnostics is not None
             trace_error = self._record_writing_failure(
                 attempt,
                 repair,
                 provider_error,
             )
             if trace_error is not None:
-                note = (
-                    "writing_attempt_finished trace failed: "
-                    + _bounded_trace_text(
-                        trace_error,
-                        _WRITING_FAILURE_MESSAGE_CHARS_MAX,
-                    )
+                _add_audit_failure_note(
+                    provider_error,
+                    "writing_attempt_finished",
+                    trace_error,
                 )
-                add_note = getattr(provider_error, "add_note", None)
-                if callable(add_note):
-                    try:
-                        add_note(note)
-                    except Exception:
-                        pass
-                raise provider_error.with_traceback(
-                    provider_traceback
-                ) from trace_error
-            raise provider_error.with_traceback(provider_traceback)
+                restored_error = _restore_exception_traceback(
+                    provider_error,
+                    provider_diagnostics,
+                )
+                if provider_diagnostics.audit_cause_allowed:
+                    raise restored_error from trace_error
+                raise restored_error
+            raise _restore_exception_traceback(
+                provider_error,
+                provider_diagnostics,
+            )
         self._record("writing_attempt_finished", {
             "attempt": attempt,
             "repair": repair,
@@ -844,20 +992,14 @@ class ResearchWorkflow:
         repair: bool,
         error: Exception,
     ) -> TraceWriteError | None:
+        failure_class, failure_message = _safe_failure_details(error)
         try:
             self._record_during_error("writing_attempt_finished", {
                 "attempt": attempt,
                 "repair": repair,
                 "status": "failed",
-                "failure_class": _bounded_trace_text(
-                    getattr(error, "failure_class", None)
-                    or type(error).__name__,
-                    _WRITING_FAILURE_CLASS_CHARS_MAX,
-                ),
-                "failure_message": _bounded_trace_text(
-                    getattr(error, "failure_message", None) or error,
-                    _WRITING_FAILURE_MESSAGE_CHARS_MAX,
-                ),
+                "failure_class": failure_class,
+                "failure_message": failure_message,
             })
         except TraceWriteError as trace_error:
             return trace_error
@@ -1529,17 +1671,12 @@ class ResearchWorkflow:
         error: Exception,
         state: dict[str, Any],
     ) -> TraceWriteError | None:
+        failure_class, failure_message = _safe_failure_details(error)
         try:
             plan = state.get("plan")
             budget = state.get("budget")
             gate = state.get("gate")
-            failure_class = (
-                getattr(error, "failure_class", None) or type(error).__name__
-            )
-            failure_message = (
-                getattr(error, "failure_message", None) or str(error)
-            )
-            self._record_during_error("research_workflow_completed", {
+            payload = {
                 "terminal_reason": "failed",
                 "rank": plan.rank.value if plan is not None else None,
                 "research_rounds_used": (
@@ -1556,13 +1693,26 @@ class ResearchWorkflow:
                 "remaining_gaps": (
                     tuple(gate.gaps) if gate is not None else ()
                 ),
-                "failure_class": str(failure_class),
-                "failure_message": str(failure_message),
-            })
+                "failure_class": failure_class,
+                "failure_message": failure_message,
+            }
+        except BaseException:
+            payload = {
+                "terminal_reason": "failed",
+                "rank": None,
+                "research_rounds_used": 0,
+                "remaining_rounds": None,
+                "supplemental_research_used": False,
+                "writing_repair_used": False,
+                "final_validation_errors": (),
+                "remaining_gaps": (),
+                "failure_class": failure_class,
+                "failure_message": failure_message,
+            }
+        try:
+            self._record_during_error("research_workflow_completed", payload)
         except TraceWriteError as trace_error:
             return trace_error
-        except Exception:
-            pass
         return None
 
     def _add_terminal_trace_note(
@@ -1570,23 +1720,11 @@ class ResearchWorkflow:
         error: Exception,
         trace_error: TraceWriteError,
     ) -> None:
-        trace_class = _bounded_trace_text(
-            type(trace_error).__name__,
-            _WRITING_FAILURE_CLASS_CHARS_MAX,
-        )
-        trace_message = _bounded_trace_text(
+        _add_audit_failure_note(
+            error,
+            "research_workflow_completed",
             trace_error,
-            _WRITING_FAILURE_MESSAGE_CHARS_MAX,
         )
-        add_note = getattr(error, "add_note", None)
-        if callable(add_note):
-            try:
-                add_note(
-                    "research_workflow_completed trace failed "
-                    f"[{trace_class}]: {trace_message}"
-                )
-            except Exception:
-                pass
 
     def run(
         self,
@@ -1606,7 +1744,7 @@ class ResearchWorkflow:
             "errors": (),
         }
         workflow_error: Exception | None = None
-        workflow_traceback = None
+        workflow_diagnostics: _ExceptionDiagnostics | None = None
         try:
             result = self._run_forward(
                 question,
@@ -1621,17 +1759,24 @@ class ResearchWorkflow:
             raise
         except Exception as error:
             workflow_error = error
-            workflow_traceback = error.__traceback__
+            workflow_diagnostics = _capture_exception_diagnostics(error)
 
+        assert workflow_error is not None
+        assert workflow_diagnostics is not None
         self._capture_consumed_rounds(state)
         terminal_trace_error = self._record_terminal_failure(
             workflow_error,
             state,
         )
         if terminal_trace_error is not None:
-            if workflow_error.__cause__ is None:
-                raise workflow_error.with_traceback(
-                    workflow_traceback
-                ) from terminal_trace_error
+            restored_error = _restore_exception_traceback(
+                workflow_error,
+                workflow_diagnostics,
+            )
+            if workflow_diagnostics.audit_cause_allowed:
+                raise restored_error from terminal_trace_error
             self._add_terminal_trace_note(workflow_error, terminal_trace_error)
-        raise workflow_error.with_traceback(workflow_traceback)
+        raise _restore_exception_traceback(
+            workflow_error,
+            workflow_diagnostics,
+        )

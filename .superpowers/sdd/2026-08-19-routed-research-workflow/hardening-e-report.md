@@ -174,3 +174,35 @@ The resulting research boundary is:
 - Affected regression suite: `189 passed`.
 - Full suite: `475 passed, 1 deselected`; the sole deselection was the approved source-map baseline test, using a unique external basetemp.
 - Final compile, baseline-range diff, commit, and clean-status evidence is included in the handoff.
+
+## Fix Round 4: preserve provider diagnostics
+
+### Baseline and root cause
+
+- Verified exact clean baseline `22d4b89743adc3ac51d3408b9b029f9bb78cf733` before edits.
+- The prior audit-failure merge treated only `provider.__cause__` as existing diagnostics. A provider with an existing `__context__` therefore received a new audit cause and suppressed its original context; a provider with an explicit cause also lost that cause during the failed-finished path.
+- Provider preservation still depended on overridable instance protocols: virtual access to traceback/cause/context, `failure_class` / `failure_message`, `add_note()`, `with_traceback()`, string conversion, and class-name lookup could raise a different exception and replace the provider failure.
+- Production scope remained only `simple_cc/research_workflow.py`; the accepted embedded-scheme scanner limitation was not touched.
+
+### Implementation and diagnostic-chain evidence
+
+- Provider capture now snapshots traceback, cause, context, and suppress-context through `BaseException.__getattribute__` in a guarded code-owned helper. Failure metadata uses the same guarded boundary, a metaclass-safe type-name lookup, and a whitespace/control-normalizing 128/512-character formatter with an unprintable fallback.
+- Audit notes use `BaseException.add_note()` directly and are bounded to 600 characters. Traceback restoration uses `BaseException.with_traceback()` directly and always returns the identical provider object even if restoration fails. These base-class calls bypass hostile instance overrides.
+- A failed-finished or terminal `TraceWriteError` becomes an explicit cause only when the captured provider has neither cause nor context. When either diagnostic already exists, the audit failure becomes an event-specific bounded note and the original cause, context, and suppress flag remain identical.
+- When failed-finished already became the first audit cause, a later terminal audit failure is only a terminal-specific note. All audit I/O still runs outside the active provider exception scope, keeping the complete cause/context graph acyclic and preserving the original traceback tail.
+- Terminal failure payload construction is isolated from hostile state/provider access and falls back to a bounded code-owned payload. Recorder calls remain outside that guard, so non-`TraceWriteError` `BaseException` behavior, including `KeyboardInterrupt` and `SystemExit`, is unchanged.
+
+### File-by-file scope
+
+- `simple_cc/research_workflow.py`: adds guarded exception diagnostics, bounded safe metadata and notes, base-class note/traceback operations, cause-or-context-aware audit merging, and safe terminal payload construction.
+- `tests/test_research_workflow.py`: expands attempts 1 and 2 across failed-only, persistent, and terminal-only audit failures; covers empty, explicit-cause, context, and suppressed-context providers with both preconstructed and real recorder failures; adds hostile exception protocols, bounded payload/note checks, traceback-tail and acyclic-graph checks, and `KeyboardInterrupt` / `SystemExit` characterization. The graph test helper also uses base-class attribute access so the helper itself does not invoke hostile protocols.
+- `.superpowers/sdd/2026-08-19-routed-research-workflow/hardening-e-report.md`: records Fix Round 4 review findings, TDD evidence, scope, and verification.
+
+### TDD and verification
+
+- Focused RED: `38 failed, 18 passed`; failures showed cause/context replacement and all six hostile-provider combinations replacing the provider object. A hostile-only characterization rerun produced `6 failed`. The two recorder `BaseException` cases already passed and fixed the behavior that must remain unchanged.
+- Focused GREEN: `56 passed, 70 deselected`.
+- Complete workflow file: `126 passed`.
+- Affected regression suite: `233 passed`.
+- Full suite: `519 passed, 1 deselected`; the sole deselection was the approved source-map baseline test, using a unique external basetemp.
+- Final compile, baseline-range diff, commit, and clean-status evidence is included in the handoff.

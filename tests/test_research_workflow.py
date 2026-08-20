@@ -118,10 +118,105 @@ def valid_light_report() -> ModelResponse:
 
 
 def _provider_error_with_origin(message: str) -> tuple[RuntimeError, object]:
+    return _error_with_origin(RuntimeError(message))
+
+
+def _error_with_origin(error: RuntimeError) -> tuple[RuntimeError, object]:
     try:
-        raise RuntimeError(message)
-    except RuntimeError as error:
-        return error, error.__traceback__
+        raise error
+    except RuntimeError as caught:
+        return caught, BaseException.__getattribute__(caught, "__traceback__")
+
+
+def _install_provider_diagnostics(
+    error: RuntimeError,
+    mode: str,
+) -> tuple[BaseException | None, BaseException | None, bool]:
+    cause: BaseException | None = None
+    context: BaseException | None = None
+    suppress_context = False
+    if mode == "explicit_cause":
+        cause = LookupError("provider cause")
+        suppress_context = True
+    elif mode == "context":
+        context = LookupError("provider context")
+    elif mode == "suppressed_context":
+        context = LookupError("suppressed provider context")
+        suppress_context = True
+    BaseException.__setattr__(error, "__cause__", cause)
+    BaseException.__setattr__(error, "__context__", context)
+    BaseException.__setattr__(error, "__suppress_context__", suppress_context)
+    return cause, context, suppress_context
+
+
+def _assert_provider_diagnostics(
+    error: RuntimeError,
+    *,
+    cause: BaseException | None,
+    context: BaseException | None,
+    suppress_context: bool,
+) -> None:
+    if BaseException.__getattribute__(error, "__cause__") is not cause:
+        pytest.fail("provider cause identity changed", pytrace=False)
+    if BaseException.__getattribute__(error, "__context__") is not context:
+        pytest.fail("provider context identity changed", pytrace=False)
+    if (
+        BaseException.__getattribute__(error, "__suppress_context__")
+        is not suppress_context
+    ):
+        pytest.fail("provider suppress-context flag changed", pytrace=False)
+
+
+def _audit_notes(error: BaseException, event_type: str) -> list[str]:
+    try:
+        notes = BaseException.__getattribute__(error, "__notes__")
+    except AttributeError:
+        return []
+    return [note for note in notes if event_type in note]
+
+
+class _HostileProtocolTrap(RuntimeError):
+    pass
+
+
+class _HostileExceptionMeta(type):
+    def __getattribute__(cls, name):
+        if name == "__name__":
+            raise _HostileProtocolTrap("hostile class-name lookup")
+        return type.__getattribute__(cls, name)
+
+
+class _HostileProviderError(RuntimeError, metaclass=_HostileExceptionMeta):
+    @property
+    def failure_class(self):
+        raise _HostileProtocolTrap("hostile failure_class getter")
+
+    @property
+    def failure_message(self):
+        raise _HostileProtocolTrap("hostile failure_message getter")
+
+    def __getattribute__(self, name):
+        if name in {
+            "failure_class",
+            "failure_message",
+            "add_note",
+            "with_traceback",
+            "__traceback__",
+            "__cause__",
+            "__context__",
+            "__suppress_context__",
+        }:
+            raise _HostileProtocolTrap(f"hostile {name} lookup")
+        return BaseException.__getattribute__(self, name)
+
+    def __str__(self):
+        raise _HostileProtocolTrap("hostile string conversion")
+
+    def add_note(self, note):
+        raise _HostileProtocolTrap("hostile add_note call")
+
+    def with_traceback(self, traceback):
+        raise _HostileProtocolTrap("hostile with_traceback call")
 
 
 def _trace_failure_kind(event_type: str, payload: dict) -> str | None:
@@ -138,7 +233,7 @@ def _trace_failure_kind(event_type: str, payload: dict) -> str | None:
 def _trace_failure_message(kind: str) -> str:
     if kind == "terminal":
         return "terminal\ntrace " + "x" * 2_000
-    return "failed finished trace unavailable"
+    return "failed\nfinished trace " + "x" * 2_000
 
 
 def _install_trace_failures(
@@ -208,15 +303,13 @@ def _assert_acyclic_exception_graph(error: BaseException) -> list[BaseException]
             return
         identity = id(node)
         if identity in visiting:
-            raise AssertionError(
-                f"exception graph cycle reaches {type(node).__name__}"
-            )
+            raise AssertionError("exception graph contains a cycle")
         if identity in visited:
             return
         visiting.add(identity)
         nodes.append(node)
-        visit(node.__cause__)
-        visit(node.__context__)
+        visit(BaseException.__getattribute__(node, "__cause__"))
+        visit(BaseException.__getattribute__(node, "__context__"))
         visiting.remove(identity)
         visited.add(identity)
 
@@ -2133,15 +2226,23 @@ def test_writing_finished_trace_failure_preserves_identity_and_skips_gate(
 
 @pytest.mark.parametrize("trace_mode", ("preconstructed", "write_failure"))
 @pytest.mark.parametrize("failed_attempt", (1, 2))
+@pytest.mark.parametrize(
+    "provider_diagnostics",
+    ("empty", "explicit_cause", "context", "suppressed_context"),
+)
 def test_provider_error_remains_primary_when_failed_finished_trace_also_fails(
     tmp_path,
     monkeypatch,
     failed_attempt,
     trace_mode,
+    provider_diagnostics,
 ):
     registry = registry_with_two_sources()
     provider_error, origin_traceback = _provider_error_with_origin(
         f"writer {failed_attempt} offline"
+    )
+    original_cause, original_context, original_suppress = (
+        _install_provider_diagnostics(provider_error, provider_diagnostics)
     )
     responses = [
         light_plan_response(),
@@ -2182,31 +2283,54 @@ def test_provider_error_remains_primary_when_failed_finished_trace_also_fails(
         workflow.run("question", "2025-05-01", registry=registry)
 
     assert caught.value is provider_error
-    assert caught.value.__cause__ is trace_errors["writing_failed"]
+    expected_cause = (
+        trace_errors["writing_failed"]
+        if provider_diagnostics == "empty"
+        else original_cause
+    )
+    _assert_provider_diagnostics(
+        caught.value,
+        cause=expected_cause,
+        context=original_context,
+        suppress_context=(
+            True if provider_diagnostics == "empty" else original_suppress
+        ),
+    )
     assert active_exceptions == {"writing_failed": None}
     if trace_mode == "write_failure":
         assert trace_errors["writing_failed"].__cause__ is (
             os_errors["writing_failed"]
         )
     _assert_acyclic_exception_graph(caught.value)
-    assert _traceback_contains(caught.value.__traceback__, origin_traceback)
-    assert any(
-        "writing_attempt_finished trace failed" in note
-        for note in getattr(caught.value, "__notes__", ())
+    assert _traceback_contains(
+        BaseException.__getattribute__(caught.value, "__traceback__"),
+        origin_traceback,
     )
+    writing_notes = _audit_notes(caught.value, "writing_attempt_finished")
+    assert len(writing_notes) == 1
+    assert "\n" not in writing_notes[0]
+    assert len(writing_notes[0]) <= 600
 
 
 @pytest.mark.parametrize("trace_mode", ("preconstructed", "write_failure"))
 @pytest.mark.parametrize("failed_attempt", (1, 2))
+@pytest.mark.parametrize(
+    "provider_diagnostics",
+    ("empty", "explicit_cause", "context", "suppressed_context"),
+)
 def test_provider_error_keeps_first_trace_cause_when_terminal_trace_also_fails(
     tmp_path,
     monkeypatch,
     failed_attempt,
     trace_mode,
+    provider_diagnostics,
 ):
     registry = registry_with_two_sources()
     provider_error, origin_traceback = _provider_error_with_origin(
         f"writer {failed_attempt} offline"
+    )
+    original_cause, original_context, original_suppress = (
+        _install_provider_diagnostics(provider_error, provider_diagnostics)
     )
     responses = [
         light_plan_response(),
@@ -2247,7 +2371,19 @@ def test_provider_error_keeps_first_trace_cause_when_terminal_trace_also_fails(
         workflow.run("question", "2025-05-01", registry=registry)
 
     assert caught.value is provider_error
-    assert caught.value.__cause__ is trace_errors["writing_failed"]
+    expected_cause = (
+        trace_errors["writing_failed"]
+        if provider_diagnostics == "empty"
+        else original_cause
+    )
+    _assert_provider_diagnostics(
+        caught.value,
+        cause=expected_cause,
+        context=original_context,
+        suppress_context=(
+            True if provider_diagnostics == "empty" else original_suppress
+        ),
+    )
     assert active_exceptions == {"writing_failed": None, "terminal": None}
     if trace_mode == "write_failure":
         assert trace_errors["writing_failed"].__cause__ is (
@@ -2256,12 +2392,15 @@ def test_provider_error_keeps_first_trace_cause_when_terminal_trace_also_fails(
         assert trace_errors["terminal"].__cause__ is os_errors["terminal"]
     _assert_acyclic_exception_graph(caught.value)
     _assert_acyclic_exception_graph(trace_errors["terminal"])
-    assert _traceback_contains(caught.value.__traceback__, origin_traceback)
-    terminal_notes = [
-        note
-        for note in getattr(caught.value, "__notes__", ())
-        if "research_workflow_completed trace failed" in note
-    ]
+    assert _traceback_contains(
+        BaseException.__getattribute__(caught.value, "__traceback__"),
+        origin_traceback,
+    )
+    writing_notes = _audit_notes(caught.value, "writing_attempt_finished")
+    assert len(writing_notes) == 1
+    assert "\n" not in writing_notes[0]
+    assert len(writing_notes[0]) <= 600
+    terminal_notes = _audit_notes(caught.value, "research_workflow_completed")
     assert len(terminal_notes) == 1
     assert "TraceWriteError" in terminal_notes[0]
     assert "\n" not in terminal_notes[0]
@@ -2270,15 +2409,23 @@ def test_provider_error_keeps_first_trace_cause_when_terminal_trace_also_fails(
 
 @pytest.mark.parametrize("trace_mode", ("preconstructed", "write_failure"))
 @pytest.mark.parametrize("failed_attempt", (1, 2))
+@pytest.mark.parametrize(
+    "provider_diagnostics",
+    ("empty", "explicit_cause", "context", "suppressed_context"),
+)
 def test_provider_error_uses_terminal_trace_as_cause_when_only_terminal_fails(
     tmp_path,
     monkeypatch,
     failed_attempt,
     trace_mode,
+    provider_diagnostics,
 ):
     registry = registry_with_two_sources()
     provider_error, origin_traceback = _provider_error_with_origin(
         f"writer {failed_attempt} offline"
+    )
+    original_cause, original_context, original_suppress = (
+        _install_provider_diagnostics(provider_error, provider_diagnostics)
     )
     responses = [
         light_plan_response(),
@@ -2322,12 +2469,192 @@ def test_provider_error_uses_terminal_trace_as_cause_when_only_terminal_fails(
         workflow.run("question", "2025-05-01", registry=registry)
 
     assert caught.value is provider_error
-    assert caught.value.__cause__ is trace_errors["terminal"]
+    expected_cause = (
+        trace_errors["terminal"]
+        if provider_diagnostics == "empty"
+        else original_cause
+    )
+    _assert_provider_diagnostics(
+        caught.value,
+        cause=expected_cause,
+        context=original_context,
+        suppress_context=(
+            True if provider_diagnostics == "empty" else original_suppress
+        ),
+    )
     assert active_exceptions == {"terminal": None}
     if trace_mode == "write_failure":
         assert trace_errors["terminal"].__cause__ is os_errors["terminal"]
     _assert_acyclic_exception_graph(caught.value)
-    assert _traceback_contains(caught.value.__traceback__, origin_traceback)
+    assert _traceback_contains(
+        BaseException.__getattribute__(caught.value, "__traceback__"),
+        origin_traceback,
+    )
+    terminal_notes = _audit_notes(caught.value, "research_workflow_completed")
+    assert len(terminal_notes) == (0 if provider_diagnostics == "empty" else 1)
+    if terminal_notes:
+        assert "TraceWriteError" in terminal_notes[0]
+        assert "\n" not in terminal_notes[0]
+        assert len(terminal_notes[0]) <= 600
+
+
+@pytest.mark.parametrize("failed_attempt", (1, 2))
+@pytest.mark.parametrize(
+    ("failure_combination", "failed_kinds"),
+    (
+        ("failed_only", {"writing_failed"}),
+        ("persistent", {"writing_failed", "terminal"}),
+        ("terminal_only", {"terminal"}),
+    ),
+)
+def test_hostile_provider_protocols_cannot_replace_primary_error(
+    tmp_path,
+    monkeypatch,
+    failed_attempt,
+    failure_combination,
+    failed_kinds,
+):
+    registry = registry_with_two_sources()
+    provider_error, origin_traceback = _error_with_origin(
+        _HostileProviderError("private\nprovider " + "s" * 2_000)
+    )
+    responses = [
+        light_plan_response(),
+        gate_response(registry, covered=True),
+    ]
+    if failed_attempt == 2:
+        responses.append(ModelResponse("unsupported draft"))
+    responses.append(provider_error)
+    provider = ScriptedProvider(responses)
+    recorder = TraceRecorder(
+        tmp_path / "run",
+        run_id=f"hostile-{failure_combination}-{failed_attempt}",
+    )
+    recorder.start_run(
+        task_id="research-task",
+        question="question",
+        cutoff="2025-05-01",
+        metadata={"task_type": "research"},
+    )
+    run = RunContext(
+        recorder,
+        f"hostile-{failure_combination}-{failed_attempt}",
+        "research-task",
+        "2025-05-01",
+    )
+    trace_errors, _, active_exceptions = _install_trace_failures(
+        monkeypatch,
+        recorder,
+        kinds=failed_kinds,
+        mode="preconstructed",
+    )
+    workflow = ResearchWorkflow(
+        provider,
+        lambda prompt, max_rounds, evidence_registry: AgentLoopOutcome(
+            "completed", "notes", rounds_used=1
+        ),
+        run_context=run,
+    )
+
+    with bind_run_context(run), pytest.raises(BaseException) as caught:
+        workflow.run("question", "2025-05-01", registry=registry)
+
+    if caught.value is not provider_error:
+        pytest.fail("hostile protocol replaced the provider exception", pytrace=False)
+    first_audit = (
+        trace_errors["terminal"]
+        if failure_combination == "terminal_only"
+        else trace_errors["writing_failed"]
+    )
+    _assert_provider_diagnostics(
+        provider_error,
+        cause=first_audit,
+        context=None,
+        suppress_context=True,
+    )
+    assert active_exceptions == {kind: None for kind in failed_kinds}
+    _assert_acyclic_exception_graph(provider_error)
+    assert _traceback_contains(
+        BaseException.__getattribute__(provider_error, "__traceback__"),
+        origin_traceback,
+    )
+
+    writing_notes = _audit_notes(provider_error, "writing_attempt_finished")
+    assert len(writing_notes) == (
+        0 if failure_combination == "terminal_only" else 1
+    )
+    terminal_notes = _audit_notes(provider_error, "research_workflow_completed")
+    assert len(terminal_notes) == (1 if failure_combination == "persistent" else 0)
+    for note in [*writing_notes, *terminal_notes]:
+        assert "\n" not in note
+        assert len(note) <= 600
+
+    rows, incomplete = read_trace_lines(recorder.trajectory_path)
+    assert incomplete is False
+    failed_events = [
+        row["payload"]
+        for row in rows
+        if row["event_type"] == "writing_attempt_finished"
+        and row["payload"].get("status") == "failed"
+    ]
+    if failure_combination == "terminal_only":
+        assert len(failed_events) == 1
+        payload = failed_events[0]
+        assert isinstance(payload["failure_class"], str)
+        assert len(payload["failure_class"]) <= 128
+        assert isinstance(payload["failure_message"], str)
+        assert len(payload["failure_message"]) <= 512
+        assert "private" not in payload["failure_message"]
+        assert "\n" not in payload["failure_message"]
+
+
+@pytest.mark.parametrize("interrupt_type", (KeyboardInterrupt, SystemExit))
+def test_non_trace_base_exception_from_audit_recorder_is_not_swallowed(
+    tmp_path,
+    monkeypatch,
+    interrupt_type,
+):
+    registry = registry_with_two_sources()
+    provider_error = RuntimeError("writer offline")
+    provider = ScriptedProvider([
+        light_plan_response(),
+        gate_response(registry, covered=True),
+        provider_error,
+    ])
+    recorder = TraceRecorder(tmp_path / "run", run_id="audit-base-exception")
+    recorder.start_run(
+        task_id="research-task",
+        question="question",
+        cutoff="2025-05-01",
+        metadata={"task_type": "research"},
+    )
+    run = RunContext(
+        recorder,
+        "audit-base-exception",
+        "research-task",
+        "2025-05-01",
+    )
+    interrupt = interrupt_type("audit interrupted")
+    original_record = recorder.record
+
+    def interrupt_audit(event_type, payload, **kwargs):
+        if _trace_failure_kind(event_type, payload) == "writing_failed":
+            raise interrupt
+        return original_record(event_type, payload, **kwargs)
+
+    monkeypatch.setattr(recorder, "record", interrupt_audit)
+    workflow = ResearchWorkflow(
+        provider,
+        lambda prompt, max_rounds, evidence_registry: AgentLoopOutcome(
+            "completed", "notes", rounds_used=1
+        ),
+        run_context=run,
+    )
+
+    with bind_run_context(run), pytest.raises(BaseException) as caught:
+        workflow.run("question", "2025-05-01", registry=registry)
+
+    assert caught.value is interrupt
 
 
 @pytest.mark.parametrize("failed_attempt", (1, 2))
