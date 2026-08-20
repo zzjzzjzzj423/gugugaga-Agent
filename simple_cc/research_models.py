@@ -392,6 +392,11 @@ class EvidenceRegistry:
         if existing is None:
             self._records[record.canonical_url] = record
             return record
+        if existing.tool_name != record.tool_name:
+            raise EvidenceRegistrationError(
+                "conflicting_tool_name",
+                "repeated source has conflicting fetch-tool provenance",
+            )
 
         for field_name in ("published_at", "date_status", "cutoff"):
             old_value = getattr(existing, field_name)
@@ -438,6 +443,14 @@ class EvidenceRegistry:
             content_fragments=merged_fragments,
             artifact_references=tuple(artifact_references),
         )
+        # Authority can only originate from the already trusted existing
+        # record. Validate every merged ingestion field through the same
+        # boundary before committing, with that gate-owned state removed.
+        self._validate_record(replace(
+            merged,
+            authoritative=False,
+            authority_reason=None,
+        ))
         if merged == existing:
             return existing
         self._records[record.canonical_url] = merged
@@ -455,10 +468,8 @@ class EvidenceRegistry:
             for url, item in self._records.items()
         }
 
-    def mark_authority(self, source_id: str, authoritative: bool, reason: str) -> None:
-        record = self.get_by_id(source_id)
-        if record is None:
-            raise ValueError(f"unknown evidence source id: {source_id}")
+    @staticmethod
+    def _validated_authority_reason(authoritative: bool, reason: str) -> str:
         if type(authoritative) is not bool:
             raise ValueError("authoritative decision must be a bool")
         if not isinstance(reason, str):
@@ -472,6 +483,47 @@ class EvidenceRegistry:
             raise ValueError(
                 "authority reason must be non-empty, control-safe, and bounded"
             )
+        return cleaned_reason
+
+    def replace_authority_decisions(
+        self,
+        decisions: tuple[tuple[str, bool, str], ...],
+    ) -> None:
+        cleared = {
+            url: replace(item, authoritative=False, authority_reason=None)
+            for url, item in self._records.items()
+        }
+        staged = dict(cleared)
+        try:
+            for source_id, authoritative, reason in decisions:
+                record = next(
+                    (
+                        item for item in staged.values()
+                        if item.source_id == source_id
+                    ),
+                    None,
+                )
+                if record is None:
+                    raise ValueError(f"unknown evidence source id: {source_id}")
+                cleaned_reason = self._validated_authority_reason(
+                    authoritative,
+                    reason,
+                )
+                staged[record.canonical_url] = replace(
+                    record,
+                    authoritative=authoritative,
+                    authority_reason=cleaned_reason,
+                )
+        except (TypeError, ValueError):
+            self._records = cleared
+            raise
+        self._records = staged
+
+    def mark_authority(self, source_id: str, authoritative: bool, reason: str) -> None:
+        record = self.get_by_id(source_id)
+        if record is None:
+            raise ValueError(f"unknown evidence source id: {source_id}")
+        cleaned_reason = self._validated_authority_reason(authoritative, reason)
         self._records[record.canonical_url] = replace(
             record,
             authoritative=authoritative,

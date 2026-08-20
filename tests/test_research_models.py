@@ -75,6 +75,37 @@ def test_registry_deduplicates_canonical_urls():
     assert registry.records == (first,)
 
 
+def test_registry_rejects_duplicate_url_with_different_fetch_tool_unchanged():
+    url = "https://example.com/report"
+    web_record = evidence_record_from_result(
+        "web_fetch",
+        '{"ok":true,"operation":"fetch",'
+        f'"url":"{url}","title":"Web report",'
+        '"content":"web facts","published_at":"2025-01-02",'
+        '"date_status":"verified","cutoff":"2025-05-01"}',
+    )
+    pdf_record = evidence_record_from_result(
+        "pdf_fetch",
+        '{"ok":true,"operation":"pdf_fetch",'
+        f'"url":"{url}","title":"PDF report",'
+        '"start_page":1,"end_page":1,"pages":['
+        '{"page_number":1,"content":"pdf facts"}],'
+        '"published_at":"2025-01-02","date_status":"verified",'
+        '"cutoff":"2025-05-01"}',
+    )
+    assert web_record is not None
+    assert pdf_record is not None
+    registry = EvidenceRegistry()
+    registry.register(web_record)
+    before = registry.records
+
+    with pytest.raises(EvidenceRegistrationError) as caught:
+        registry.register(pdf_record)
+
+    assert caught.value.code == "conflicting_tool_name"
+    assert registry.records == before
+
+
 @pytest.mark.parametrize(
     ("changes", "error_code"),
     (

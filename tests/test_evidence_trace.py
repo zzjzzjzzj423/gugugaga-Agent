@@ -98,7 +98,7 @@ def test_citation_linkage_supports_legal_brackets_and_rejects_prefix_attack():
     parenthesis_url = canonicalize_url("https://example.com/a)b")
     bracket_url = canonicalize_url("https://example.com/a]b")
     linked = link_final_answer_sources(
-        f"See [paren]({parenthesis_url}). Then {bracket_url}, for comparison.",
+        f"See [paren]({parenthesis_url}). Then <{bracket_url}> for comparison.",
         {
             parenthesis_url: "src_parenthesis",
             bracket_url: "src_bracket",
@@ -116,7 +116,7 @@ def test_citation_linkage_supports_legal_brackets_and_rejects_prefix_attack():
         "https://example.com/report/attacker-copy"
     )
     attacked = link_final_answer_sources(
-        f"Do not trust {longer_unfetched}.",
+        f"Do not trust <{longer_unfetched}>.",
         {registered_prefix: "src_prefix"},
     )
 
@@ -127,7 +127,7 @@ def test_citation_linkage_supports_legal_brackets_and_rejects_prefix_attack():
         "https://example.com/report)"
     )
     delimiter_attacked = link_final_answer_sources(
-        f"A distinct unfetched identity is {delimiter_suffix_attack}.",
+        f"A distinct unfetched identity is <{delimiter_suffix_attack}>.",
         {registered_prefix: "src_prefix"},
     )
 
@@ -135,6 +135,32 @@ def test_citation_linkage_supports_legal_brackets_and_rejects_prefix_attack():
     assert delimiter_attacked["unmatched_citations"] == [
         delimiter_suffix_attack
     ]
+
+
+def test_plain_url_punctuation_never_matches_a_registered_prefix():
+    registered = canonicalize_url("https://example.com/report")
+    unfetched = canonicalize_url("https://example.com/report!")
+
+    linked = link_final_answer_sources(
+        f"The distinct URL is {unfetched} and was not fetched.",
+        {registered: "src_registered"},
+    )
+
+    assert linked["matched_source_ids"] == []
+    assert linked["unmatched_citations"] == [unfetched]
+
+
+@pytest.mark.parametrize("punctuation", ("!", ".", ",", ";", ":"))
+def test_exact_registered_url_identity_keeps_trailing_punctuation(punctuation):
+    registered = canonicalize_url(f"https://example.com/report{punctuation}")
+
+    linked = link_final_answer_sources(
+        f"The exact fetched URL is {registered} and is cited.",
+        {registered: "src_exact"},
+    )
+
+    assert linked["matched_source_ids"] == ["src_exact"]
+    assert linked["unmatched_citations"] == []
 
 
 def test_source_runtime_traces_tool_and_injects_cutoff(tmp_path, monkeypatch):

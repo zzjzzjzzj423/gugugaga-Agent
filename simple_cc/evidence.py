@@ -148,7 +148,6 @@ def source_id_for_url(url: str) -> str:
 
 
 _URL_PATTERN = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
-_CITATION_PROSE_TRAILING = ".,;:!?\"'"
 
 
 def link_final_answer_sources(
@@ -160,22 +159,40 @@ def link_final_answer_sources(
     answer = final_text or ""
     for match in _URL_PATTERN.finditer(answer):
         raw_token = match.group(0)
-        raw = raw_token.rstrip(_CITATION_PROSE_TRAILING)
-        # Only remove a closing parenthesis when syntax proves that it closes a
-        # Markdown link. In plain prose `)` and `]` remain legal URL identity,
-        # preventing a registered prefix from matching a longer unfetched URL.
-        if answer[max(0, match.start() - 2):match.start()] == "](" and raw.endswith(
-            ")"
-        ):
-            raw = raw[:-1]
+        canonical: str | None = None
         try:
-            canonical = canonicalize_url(raw)
+            canonical = canonicalize_url(raw_token)
         except ValueError:
+            pass
+
+        # An exact registered identity wins, including URL-valid trailing
+        # punctuation. Only proven Markdown syntax may remove a structural
+        # closing parenthesis; plain-text punctuation is never guessed away.
+        source_id = (
+            registered_sources.get(canonical)
+            if canonical is not None
+            else None
+        )
+        if (
+            source_id is None
+            and answer[max(0, match.start() - 2):match.start()] == "]("
+        ):
+            closing = raw_token.rfind(")")
+            if closing >= 0:
+                try:
+                    canonical = canonicalize_url(raw_token[:closing])
+                except ValueError:
+                    canonical = None
+                source_id = (
+                    registered_sources.get(canonical)
+                    if canonical is not None
+                    else None
+                )
+        if canonical is None:
             continue
         if canonical in cited_urls:
             continue
         cited_urls.append(canonical)
-        source_id = registered_sources.get(canonical)
         if source_id is None:
             unmatched.append(canonical)
         elif source_id not in matched:

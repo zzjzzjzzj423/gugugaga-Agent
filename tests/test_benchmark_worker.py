@@ -356,7 +356,7 @@ def test_offline_worker_search_fetch_answer_trace_is_self_consistent(
                 "tool_calls",
             ),
             ModelResponse(
-                f"Research notes supported by {url_a} and {url_b}."
+                f"Research notes supported by <{url_a}> and <{url_b}>."
             ),
             ModelResponse(json.dumps({
                 "directions": [{
@@ -372,7 +372,9 @@ def test_offline_worker_search_fetch_answer_trace_is_self_consistent(
                 }],
                 "gaps": [],
             })),
-            ModelResponse(f"Final answer supported by {url_a} and {url_b}."),
+            ModelResponse(
+                f"Final answer supported by <{url_a}> and <{url_b}>."
+            ),
         ]
     )
     run_dir = tmp_path / "run"

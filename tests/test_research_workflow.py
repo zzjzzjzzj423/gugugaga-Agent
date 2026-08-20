@@ -549,6 +549,57 @@ def test_200_record_gate_prompt_and_packet_selection_trace_stay_bounded(tmp_path
     assert selection["truncated_fields"]
 
 
+@pytest.mark.parametrize("omitted_use", ("direction", "authority"))
+def test_actual_gate_rejects_ids_omitted_from_40_record_packet(omitted_use):
+    registry = EvidenceRegistry()
+    for index in range(40):
+        record = evidence_record_from_result(
+            "web_fetch",
+            json.dumps({
+                "ok": True,
+                "operation": "fetch",
+                "url": f"https://domain-{index}.example/report",
+                "title": f"Evidence {index}",
+                "content": f"direct evidence {index}",
+                "published_at": "2025-01-02",
+                "date_status": "verified",
+                "cutoff": "2025-05-01",
+            }),
+        )
+        assert record is not None
+        registry.register(record)
+    packet = build_evidence_packet(registry)
+    assert len(packet) == EVIDENCE_PACKET_MAX_RECORDS
+    selected_ids = {item["source_id"] for item in packet}
+    omitted_id = next(
+        item.source_id
+        for item in registry.records
+        if item.source_id not in selected_ids
+    )
+    payload = valid_gate_payload(registry)
+    selected_id = packet[0]["source_id"]
+    payload["directions"][0]["source_ids"] = [selected_id]
+    payload["authorities"][0]["source_id"] = selected_id
+    if omitted_use == "direction":
+        payload["directions"][0]["source_ids"] = [omitted_id]
+    else:
+        payload["authorities"][0]["source_id"] = omitted_id
+    provider = ScriptedProvider([ModelResponse(json.dumps(payload))])
+
+    decision = ResearchWorkflow(
+        provider,
+        lambda prompt, max_rounds, evidence_registry: None,
+    ).evaluate_research("question", "2025-05-01", light_plan(), registry)
+
+    request = json.loads(provider.requests[0]["messages"][0]["content"])
+    assert omitted_id not in {item["source_id"] for item in request["evidence"]}
+    assert decision.passed is False
+    assert decision.source_count == 40
+    assert decision.domain_count == 40
+    assert "unknown evidence source id" in " ".join(decision.validation_errors)
+    assert not any(item.authoritative for item in registry.records)
+
+
 def test_gate_rejects_unknown_authority_id():
     registry = registry_with_two_sources()
     payload = valid_gate_payload(registry)
@@ -733,6 +784,41 @@ def test_gate_invalid_later_authority_does_not_apply_valid_first_decision():
     assert decision.passed is False
     assert "unknown evidence source id" in " ".join(decision.validation_errors)
     assert not any(item.authoritative for item in registry.records)
+
+
+def test_gate_nul_in_second_authority_is_transactional_and_fails_writing_quota():
+    registry = registry_with_two_sources()
+    payload = valid_gate_payload(registry)
+    payload["authorities"].append({
+        "source_id": registry.records[1].source_id,
+        "is_authoritative": True,
+        "reason": "unsafe\u0000reason",
+    })
+
+    decision = parse_research_gate(json.dumps(payload), light_plan(), registry)
+
+    assert decision.passed is False
+    assert "control-safe" in " ".join(decision.validation_errors)
+    assert not any(item.authoritative for item in registry.records)
+    assert "use at least 1 authoritative source" in validate_research_final(
+        "Report https://alpha.example/report https://beta.example/data",
+        registry,
+        light_plan(),
+    )
+
+
+def test_gate_authority_reason_uses_same_nfc_then_length_rule_as_registry():
+    registry = registry_with_two_sources()
+    payload = valid_gate_payload(registry)
+    decomposed_reason = "e\u0301" * 257
+    payload["authorities"][0]["reason"] = decomposed_reason
+
+    decision = parse_research_gate(json.dumps(payload), light_plan(), registry)
+
+    assert decision.passed is True
+    authoritative = registry.get_by_id(registry.records[0].source_id)
+    assert authoritative is not None
+    assert authoritative.authority_reason == "é" * 257
 
 
 def test_gate_passes_with_two_domains_covered_direction_and_authority():
