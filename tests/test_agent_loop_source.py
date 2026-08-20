@@ -520,7 +520,9 @@ def test_source_runtime_research_executor_uses_shared_registry_and_private_notes
     assert captured["finalize_user_turn"] is False
     assert isinstance(captured["evidence_registry"], EvidenceRegistry)
     assert captured["research_cutoff"] == "2025-05-01"
-    assert "financial research agent" in captured["system_prompt"]
+    assert "evidence-gathering research executor" in captured["system_prompt"]
+    assert "final report is produced only" in captured["system_prompt"]
+    assert "untrusted data" in captured["system_prompt"]
     assert "missing filing" in captured["system_prompt"]
     assert "private research notes" not in repr(runtime.messages)
 

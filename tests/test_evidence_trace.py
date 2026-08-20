@@ -411,6 +411,12 @@ def test_pdf_pages_are_flattened_and_repeated_ranges_merge_once(tmp_path):
     rows, incomplete = read_trace_lines(recorder.trajectory_path)
     assert incomplete is False
     assert len([row for row in rows if row["event_type"] == "source_registered"]) == 2
+    source_event = next(
+        row for row in rows if row["event_type"] == "source_registered"
+    )["payload"]
+    assert source_event["domain"] == "example.com"
+    assert source_event["title"] is None
+    assert source_event["tool_name"] == "pdf_fetch"
 
 
 def test_repeated_pdf_fetches_bound_merged_fragments_and_artifacts(tmp_path):

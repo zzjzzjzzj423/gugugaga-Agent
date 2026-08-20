@@ -707,7 +707,10 @@ def record_research_evidence(
         "source_registered",
         {
             "source_id": record.source_id,
-            "canonical_url": record.canonical_url,
+            "canonical_url": record.canonical_url[:2048],
+            "domain": record.domain[:255],
+            "title": record.title[:512] if record.title is not None else None,
+            "tool_name": record.tool_name[:64],
             "published_at": record.published_at,
             "date_status": record.date_status,
             "cutoff": record.cutoff,

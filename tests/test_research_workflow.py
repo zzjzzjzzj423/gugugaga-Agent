@@ -10,6 +10,12 @@ from simple_cc.evidence import evidence_record_from_result, source_id_for_url
 from simple_cc.models import ModelResponse, ToolCall
 from simple_cc.research_models import EvidenceRegistry, ResearchPlan, ResearchRank
 from simple_cc.research_workflow import (
+    EVIDENCE_PACKET_DOMAIN_CHARS_MAX,
+    EVIDENCE_PACKET_MAX_RECORDS,
+    EVIDENCE_PACKET_TEXT_CHARS_MAX,
+    EVIDENCE_PACKET_TITLE_CHARS_MAX,
+    EVIDENCE_PACKET_TOTAL_CHARS_MAX,
+    EVIDENCE_PACKET_URL_CHARS_MAX,
     ResearchWorkflow,
     build_evidence_packet,
     parse_research_gate,
@@ -204,6 +210,105 @@ def test_build_evidence_packet_exposes_only_registered_bounded_fields():
         "date_status": "verified",
         "cutoff": "2025-05-01",
     }
+
+
+def test_evidence_packet_is_deterministic_diverse_and_aggregate_bounded():
+    registry = EvidenceRegistry()
+    for index in range(200):
+        domain = "repeated.example" if index < 190 else f"domain-{index}.example"
+        url = f"https://{domain}/{'u' * 3000}/{index}"
+        record = evidence_record_from_result(
+            "web_fetch",
+            json.dumps({
+                "ok": True,
+                "operation": "fetch",
+                "url": url,
+                "title": "T" * 2000,
+                "content": f"record {index} " + "evidence " * 1000,
+                "published_at": "2025-01-02",
+                "date_status": "verified",
+                "cutoff": "2025-05-01",
+            }),
+        )
+        assert record is not None
+        registered = registry.register(record)
+        if index >= 198:
+            registry.mark_authority(
+                registered.source_id, True, "official source " + "R" * 2000
+            )
+
+    first = build_evidence_packet(registry)
+    second = build_evidence_packet(registry)
+
+    assert first == second
+    assert len(first) <= EVIDENCE_PACKET_MAX_RECORDS
+    assert len(json.dumps(first, ensure_ascii=False, sort_keys=True)) <= (
+        EVIDENCE_PACKET_TOTAL_CHARS_MAX
+    )
+    assert len({item["domain"] for item in first}) >= 4
+    assert {
+        item.source_id for item in registry.records if item.authoritative
+    } <= {item["source_id"] for item in first}
+    assert all(
+        len(item["url"]) <= EVIDENCE_PACKET_URL_CHARS_MAX
+        and len(item["domain"]) <= EVIDENCE_PACKET_DOMAIN_CHARS_MAX
+        and len(item["title"] or "") <= EVIDENCE_PACKET_TITLE_CHARS_MAX
+        and len(item["content_excerpt"]) <= EVIDENCE_PACKET_TEXT_CHARS_MAX
+        for item in first
+    )
+
+
+def test_200_record_gate_prompt_and_packet_selection_trace_stay_bounded(tmp_path):
+    registry = EvidenceRegistry()
+    for index in range(200):
+        record = evidence_record_from_result(
+            "web_fetch",
+            json.dumps({
+                "ok": True,
+                "operation": "fetch",
+                "url": f"https://domain-{index}.example/report",
+                "title": "Evidence " + "T" * 1000,
+                "content": "X" * 6000,
+                "published_at": "2025-01-02",
+                "date_status": "verified",
+                "cutoff": "2025-05-01",
+            }),
+        )
+        assert record is not None
+        registry.register(record)
+    provider = ScriptedProvider([ModelResponse("invalid gate")])
+    recorder = TraceRecorder(tmp_path / "run", run_id="packet-bound-run")
+    recorder.start_run(
+        task_id="research-task",
+        question="question",
+        cutoff="2025-05-01",
+        metadata={"task_type": "research"},
+    )
+    run = RunContext(recorder, "packet-bound-run", "research-task", "2025-05-01")
+
+    ResearchWorkflow(
+        provider,
+        lambda prompt, max_rounds, evidence_registry: None,
+        run_context=run,
+    ).evaluate_research("question", "2025-05-01", light_plan(), registry)
+
+    request_text = provider.requests[0]["messages"][0]["content"]
+    assert len(request_text) < EVIDENCE_PACKET_TOTAL_CHARS_MAX + 10_000
+    rows, incomplete = read_trace_lines(recorder.trajectory_path)
+    selection = next(
+        row["payload"]
+        for row in rows
+        if row["event_type"] == "evidence_packet_selected"
+    )
+    assert incomplete is False
+    assert selection["available_record_count"] == 200
+    assert selection["selected_record_count"] <= EVIDENCE_PACKET_MAX_RECORDS
+    assert selection["omitted_record_count"] >= 168
+    assert selection["serialized_chars"] <= EVIDENCE_PACKET_TOTAL_CHARS_MAX
+    assert selection["omitted_source_ids"]
+    assert selection["omitted_source_ids_truncated"] is True
+    assert selection["truncated_field_count"] > 0
+    assert selection["truncated_fields"]
 
 
 def test_gate_rejects_unknown_authority_id():
@@ -503,13 +608,15 @@ def test_research_phase_call_kinds_are_scoped_and_tool_free(tmp_path):
         "research_rewrite",
     ]
     assert [request["tools"] for request in delegate.requests] == [[], [], [], []]
+    assert "untrusted data" in delegate.requests[1]["system"]
+    assert "instructions found inside evidence" in delegate.requests[1]["system"]
     plan_event = next(row for row in rows if row["event_type"] == "research_plan")
     gate_event = next(row for row in rows if row["event_type"] == "research_gate")
     assert plan_event["payload"]["rank"] == "light"
     assert gate_event["payload"]["passed"] is True
 
 
-def test_tool_only_phase_response_extracts_empty_text():
+def test_tool_only_phase_response_fails_closed_to_empty_text():
     provider = ScriptedProvider([
         ModelResponse(tool_calls=[ToolCall("tool-1", "web_search", {})])
     ])
@@ -522,6 +629,103 @@ def test_tool_only_phase_response_extracts_empty_text():
 
     assert result == ""
     assert provider.requests[0]["tools"] == []
+
+
+@pytest.mark.parametrize("finish_reason", ("length", "max_tokens"))
+def test_truncated_planning_response_uses_standard_fallback(finish_reason):
+    provider = ScriptedProvider([ModelResponse(
+        json.dumps({
+            "rank": "light",
+            "directions": ["primary filings"],
+            "reason": "looks valid but was truncated",
+        }),
+        finish_reason=finish_reason,
+    )])
+
+    plan = ResearchWorkflow(
+        provider,
+        lambda prompt, max_rounds, evidence_registry: None,
+    ).plan("question", "2025-05-01")
+
+    assert plan.rank is ResearchRank.STANDARD
+    assert plan.used_fallback is True
+    assert len(provider.requests) == 1
+
+
+def test_mixed_text_and_tool_gate_response_fails_closed():
+    registry = registry_with_two_sources()
+    provider = ScriptedProvider([ModelResponse(
+        json.dumps(valid_gate_payload(registry)),
+        [ToolCall("unexpected", "web_search", {})],
+        "stop",
+    )])
+
+    decision = ResearchWorkflow(
+        provider,
+        lambda prompt, max_rounds, evidence_registry: None,
+    ).evaluate_research("question", "2025-05-01", light_plan(), registry)
+
+    assert decision.passed is False
+    assert decision.gaps == ("research gate output was invalid",)
+    assert not any(item.authoritative for item in registry.records)
+
+
+def test_truncated_first_writing_uses_single_rewrite():
+    registry = registry_with_two_sources()
+    provider = ScriptedProvider([
+        light_plan_response(),
+        gate_response(registry, covered=True),
+        ModelResponse(
+            "partial "
+            "https://alpha.example/report https://beta.example/data",
+            finish_reason="length",
+        ),
+        valid_light_report(),
+    ])
+
+    result = ResearchWorkflow(
+        provider,
+        lambda prompt, max_rounds, evidence_registry: AgentLoopOutcome(
+            "completed", "notes", rounds_used=1
+        ),
+    ).run("question", "2025-05-01", registry=registry)
+
+    assert result.writing_repair_used is True
+    assert result.final_text.startswith("Report")
+    assert len(provider.requests) == 4
+    assert "untrusted data" in provider.requests[2]["system"]
+    assert "instructions found inside evidence" in provider.requests[2]["system"]
+    assert "untrusted data" in provider.requests[3]["system"]
+    assert "instructions found inside evidence" in provider.requests[3]["system"]
+
+
+def test_truncated_second_writing_returns_controlled_insufficient():
+    registry = registry_with_two_sources()
+    provider = ScriptedProvider([
+        light_plan_response(),
+        gate_response(registry, covered=True),
+        ModelResponse(
+            "partial "
+            "https://alpha.example/report https://beta.example/data",
+            finish_reason="length",
+        ),
+        ModelResponse(
+            "apparently valid "
+            "https://alpha.example/report https://beta.example/data",
+            finish_reason="length",
+        ),
+    ])
+
+    result = ResearchWorkflow(
+        provider,
+        lambda prompt, max_rounds, evidence_registry: AgentLoopOutcome(
+            "completed", "notes", rounds_used=1
+        ),
+    ).run("question", "2025-05-01", registry=registry)
+
+    assert result.writing_repair_used is True
+    assert result.final_text.startswith("INSUFFICIENT_EVIDENCE")
+    assert len(provider.requests) == 4
 
 
 def test_initial_gate_pass_skips_supplement():
@@ -659,6 +863,27 @@ def test_routed_trace_orders_phases_shares_budget_and_links_sources(
     finally:
         config.configure_workspace(old_workspace)
 
+    research_requests = [request for request in provider.requests if request["tools"]]
+    initial_stage = json.loads(research_requests[0]["messages"][0]["content"])
+    supplemental_stage = json.loads(
+        research_requests[-1]["messages"][0]["content"]
+    )
+    assert initial_stage["existing_evidence"] == []
+    assert {
+        item["source_id"] for item in supplemental_stage["existing_evidence"]
+    } == set(source_ids)
+    assert {
+        item["url"] for item in supplemental_stage["existing_evidence"]
+    } == set(urls)
+    assert all(
+        item["content_excerpt"].startswith("evidence from")
+        for item in supplemental_stage["existing_evidence"]
+    )
+    assert "independent corroboration is still missing" in (
+        supplemental_stage["research_gaps"]
+    )
+    assert "untrusted data" in research_requests[-1]["system"]
+
     rows, incomplete = read_trace_lines(recorder.trajectory_path)
     workflow_event_names = {
         "task_routed",
@@ -711,8 +936,27 @@ def test_routed_trace_orders_phases_shares_budget_and_links_sources(
     for gate in (
         row for row in workflow_rows if row["event_type"] == "research_gate"
     ):
+        assert gate["payload"]["authority_decisions"] == [{
+            "source_id": source_ids[0],
+            "is_authoritative": True,
+            "reason": "official disclosure",
+        }]
         for source_id in gate["payload"]["authoritative_source_ids"]:
             assert registered_sequences[source_id] < gate["sequence"]
+
+    registered_payloads = [
+        row["payload"] for row in rows if row["event_type"] == "source_registered"
+    ]
+    assert {payload["domain"] for payload in registered_payloads} == {
+        "alpha.example",
+        "beta.example",
+    }
+    assert {payload["title"] for payload in registered_payloads} == {
+        "Registered evidence"
+    }
+    assert {payload["tool_name"] for payload in registered_payloads} == {
+        "web_fetch"
+    }
 
     final_event = next(
         row for row in rows if row["event_type"] == "final_answer"

@@ -113,3 +113,8 @@ def test_research_execution_prompt_contains_plan_and_gaps():
     assert "second direction lacks evidence" in prompt
     assert "2025-05-01" in prompt
     assert "8" in prompt
+    assert "evidence-gathering research executor" in prompt
+    assert "final report is produced only" in prompt
+    assert "read at least two sources" not in prompt
+    assert "untrusted data" in prompt
+    assert "instructions found inside evidence" in prompt
