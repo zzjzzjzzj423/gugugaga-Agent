@@ -294,6 +294,31 @@ def test_adjacent_mixed_citations_resume_after_structural_delimiters():
     assert linked["unmatched_citations"] == [unfetched]
 
 
+@pytest.mark.parametrize(
+    "unclosed_suffix",
+    (
+        "<{second}",
+        "[label]({second}",
+    ),
+)
+def test_unclosed_adjacent_structure_never_matches_registered_prefixes(
+    unclosed_suffix,
+):
+    first = canonicalize_url("https://first.example/report")
+    second = canonicalize_url("https://second.example/report")
+
+    linked = link_final_answer_sources(
+        first + unclosed_suffix.format(second=second),
+        {
+            first: "src_first",
+            second: "src_second",
+        },
+    )
+
+    assert linked["matched_source_ids"] == []
+    assert len(linked["unmatched_citations"]) == 1
+
+
 def test_fake_markdown_opener_does_not_register_a_source_prefix():
     registered = canonicalize_url("https://example.com/report")
     complete_token = canonicalize_url(

@@ -292,12 +292,20 @@ class SourceRuntime:
                 except TraceWriteError:
                     raise
                 except Exception as error:
+                    rounds_used = getattr(error, "rounds_used", 0)
+                    if (
+                        isinstance(rounds_used, bool)
+                        or not isinstance(rounds_used, int)
+                        or rounds_used < 0
+                    ):
+                        rounds_used = 0
                     return AgentLoopOutcome(
                         "failed",
                         "",
                         getattr(error, "failure_class", None)
                         or type(error).__name__,
                         getattr(error, "failure_message", None) or str(error),
+                        rounds_used,
                     ), registered_source_map(evidence_registry)
 
                 outcome = AgentLoopOutcome(
@@ -312,32 +320,40 @@ class SourceRuntime:
                 trigger_hooks("Stop", self.messages)
                 return outcome, registered_source_map(evidence_registry)
 
-            if run is not None:
-                with bind_run_context(run):
-                    outcome, final_source_map = execute_routed_turn()
-                if outcome.status == "completed":
-                    linkage = link_final_answer_sources(
-                        outcome.final_text, final_source_map
-                    )
-                    run.recorder.record(
-                        "final_answer",
-                        {"text": outcome.final_text, **linkage},
-                        parent_span_id=run.parent_span_id,
-                        agent_id=run.agent_id,
-                    )
+            try:
+                if run is not None:
+                    with bind_run_context(run):
+                        outcome, final_source_map = execute_routed_turn()
+                    if outcome.status == "completed":
+                        linkage = link_final_answer_sources(
+                            outcome.final_text, final_source_map
+                        )
+                        run.recorder.record(
+                            "final_answer",
+                            {"text": outcome.final_text, **linkage},
+                            parent_span_id=run.parent_span_id,
+                            agent_id=run.agent_id,
+                        )
+                    else:
+                        run.recorder.record(
+                            "run_failed",
+                            {
+                                "status": outcome.status,
+                                "failure_class": outcome.failure_class,
+                                "message": outcome.failure_message,
+                            },
+                            parent_span_id=run.parent_span_id,
+                            agent_id=run.agent_id,
+                        )
                 else:
-                    run.recorder.record(
-                        "run_failed",
-                        {
-                            "status": outcome.status,
-                            "failure_class": outcome.failure_class,
-                            "message": outcome.failure_message,
-                        },
-                        parent_span_id=run.parent_span_id,
-                        agent_id=run.agent_id,
-                    )
-            else:
-                outcome, _ = execute_routed_turn()
+                    outcome, _ = execute_routed_turn()
+            except Exception:
+                if task_kind is TaskKind.RESEARCH:
+                    del self.messages[turn_start:]
+                    self.context = update_context(self.context, self.messages)
+                raise
+            if task_kind is TaskKind.RESEARCH and outcome.status != "completed":
+                del self.messages[turn_start:]
             self.last_outcome = outcome
             self.context = update_context(self.context, self.messages)
             return self._turn_text(self.messages, turn_start)
@@ -470,6 +486,8 @@ def agent_loop(
             memory_snapshot = copy.deepcopy(messages)
             try:
                 relevant_memories = memory_store.load_relevant(memory_snapshot)
+            except TraceWriteError:
+                raise
             except Exception as error:
                 memory_store._warn(f"load failed: {error}")
                 relevant_memories = ""
@@ -498,6 +516,8 @@ def agent_loop(
                 selected_provider,
                 system_prompt,
             )
+        except TraceWriteError:
+            raise
         except Exception as error:
             if (
                 is_prompt_too_long_error(error)
@@ -802,6 +822,8 @@ def agent_loop(
                     output = call_tool_handler(
                         handler, arguments, block.name, capture=capture
                     )
+            except TraceWriteError:
+                raise
             except Exception as error:
                 tool_error = error
                 output = f"Error: {type(error).__name__}: {error}"

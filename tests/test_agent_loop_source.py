@@ -19,7 +19,12 @@ from simple_cc.research_models import (
     ResearchWorkflowResult,
 )
 from simple_cc.research_workflow import ResearchWorkflowError
-from simple_cc.trace import RunContext, TraceRecorder, read_trace_lines
+from simple_cc.trace import (
+    RunContext,
+    TraceRecorder,
+    TraceWriteError,
+    read_trace_lines,
+)
 
 
 class ScriptedProvider:
@@ -861,3 +866,130 @@ def test_source_runtime_adapts_research_workflow_failure(monkeypatch):
         "planner failed",
         0,
     )
+
+
+def test_failed_research_turn_is_rolled_back_before_the_next_provider_request(
+    monkeypatch,
+):
+    provider = ScriptedProvider([
+        ProviderResponse([TextBlock(text="second turn answer")], "end_turn")
+    ])
+    runtime = agent.SourceRuntime(provider, memory_enabled=False)
+    events = []
+
+    class FailedWorkflow:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self, question, cutoff, *, registry=None):
+            error = ResearchWorkflowError(
+                "ProviderUnavailable",
+                "secret upstream detail",
+            )
+            error.rounds_used = 3
+            raise error
+
+    monkeypatch.setattr(agent, "ResearchWorkflow", FailedWorkflow)
+    monkeypatch.setattr(
+        agent,
+        "trigger_hooks",
+        lambda event, *args: events.append(event),
+    )
+
+    assert runtime.run_turn(
+        "first research turn",
+        run_metadata={"task_type": "research"},
+    ) == ""
+    failed_outcome = runtime.last_outcome
+    assert failed_outcome == agent.AgentLoopOutcome(
+        "failed",
+        "",
+        "ProviderUnavailable",
+        "secret upstream detail",
+        3,
+    )
+    assert runtime.messages == []
+
+    assert runtime.run_turn(
+        "second ordinary turn",
+        run_metadata={"task_type": "normal"},
+    ) == "second turn answer"
+
+    assert [message["role"] for message in provider.requests[0]["messages"]] == [
+        "user"
+    ]
+    assert provider.requests[0]["messages"][0]["content"] == (
+        "second ordinary turn"
+    )
+    assert "secret upstream detail" not in repr(runtime.messages)
+    assert events == ["UserPromptSubmit", "UserPromptSubmit", "Stop"]
+
+
+def test_research_agent_memory_trace_failure_is_not_downgraded(monkeypatch):
+    class FailingMemoryStore:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def turn_prompt(self, messages):
+            return "research question"
+
+        def load_relevant(self, messages):
+            raise TraceWriteError("memory trace unavailable")
+
+        def _warn(self, message):
+            pass
+
+        def inject(self, messages, memories, *, target_text):
+            return messages
+
+        def extract(self, messages, final_text):
+            pass
+
+        def consolidate_if_needed(self):
+            pass
+
+    monkeypatch.setattr(agent, "MemoryStore", FailingMemoryStore)
+    provider = ScriptedProvider([
+        ProviderResponse([TextBlock(text="notes")], "end_turn")
+    ])
+
+    with pytest.raises(TraceWriteError, match="memory trace unavailable"):
+        agent.agent_loop(
+            [{"role": "user", "content": "research question"}],
+            {},
+            provider=provider,
+            tools=[],
+            handlers={},
+            memory_enabled=True,
+            evidence_registry=EvidenceRegistry(),
+            finalize_user_turn=False,
+        )
+
+
+def test_research_tool_trace_failure_is_not_downgraded_to_tool_error():
+    provider = ScriptedProvider([
+        ProviderResponse(
+            [ToolUseBlock("fetch-1", "web_fetch", {"url": "https://a.example"})],
+            "tool_use",
+        ),
+        ProviderResponse([TextBlock(text="notes")], "end_turn"),
+    ])
+
+    def fail_trace(**arguments):
+        raise TraceWriteError("tool artifact trace unavailable")
+
+    with pytest.raises(TraceWriteError, match="tool artifact trace unavailable"):
+        agent.agent_loop(
+            [{"role": "user", "content": "research question"}],
+            {},
+            provider=provider,
+            tools=[{
+                "name": "web_fetch",
+                "description": "fetch",
+                "input_schema": {},
+            }],
+            handlers={"web_fetch": fail_trace},
+            memory_enabled=False,
+            evidence_registry=EvidenceRegistry(),
+            finalize_user_turn=False,
+        )

@@ -6,7 +6,7 @@ import json
 import re
 import sys
 import unicodedata
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from dataclasses import dataclass, replace
 from datetime import date
 from typing import Any
@@ -182,12 +182,16 @@ def _candidate_limit(
             following.start(),
         )
         if following_opening is not None:
-            limit = following_opening
+            closing = answer.rfind(")", following.start(), limit)
+            if closing >= 0:
+                limit = following_opening
         elif (
             following.start() > scheme_match.end()
             and answer[following.start() - 1] == "<"
         ):
-            limit = following.start() - 1
+            closing = answer.find(">", following.start(), limit)
+            if closing >= 0:
+                limit = following.start() - 1
         else:
             limit = following.start()
     return limit
@@ -696,10 +700,18 @@ def validate_research_final(
     final_text: str,
     registry: EvidenceRegistry,
     plan: ResearchPlan,
+    *,
+    allowed_source_ids: Collection[str] | None = None,
 ) -> list[str]:
     policy = plan.policy
-    records = registry.records
-    linkage = link_final_answer_sources(final_text, registered_source_map(registry))
+    allowed = set(allowed_source_ids) if allowed_source_ids is not None else None
+    records = tuple(
+        item
+        for item in registry.records
+        if allowed is None or item.source_id in allowed
+    )
+    source_map = {item.canonical_url: item.source_id for item in records}
+    linkage = link_final_answer_sources(final_text, source_map)
     errors: list[str] = []
 
     if len(records) < policy.distinct_source_count:

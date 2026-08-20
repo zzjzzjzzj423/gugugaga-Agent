@@ -29,6 +29,7 @@ from simple_cc.telemetry import TracingProvider
 from simple_cc.trace import (
     RunContext,
     TraceRecorder,
+    TraceWriteError,
     bind_run_context,
     read_trace_lines,
 )
@@ -598,6 +599,234 @@ def test_actual_gate_rejects_ids_omitted_from_40_record_packet(omitted_use):
     assert decision.domain_count == 40
     assert "unknown evidence source id" in " ".join(decision.validation_errors)
     assert not any(item.authoritative for item in registry.records)
+
+
+def test_final_gate_packet_is_reused_for_writing_rewrite_and_validation(tmp_path):
+    registry = EvidenceRegistry()
+    for index in range(40):
+        record = evidence_record_from_result(
+            "web_fetch",
+            json.dumps({
+                "ok": True,
+                "operation": "fetch",
+                "url": f"https://packet-{index}.example/report",
+                "title": f"Evidence {index}",
+                "content": f"direct evidence {index}",
+                "published_at": "2025-01-02",
+                "date_status": "verified",
+                "cutoff": "2025-05-01",
+            }),
+        )
+        assert record is not None
+        registry.register(record)
+
+    class PacketAwareProvider:
+        def __init__(self):
+            self.requests = []
+            self.gate_packet = None
+            self.writing_packet = None
+            self.rewrite_packet = None
+            self.gate_source_id = None
+            self.omitted_url = None
+
+        def create(self, messages, system, tools, max_tokens=8192, model=None):
+            self.requests.append({
+                "messages": messages,
+                "system": system,
+                "tools": tools,
+                "max_tokens": max_tokens,
+                "model": model,
+            })
+            call_number = len(self.requests)
+            if call_number == 1:
+                return light_plan_response()
+            payload = json.loads(messages[0]["content"])
+            if call_number == 2:
+                self.gate_packet = payload["evidence"]
+                assert len(self.gate_packet) == EVIDENCE_PACKET_MAX_RECORDS
+                selected_ids = {
+                    item["source_id"] for item in self.gate_packet
+                }
+                self.gate_source_id = self.gate_packet[-1]["source_id"]
+                self.omitted_url = next(
+                    item.canonical_url
+                    for item in registry.records
+                    if item.source_id not in selected_ids
+                )
+                return ModelResponse(json.dumps({
+                    "directions": [{
+                        "direction": "primary filings",
+                        "covered": True,
+                        "source_ids": [self.gate_source_id],
+                        "reason": "direct support",
+                    }],
+                    "authorities": [{
+                        "source_id": self.gate_source_id,
+                        "is_authoritative": True,
+                        "reason": "official disclosure",
+                    }],
+                    "gaps": [],
+                }))
+            if call_number == 3:
+                self.writing_packet = payload["evidence"]
+                selected_url = self.writing_packet[0]["url"]
+                return ModelResponse(
+                    f"Draft {selected_url} {self.omitted_url}"
+                )
+            if call_number == 4:
+                self.rewrite_packet = payload["evidence"]
+                assert "final answer contains unfetched citations" in (
+                    payload["validation_errors"]
+                )
+                return ModelResponse(
+                    f"Rewritten {self.rewrite_packet[0]['url']}"
+                )
+            raise AssertionError("unexpected model call")
+
+    provider = PacketAwareProvider()
+    recorder = TraceRecorder(tmp_path / "run", run_id="packet-finalization-run")
+    recorder.start_run(
+        task_id="research-task",
+        question="question",
+        cutoff="2025-05-01",
+        metadata={"task_type": "research"},
+    )
+    run = RunContext(
+        recorder,
+        "packet-finalization-run",
+        "research-task",
+        "2025-05-01",
+    )
+
+    result = ResearchWorkflow(
+        provider,
+        lambda prompt, max_rounds, evidence_registry: AgentLoopOutcome(
+            "completed", "notes", rounds_used=1
+        ),
+        run_context=run,
+    ).run("question", "2025-05-01", registry=registry)
+
+    assert result.writing_repair_used is True
+    assert provider.gate_source_id in {
+        item["source_id"] for item in provider.gate_packet
+    }
+    assert provider.writing_packet == provider.gate_packet
+    assert provider.rewrite_packet == provider.gate_packet
+    rows, incomplete = read_trace_lines(recorder.trajectory_path)
+    assert incomplete is False
+    selections = [
+        row["payload"]
+        for row in rows
+        if row["event_type"] == "evidence_packet_selected"
+    ]
+    assert [item["stage"] for item in selections] == [
+        "research_execution",
+        "research_gate",
+    ]
+    reused = [
+        row["payload"]
+        for row in rows
+        if row["event_type"] == "evidence_packet_reused"
+    ]
+    assert [item["stage"] for item in reused] == [
+        "research_writing",
+        "research_rewrite",
+    ]
+    assert all(
+        item["selected_source_ids"]
+        == [record["source_id"] for record in provider.gate_packet]
+        for item in reused
+    )
+
+
+def test_research_agent_trace_failure_escapes_source_runtime(tmp_path, monkeypatch):
+    provider = ScriptedProvider([
+        light_plan_response(),
+        ModelResponse("private research notes"),
+    ])
+    recorder = TraceRecorder(tmp_path / "run", run_id="agent-trace-failure-run")
+    recorder.start_run(
+        task_id="research-task",
+        question="question",
+        cutoff=None,
+        metadata={"task_type": "research"},
+    )
+    original_record = recorder.record
+    failed = False
+
+    def fail_research_agent_request_once(event_type, payload, **kwargs):
+        nonlocal failed
+        if (
+            not failed
+            and event_type == "llm_request_started"
+            and payload.get("call_kind") == "agent"
+        ):
+            failed = True
+            raise TraceWriteError("research agent trace unavailable")
+        return original_record(event_type, payload, **kwargs)
+
+    monkeypatch.setattr(recorder, "record", fail_research_agent_request_once)
+    runtime = agent.SourceRuntime(
+        provider,
+        recorder=recorder,
+        tool_definitions=[],
+        tool_handlers={},
+        memory_enabled=False,
+    )
+
+    with pytest.raises(TraceWriteError, match="research agent trace unavailable"):
+        runtime.run_turn(
+            "question",
+            task_id="research-task",
+            run_metadata={"task_type": "research"},
+        )
+
+    assert failed is True
+    assert runtime.messages == []
+
+
+def test_research_failure_stage_trace_failure_escapes_source_runtime(
+    tmp_path, monkeypatch
+):
+    provider = ScriptedProvider([
+        light_plan_response(),
+        RuntimeError("research provider offline"),
+    ])
+    recorder = TraceRecorder(tmp_path / "run", run_id="stage-trace-failure-run")
+    recorder.start_run(
+        task_id="research-task",
+        question="question",
+        cutoff=None,
+        metadata={"task_type": "research"},
+    )
+    original_record = recorder.record
+    failed = False
+
+    def fail_attempt_finished_once(event_type, payload, **kwargs):
+        nonlocal failed
+        if not failed and event_type == "research_attempt_finished":
+            failed = True
+            raise TraceWriteError("research stage trace unavailable")
+        return original_record(event_type, payload, **kwargs)
+
+    monkeypatch.setattr(recorder, "record", fail_attempt_finished_once)
+    runtime = agent.SourceRuntime(
+        provider,
+        recorder=recorder,
+        tool_definitions=[],
+        tool_handlers={},
+        memory_enabled=False,
+    )
+
+    with pytest.raises(TraceWriteError, match="research stage trace unavailable"):
+        runtime.run_turn(
+            "question",
+            task_id="research-task",
+            run_metadata={"task_type": "research"},
+        )
+
+    assert failed is True
+    assert runtime.messages == []
 
 
 def test_gate_rejects_unknown_authority_id():
@@ -1483,6 +1712,7 @@ def test_failed_executor_preserves_failure_class_and_message():
     assert getattr(caught.value, "failure_message", None) == (
         "upstream timed out"
     )
+    assert getattr(caught.value, "rounds_used", None) == 2
 
 
 def test_max_rounds_consumes_supplied_budget_and_still_writes():
