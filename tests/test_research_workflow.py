@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 
 import pytest
 
@@ -114,6 +115,121 @@ def valid_light_report() -> ModelResponse:
     return ModelResponse(
         "Report https://alpha.example/report https://beta.example/data"
     )
+
+
+def _provider_error_with_origin(message: str) -> tuple[RuntimeError, object]:
+    try:
+        raise RuntimeError(message)
+    except RuntimeError as error:
+        return error, error.__traceback__
+
+
+def _trace_failure_kind(event_type: str, payload: dict) -> str | None:
+    if (
+        event_type == "writing_attempt_finished"
+        and payload.get("status") == "failed"
+    ):
+        return "writing_failed"
+    if event_type == "research_workflow_completed":
+        return "terminal"
+    return None
+
+
+def _trace_failure_message(kind: str) -> str:
+    if kind == "terminal":
+        return "terminal\ntrace " + "x" * 2_000
+    return "failed finished trace unavailable"
+
+
+def _install_trace_failures(
+    monkeypatch,
+    recorder: TraceRecorder,
+    *,
+    kinds: set[str],
+    mode: str,
+) -> tuple[
+    dict[str, TraceWriteError],
+    dict[str, OSError],
+    dict[str, BaseException | None],
+]:
+    trace_errors: dict[str, TraceWriteError] = {}
+    os_errors: dict[str, OSError] = {}
+    active_exceptions: dict[str, BaseException | None] = {}
+    original_record = recorder.record
+    if mode == "preconstructed":
+        trace_errors.update({
+            kind: TraceWriteError(_trace_failure_message(kind))
+            for kind in kinds
+        })
+
+        def fail_record(event_type, payload, **kwargs):
+            kind = _trace_failure_kind(event_type, payload)
+            if kind in kinds:
+                active_exceptions[kind] = sys.exception()
+                raise trace_errors[kind]
+            return original_record(event_type, payload, **kwargs)
+
+        monkeypatch.setattr(recorder, "record", fail_record)
+        return trace_errors, os_errors, active_exceptions
+
+    original_append = recorder._append_line
+
+    def fail_append(serialized):
+        event = json.loads(serialized)
+        kind = _trace_failure_kind(event["event_type"], event["payload"])
+        if kind in kinds:
+            active_exceptions[kind] = sys.exception()
+            os_error = OSError(_trace_failure_message(kind))
+            os_errors[kind] = os_error
+            raise os_error
+        return original_append(serialized)
+
+    def capture_translated_trace(event_type, payload, **kwargs):
+        kind = _trace_failure_kind(event_type, payload)
+        try:
+            return original_record(event_type, payload, **kwargs)
+        except TraceWriteError as trace_error:
+            if kind in kinds:
+                trace_errors[kind] = trace_error
+            raise
+
+    monkeypatch.setattr(recorder, "_append_line", fail_append)
+    monkeypatch.setattr(recorder, "record", capture_translated_trace)
+    return trace_errors, os_errors, active_exceptions
+
+
+def _assert_acyclic_exception_graph(error: BaseException) -> list[BaseException]:
+    visiting: set[int] = set()
+    visited: set[int] = set()
+    nodes: list[BaseException] = []
+
+    def visit(node: BaseException | None) -> None:
+        if node is None:
+            return
+        identity = id(node)
+        if identity in visiting:
+            raise AssertionError(
+                f"exception graph cycle reaches {type(node).__name__}"
+            )
+        if identity in visited:
+            return
+        visiting.add(identity)
+        nodes.append(node)
+        visit(node.__cause__)
+        visit(node.__context__)
+        visiting.remove(identity)
+        visited.add(identity)
+
+    visit(error)
+    return nodes
+
+
+def _traceback_contains(traceback, target) -> bool:
+    while traceback is not None:
+        if traceback is target:
+            return True
+        traceback = traceback.tb_next
+    return False
 
 
 def test_parse_plan_accepts_fixed_rank_and_exact_directions():
@@ -2015,14 +2131,18 @@ def test_writing_finished_trace_failure_preserves_identity_and_skips_gate(
     assert not [row for row in rows if row["event_type"] == "writing_gate"]
 
 
+@pytest.mark.parametrize("trace_mode", ("preconstructed", "write_failure"))
 @pytest.mark.parametrize("failed_attempt", (1, 2))
 def test_provider_error_remains_primary_when_failed_finished_trace_also_fails(
     tmp_path,
     monkeypatch,
     failed_attempt,
+    trace_mode,
 ):
     registry = registry_with_two_sources()
-    provider_error = RuntimeError(f"writer {failed_attempt} offline")
+    provider_error, origin_traceback = _provider_error_with_origin(
+        f"writer {failed_attempt} offline"
+    )
     responses = [
         light_plan_response(),
         gate_response(registry, covered=True),
@@ -2044,18 +2164,12 @@ def test_provider_error_remains_primary_when_failed_finished_trace_also_fails(
         "research-task",
         "2025-05-01",
     )
-    trace_error = TraceWriteError("failed finished trace unavailable")
-    original_record = recorder.record
-
-    def fail_failed_finished(event_type, payload, **kwargs):
-        if (
-            event_type == "writing_attempt_finished"
-            and payload.get("status") == "failed"
-        ):
-            raise trace_error
-        return original_record(event_type, payload, **kwargs)
-
-    monkeypatch.setattr(recorder, "record", fail_failed_finished)
+    trace_errors, os_errors, active_exceptions = _install_trace_failures(
+        monkeypatch,
+        recorder,
+        kinds={"writing_failed"},
+        mode=trace_mode,
+    )
     workflow = ResearchWorkflow(
         provider,
         lambda prompt, max_rounds, evidence_registry: AgentLoopOutcome(
@@ -2068,21 +2182,32 @@ def test_provider_error_remains_primary_when_failed_finished_trace_also_fails(
         workflow.run("question", "2025-05-01", registry=registry)
 
     assert caught.value is provider_error
-    assert caught.value.__cause__ is trace_error
+    assert caught.value.__cause__ is trace_errors["writing_failed"]
+    assert active_exceptions == {"writing_failed": None}
+    if trace_mode == "write_failure":
+        assert trace_errors["writing_failed"].__cause__ is (
+            os_errors["writing_failed"]
+        )
+    _assert_acyclic_exception_graph(caught.value)
+    assert _traceback_contains(caught.value.__traceback__, origin_traceback)
     assert any(
         "writing_attempt_finished trace failed" in note
         for note in getattr(caught.value, "__notes__", ())
     )
 
 
+@pytest.mark.parametrize("trace_mode", ("preconstructed", "write_failure"))
 @pytest.mark.parametrize("failed_attempt", (1, 2))
 def test_provider_error_keeps_first_trace_cause_when_terminal_trace_also_fails(
     tmp_path,
     monkeypatch,
     failed_attempt,
+    trace_mode,
 ):
     registry = registry_with_two_sources()
-    provider_error = RuntimeError(f"writer {failed_attempt} offline")
+    provider_error, origin_traceback = _provider_error_with_origin(
+        f"writer {failed_attempt} offline"
+    )
     responses = [
         light_plan_response(),
         gate_response(registry, covered=True),
@@ -2104,21 +2229,12 @@ def test_provider_error_keeps_first_trace_cause_when_terminal_trace_also_fails(
         "research-task",
         "2025-05-01",
     )
-    first_trace = TraceWriteError("failed finished trace unavailable")
-    terminal_trace = TraceWriteError("terminal\ntrace " + "x" * 2_000)
-    original_record = recorder.record
-
-    def fail_persistent_trace(event_type, payload, **kwargs):
-        if (
-            event_type == "writing_attempt_finished"
-            and payload.get("status") == "failed"
-        ):
-            raise first_trace
-        if event_type == "research_workflow_completed":
-            raise terminal_trace
-        return original_record(event_type, payload, **kwargs)
-
-    monkeypatch.setattr(recorder, "record", fail_persistent_trace)
+    trace_errors, os_errors, active_exceptions = _install_trace_failures(
+        monkeypatch,
+        recorder,
+        kinds={"writing_failed", "terminal"},
+        mode=trace_mode,
+    )
     workflow = ResearchWorkflow(
         provider,
         lambda prompt, max_rounds, evidence_registry: AgentLoopOutcome(
@@ -2131,7 +2247,16 @@ def test_provider_error_keeps_first_trace_cause_when_terminal_trace_also_fails(
         workflow.run("question", "2025-05-01", registry=registry)
 
     assert caught.value is provider_error
-    assert caught.value.__cause__ is first_trace
+    assert caught.value.__cause__ is trace_errors["writing_failed"]
+    assert active_exceptions == {"writing_failed": None, "terminal": None}
+    if trace_mode == "write_failure":
+        assert trace_errors["writing_failed"].__cause__ is (
+            os_errors["writing_failed"]
+        )
+        assert trace_errors["terminal"].__cause__ is os_errors["terminal"]
+    _assert_acyclic_exception_graph(caught.value)
+    _assert_acyclic_exception_graph(trace_errors["terminal"])
+    assert _traceback_contains(caught.value.__traceback__, origin_traceback)
     terminal_notes = [
         note
         for note in getattr(caught.value, "__notes__", ())
@@ -2143,18 +2268,30 @@ def test_provider_error_keeps_first_trace_cause_when_terminal_trace_also_fails(
     assert len(terminal_notes[0]) <= 600
 
 
+@pytest.mark.parametrize("trace_mode", ("preconstructed", "write_failure"))
+@pytest.mark.parametrize("failed_attempt", (1, 2))
 def test_provider_error_uses_terminal_trace_as_cause_when_only_terminal_fails(
     tmp_path,
     monkeypatch,
+    failed_attempt,
+    trace_mode,
 ):
     registry = registry_with_two_sources()
-    provider_error = RuntimeError("writer offline")
-    provider = ScriptedProvider([
+    provider_error, origin_traceback = _provider_error_with_origin(
+        f"writer {failed_attempt} offline"
+    )
+    responses = [
         light_plan_response(),
         gate_response(registry, covered=True),
-        provider_error,
-    ])
-    recorder = TraceRecorder(tmp_path / "run", run_id="terminal-only")
+    ]
+    if failed_attempt == 2:
+        responses.append(ModelResponse("unsupported draft"))
+    responses.append(provider_error)
+    provider = ScriptedProvider(responses)
+    recorder = TraceRecorder(
+        tmp_path / "run",
+        run_id=f"terminal-only-{failed_attempt}-{trace_mode}",
+    )
     recorder.start_run(
         task_id="research-task",
         question="question",
@@ -2163,19 +2300,16 @@ def test_provider_error_uses_terminal_trace_as_cause_when_only_terminal_fails(
     )
     run = RunContext(
         recorder,
-        "terminal-only",
+        f"terminal-only-{failed_attempt}-{trace_mode}",
         "research-task",
         "2025-05-01",
     )
-    terminal_trace = TraceWriteError("terminal trace unavailable")
-    original_record = recorder.record
-
-    def fail_terminal_trace(event_type, payload, **kwargs):
-        if event_type == "research_workflow_completed":
-            raise terminal_trace
-        return original_record(event_type, payload, **kwargs)
-
-    monkeypatch.setattr(recorder, "record", fail_terminal_trace)
+    trace_errors, os_errors, active_exceptions = _install_trace_failures(
+        monkeypatch,
+        recorder,
+        kinds={"terminal"},
+        mode=trace_mode,
+    )
     workflow = ResearchWorkflow(
         provider,
         lambda prompt, max_rounds, evidence_registry: AgentLoopOutcome(
@@ -2188,7 +2322,12 @@ def test_provider_error_uses_terminal_trace_as_cause_when_only_terminal_fails(
         workflow.run("question", "2025-05-01", registry=registry)
 
     assert caught.value is provider_error
-    assert caught.value.__cause__ is terminal_trace
+    assert caught.value.__cause__ is trace_errors["terminal"]
+    assert active_exceptions == {"terminal": None}
+    if trace_mode == "write_failure":
+        assert trace_errors["terminal"].__cause__ is os_errors["terminal"]
+    _assert_acyclic_exception_graph(caught.value)
+    assert _traceback_contains(caught.value.__traceback__, origin_traceback)
 
 
 @pytest.mark.parametrize("failed_attempt", (1, 2))

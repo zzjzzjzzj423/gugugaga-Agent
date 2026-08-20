@@ -232,3 +232,23 @@ def test_research_prompt_fails_closed_and_normalizes_tool_names(
     )
     assert "bash" not in available_tools
     assert "load_skill" not in available_tools
+
+
+def test_research_prompt_skips_unhashable_string_subclass_name():
+    class UnhashableToolName(str):
+        __hash__ = None
+
+    plan = ResearchPlan(ResearchRank.LIGHT, ("primary filings",), "narrow")
+
+    prompt = research_execution_prompt(
+        {"workspace": "C:/repo"},
+        question="What happened?",
+        cutoff="2025-05-01",
+        plan=plan,
+        gaps=(),
+        remaining_rounds=4,
+        tool_names=(UnhashableToolName("web_search"),),
+    )
+
+    assert "Available tools: none." in prompt
+    assert "No research tools are available" in prompt

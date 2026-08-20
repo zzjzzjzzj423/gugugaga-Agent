@@ -129,7 +129,7 @@ def _normalize_research_tool_names(
     seen: set[str] = set()
     for name in tool_names:
         if (
-            isinstance(name, str)
+            type(name) is str
             and name
             and name in RESEARCH_TOOLS
             and name not in seen

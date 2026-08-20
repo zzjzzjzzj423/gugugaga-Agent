@@ -795,27 +795,23 @@ class ResearchWorkflow:
         repair: bool,
         call: Callable[[], str],
     ) -> str:
+        provider_error: Exception | None = None
+        provider_traceback = None
         try:
             text = call()
         except TraceWriteError:
             raise
         except Exception as error:
-            try:
-                self._record_during_error("writing_attempt_finished", {
-                    "attempt": attempt,
-                    "repair": repair,
-                    "status": "failed",
-                    "failure_class": _bounded_trace_text(
-                        getattr(error, "failure_class", None)
-                        or type(error).__name__,
-                        _WRITING_FAILURE_CLASS_CHARS_MAX,
-                    ),
-                    "failure_message": _bounded_trace_text(
-                        getattr(error, "failure_message", None) or error,
-                        _WRITING_FAILURE_MESSAGE_CHARS_MAX,
-                    ),
-                })
-            except TraceWriteError as trace_error:
+            provider_error = error
+            provider_traceback = error.__traceback__
+
+        if provider_error is not None:
+            trace_error = self._record_writing_failure(
+                attempt,
+                repair,
+                provider_error,
+            )
+            if trace_error is not None:
                 note = (
                     "writing_attempt_finished trace failed: "
                     + _bounded_trace_text(
@@ -823,14 +819,16 @@ class ResearchWorkflow:
                         _WRITING_FAILURE_MESSAGE_CHARS_MAX,
                     )
                 )
-                add_note = getattr(error, "add_note", None)
+                add_note = getattr(provider_error, "add_note", None)
                 if callable(add_note):
                     try:
                         add_note(note)
                     except Exception:
                         pass
-                raise error from trace_error
-            raise
+                raise provider_error.with_traceback(
+                    provider_traceback
+                ) from trace_error
+            raise provider_error.with_traceback(provider_traceback)
         self._record("writing_attempt_finished", {
             "attempt": attempt,
             "repair": repair,
@@ -839,6 +837,31 @@ class ResearchWorkflow:
             "failure_message": None,
         })
         return text
+
+    def _record_writing_failure(
+        self,
+        attempt: int,
+        repair: bool,
+        error: Exception,
+    ) -> TraceWriteError | None:
+        try:
+            self._record_during_error("writing_attempt_finished", {
+                "attempt": attempt,
+                "repair": repair,
+                "status": "failed",
+                "failure_class": _bounded_trace_text(
+                    getattr(error, "failure_class", None)
+                    or type(error).__name__,
+                    _WRITING_FAILURE_CLASS_CHARS_MAX,
+                ),
+                "failure_message": _bounded_trace_text(
+                    getattr(error, "failure_message", None) or error,
+                    _WRITING_FAILURE_MESSAGE_CHARS_MAX,
+                ),
+            })
+        except TraceWriteError as trace_error:
+            return trace_error
+        return None
 
     def _record_packet_selection(
         self,
@@ -1582,6 +1605,8 @@ class ResearchWorkflow:
             "repair_used": False,
             "errors": (),
         }
+        workflow_error: Exception | None = None
+        workflow_traceback = None
         try:
             result = self._run_forward(
                 question,
@@ -1595,10 +1620,18 @@ class ResearchWorkflow:
             self._capture_consumed_rounds(state)
             raise
         except Exception as error:
-            self._capture_consumed_rounds(state)
-            terminal_trace_error = self._record_terminal_failure(error, state)
-            if terminal_trace_error is not None:
-                if error.__cause__ is None:
-                    raise error from terminal_trace_error
-                self._add_terminal_trace_note(error, terminal_trace_error)
-            raise
+            workflow_error = error
+            workflow_traceback = error.__traceback__
+
+        self._capture_consumed_rounds(state)
+        terminal_trace_error = self._record_terminal_failure(
+            workflow_error,
+            state,
+        )
+        if terminal_trace_error is not None:
+            if workflow_error.__cause__ is None:
+                raise workflow_error.with_traceback(
+                    workflow_traceback
+                ) from terminal_trace_error
+            self._add_terminal_trace_note(workflow_error, terminal_trace_error)
+        raise workflow_error.with_traceback(workflow_traceback)

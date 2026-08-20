@@ -116,7 +116,7 @@ def _research_tool_view(
         if not isinstance(definition, dict):
             continue
         name = dict.get(definition, "name")
-        if not isinstance(name, str) or not name or name not in RESEARCH_TOOLS:
+        if type(name) is not str or not name or name not in RESEARCH_TOOLS:
             continue
         description = dict.get(definition, "description")
         input_schema = dict.get(definition, "input_schema")

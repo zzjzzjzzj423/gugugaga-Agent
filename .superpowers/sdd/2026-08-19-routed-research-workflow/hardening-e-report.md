@@ -138,3 +138,39 @@ The resulting research boundary is:
 - Affected regression suite: `180 passed`.
 - Full suite: `466 passed, 1 deselected`; the only deselection was the approved source-map baseline test, using a unique external basetemp.
 - `python -m compileall -q simple_cc eval tests` and baseline-range `git diff --check` are required final gates; commit and clean-status evidence is included in the handoff.
+
+## Fix Round 3: preserve acyclic failure chains
+
+### Baseline and root cause
+
+- Verified exact clean baseline `00c58c69134b33dbde27bf6da69197d49475c05e` before edits.
+- `_call_writing_attempt()` performed failed-finished trace I/O inside the active provider `except`; `run()` did the same for terminal trace I/O. A terminal-only failure therefore produced a traversable provider/trace context cycle. Even where CPython later removed a direct back-reference during re-raise, both preconstructed and real recorder failures observed the provider as `sys.exception()` while audit I/O ran, violating the stage's exception boundary and allowing underlying `OSError` context to originate under the provider failure.
+- `_research_tool_view()` and research prompt normalization used `isinstance(name, str)` before set membership. An unhashable `str` subclass passed that guard and raised `TypeError` at the membership check.
+- Production scope remained `simple_cc/research_workflow.py`, `simple_cc/agent.py`, and `simple_cc/prompts.py`. `simple_cc/context.py` and the accepted scanner limitation were not touched.
+
+### Implementation and exception-chain evidence
+
+- `_call_writing_attempt()` now captures only the identical non-trace provider exception and its traceback inside the provider `except`, exits that scope, then attempts the failed-finished event. `_record_writing_failure()` likewise catches and returns `TraceWriteError`, exiting the trace `except` before the provider is re-raised with its original traceback.
+- `run()` applies the same boundary: it saves the workflow exception and traceback, exits the provider `except`, captures any terminal trace failure through the existing return path, then re-raises outside both exception contexts. With no first cause the terminal trace becomes the cause; with a failed-finished cause it remains first and the terminal failure is represented only by the bounded typed note.
+- Tests traverse both `__cause__` and `__context__` with gray/visited sets. Attempt 1 and 2 are covered for failed-finished-only, persistent failed-finished plus terminal failure, and terminal-only failure. Every case runs once with a preconstructed `TraceWriteError` and once through real `TraceRecorder.record()` translation of a forced `_append_line()` `OSError`; the final graphs are acyclic, trace/OSError subgraphs do not refer back to the provider, provider identity is unchanged, and the original traceback tail remains reachable.
+- Both tool-name boundaries now require `type(name) is str` before truth, membership, or deduplication checks. Unhashable `str` subclasses are skipped without hashing.
+
+### File-by-file scope
+
+- `simple_cc/research_workflow.py`: separates provider capture, trace capture, audit recording, and final re-raise into non-overlapping exception contexts while preserving identity, traceback, first cause, and bounded terminal notes.
+- `simple_cc/agent.py`: rejects `str` subclasses before research allowlist membership.
+- `simple_cc/prompts.py`: rejects `str` subclasses before research allowlist membership and stable deduplication.
+- `tests/test_research_workflow.py`: adds the exception-graph walker, active-exception probes, original-traceback checks, and preconstructed/real-recorder matrices for attempts 1 and 2.
+- `tests/test_agent_loop_source.py`: covers the unhashable tool-name subclass at the runtime research view.
+- `tests/test_context_prompts.py`: covers the same boundary at research prompt normalization.
+- `.superpowers/sdd/2026-08-19-routed-research-workflow/hardening-e-report.md`: records Fix Round 3 root cause, scope, RED/GREEN evidence, and verification.
+
+### TDD and verification
+
+- Initial graph-only RED: `6 failed, 8 passed`; terminal-only cases exposed the cycle and both tool-name boundaries raised `TypeError`. CPython had already removed some direct failed-finished back-references during re-raise, which motivated an explicit active-exception boundary assertion.
+- Strengthened focused RED: `14 failed`; all twelve attempt/mode trace cases observed the provider exception during audit I/O, plus the two unhashable-name failures.
+- Focused GREEN: `14 passed`.
+- Directly affected test files: `143 passed`.
+- Affected regression suite: `189 passed`.
+- Full suite: `475 passed, 1 deselected`; the sole deselection was the approved source-map baseline test, using a unique external basetemp.
+- Final compile, baseline-range diff, commit, and clean-status evidence is included in the handoff.

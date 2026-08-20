@@ -907,6 +907,23 @@ def test_research_tool_view_deduplicates_only_identical_safe_entries():
     assert agent._research_tool_view([], {"web_fetch": fetch}) == ([], {})
 
 
+def test_research_tool_view_skips_unhashable_string_subclass_name():
+    class UnhashableToolName(str):
+        __hash__ = None
+
+    selected, handlers = agent._research_tool_view(
+        [{
+            "name": UnhashableToolName("web_fetch"),
+            "description": "fetch",
+            "input_schema": {},
+        }],
+        {"web_fetch": lambda **_: "fetch"},
+    )
+
+    assert selected == []
+    assert handlers == {}
+
+
 def test_research_prompt_does_not_touch_malformed_full_runtime_registry(
     monkeypatch,
 ):
