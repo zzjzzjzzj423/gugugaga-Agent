@@ -29,6 +29,8 @@ RESEARCH_TOOLS = {"web_search", "web_fetch", "pdf_fetch"}
 EVIDENCE_EXCERPT_CHARS = EVIDENCE_CONTENT_CHARS_MAX
 _HOST_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
 _ALLOWED_DATE_STATUSES = {"unknown", "verified"}
+_PAGE_MARKER = re.compile(r"--- PAGE [0-9]+ (?:START|END) ---")
+_TABLE_MARKER = re.compile(r"--- TABLE [0-9]+ (?:START|END) ---")
 
 
 class CutoffMismatch(ValueError):
@@ -212,16 +214,30 @@ def _normalize_evidence_text(content: str) -> str:
             continue
         else:
             visible.append(character)
-    return "".join(visible).strip()
+    return unicodedata.normalize("NFC", "".join(visible).strip())
 
 
-def _pdf_page_body(page_number: int, content: str) -> str:
+def _pdf_page_body(page_number: int, content: str) -> str | None:
     start_marker = f"--- PAGE {page_number} START ---"
     end_marker = f"--- PAGE {page_number} END ---"
     body = _normalize_evidence_text(content)
-    if body.startswith(start_marker) and body.endswith(end_marker):
-        body = body[len(start_marker):-len(end_marker)].strip()
+    if _PAGE_MARKER.search(body):
+        start_wrapper = f"{start_marker}\n"
+        end_wrapper = f"\n{end_marker}"
+        if not body.startswith(start_wrapper) or not body.endswith(end_wrapper):
+            return None
+        body = body[len(start_wrapper):-len(end_wrapper)].strip()
+        if _PAGE_MARKER.search(body):
+            return None
     return body
+
+
+def _has_substantive_evidence(content: str) -> bool:
+    without_table_markers = _TABLE_MARKER.sub("", content)
+    return any(
+        unicodedata.category(character)[0] in {"L", "N", "S"}
+        for character in without_table_markers
+    )
 
 
 def _pdf_page_fragment(
@@ -235,7 +251,7 @@ def _pdf_page_fragment(
     if available_body_chars < 1:
         return None
     bounded_body = body[:available_body_chars].rstrip()
-    if not bounded_body:
+    if not bounded_body or not _has_substantive_evidence(bounded_body):
         return None
     fragment = f"{start_marker}\n{bounded_body}\n{end_marker}"
     if len(fragment) > EVIDENCE_PDF_FRAGMENT_CHARS_MAX:
@@ -294,6 +310,11 @@ def _pdf_fragments(payload: dict[str, Any]) -> tuple[
                 "PDF pages require ordered handler-valid page numbers and string content",
             )
         usable_content = _pdf_page_body(page_number, content)
+        if usable_content is None:
+            return None, _rejected(
+                "invalid_pdf_pages",
+                "PDF content contains malformed or mismatched PAGE markers",
+            )
         if usable_content:
             fragment = _pdf_page_fragment(page_number, usable_content)
             if fragment is None:

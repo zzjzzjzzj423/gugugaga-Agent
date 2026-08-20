@@ -595,6 +595,131 @@ def test_pdf_fragment_preserves_meaningful_normalized_unicode(tmp_path):
 
 
 @pytest.mark.parametrize(
+    "content",
+    (
+        "--- PAGE 1 START ---\nfacts",
+        "facts\n--- PAGE 1 END ---",
+        "--- PAGE 2 START ---\nfacts\n--- PAGE 2 END ---",
+        (
+            "--- PAGE 1 START ---\nfacts\n"
+            "--- PAGE 2 START ---\n--- PAGE 1 END ---"
+        ),
+    ),
+)
+def test_pdf_rejects_lone_mismatched_or_extra_page_markers(tmp_path, content):
+    output = json.dumps({
+        "ok": True,
+        "operation": "pdf_fetch",
+        "url": "https://example.com/malformed-markers.pdf",
+        "start_page": 1,
+        "end_page": 1,
+        "cutoff": "2025-05-01",
+        "published_at": None,
+        "date_status": "unknown",
+        "pages": [{"page_number": 1, "content": content}],
+    })
+    _, outcome, registry, rows, incomplete = _run_single_fetch_result(
+        tmp_path,
+        "pdf-malformed-page-markers",
+        "pdf_fetch",
+        output,
+    )
+
+    assert outcome.final_text == "research notes"
+    assert registry.records == ()
+    assert incomplete is False
+    terminal = next(row for row in rows if row["event_type"] == "tool_result")
+    rejected = next(row for row in rows if row["event_type"] == "source_rejected")
+    assert terminal["sequence"] < rejected["sequence"]
+    assert rejected["payload"]["reason_code"] == "invalid_pdf_pages"
+
+
+@pytest.mark.parametrize(
+    "body",
+    (
+        "--- TABLE 1 START ---\n\t \n--- TABLE 1 END ---",
+        "--- !!! ... ---",
+    ),
+)
+def test_pdf_rejects_empty_table_or_punctuation_scaffolding(tmp_path, body):
+    output = json.dumps({
+        "ok": True,
+        "operation": "pdf_fetch",
+        "url": "https://example.com/empty-scaffolding.pdf",
+        "start_page": 1,
+        "end_page": 1,
+        "cutoff": "2025-05-01",
+        "published_at": None,
+        "date_status": "unknown",
+        "pages": [{
+            "page_number": 1,
+            "content": (
+                f"--- PAGE 1 START ---\n{body}\n--- PAGE 1 END ---"
+            ),
+        }],
+    })
+    _, outcome, registry, rows, incomplete = _run_single_fetch_result(
+        tmp_path,
+        "pdf-empty-scaffolding",
+        "pdf_fetch",
+        output,
+    )
+
+    assert outcome.final_text == "research notes"
+    assert registry.records == ()
+    assert incomplete is False
+    terminal = next(row for row in rows if row["event_type"] == "tool_result")
+    rejected = next(row for row in rows if row["event_type"] == "source_rejected")
+    assert terminal["sequence"] < rejected["sequence"]
+    assert rejected["payload"]["reason_code"] == "invalid_pdf_pages"
+
+
+def test_pdf_fragment_merge_orders_cross_width_page_keys_numerically():
+    page_numbers = (
+        10_000_000_004,
+        9_999_999_998,
+        10_000_000_001,
+        9_999_999_996,
+        10_000_000_003,
+        9_999_999_999,
+        10_000_000_000,
+        9_999_999_995,
+        10_000_000_002,
+        9_999_999_997,
+    )
+    registry = EvidenceRegistry()
+    for page_number in page_numbers:
+        record = evidence_record_from_result(
+            "pdf_fetch",
+            json.dumps({
+                "ok": True,
+                "operation": "pdf_fetch",
+                "url": "https://example.com/cross-width.pdf",
+                "start_page": page_number,
+                "end_page": page_number,
+                "cutoff": "2025-05-01",
+                "published_at": None,
+                "date_status": "unknown",
+                "pages": [{
+                    "page_number": page_number,
+                    "content": f"facts for page {page_number}",
+                }],
+            }),
+            required_cutoff="2025-05-01",
+        )
+        assert record is not None
+        registry.register(record)
+
+    retained_keys = [
+        fragment.key for fragment in registry.records[0].content_fragments
+    ]
+    retained_pages = [int(key.removeprefix("pdf_page:")) for key in retained_keys]
+    assert retained_pages == sorted(page_numbers)[:8]
+    assert any(len(key.removeprefix("pdf_page:")) == 10 for key in retained_keys)
+    assert any(len(key.removeprefix("pdf_page:")) == 11 for key in retained_keys)
+
+
+@pytest.mark.parametrize(
     ("start_page", "end_page", "pages"),
     (
         (
@@ -694,6 +819,34 @@ def test_web_content_normalizes_nonprinting_prefix_before_bounding(tmp_path):
     assert incomplete is False
     assert len(registry.records) == 1
     assert registry.records[0].content_excerpt == "研究事实\ncafé 📈"
+    terminal = next(row for row in rows if row["event_type"] == "tool_result")
+    registered = next(
+        row for row in rows if row["event_type"] == "source_registered"
+    )
+    assert terminal["sequence"] < registered["sequence"]
+
+
+def test_web_content_is_nfc_after_format_characters_are_filtered(tmp_path):
+    output = json.dumps({
+        "ok": True,
+        "operation": "fetch",
+        "url": "https://example.com/post-filter-nfc",
+        "cutoff": "2025-05-01",
+        "published_at": None,
+        "date_status": "unknown",
+        "content": "cafe\u200b\u0301 findings",
+    })
+    _, outcome, registry, rows, incomplete = _run_single_fetch_result(
+        tmp_path,
+        "web-post-filter-nfc",
+        "web_fetch",
+        output,
+    )
+
+    assert outcome.final_text == "research notes"
+    assert incomplete is False
+    assert len(registry.records) == 1
+    assert registry.records[0].content_excerpt == "café findings"
     terminal = next(row for row in rows if row["event_type"] == "tool_result")
     registered = next(
         row for row in rows if row["event_type"] == "source_registered"

@@ -14,6 +14,18 @@ EVIDENCE_PDF_FRAGMENTS_MAX = 8
 EVIDENCE_ARTIFACT_REFERENCES_MAX = 16
 
 
+def _evidence_fragment_sort_key(key: str) -> tuple[int, int, str]:
+    prefix = "pdf_page:"
+    page_number = key.removeprefix(prefix)
+    if (
+        key.startswith(prefix)
+        and page_number.isascii()
+        and page_number.isdecimal()
+    ):
+        return (0, int(page_number), key)
+    return (1, 0, key)
+
+
 class TaskKind(str, Enum):
     NORMAL = "normal"
     RESEARCH = "research"
@@ -144,7 +156,9 @@ class EvidenceRegistry:
             fragments.setdefault(item.key, item)
         merged_fragments = tuple(
             fragments[key]
-            for key in sorted(fragments)[:EVIDENCE_PDF_FRAGMENTS_MAX]
+            for key in sorted(fragments, key=_evidence_fragment_sort_key)[
+                :EVIDENCE_PDF_FRAGMENTS_MAX
+            ]
         )
         if merged_fragments:
             content_excerpt = "\n\n".join(
