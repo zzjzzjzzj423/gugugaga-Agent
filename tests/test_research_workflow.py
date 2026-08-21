@@ -270,6 +270,13 @@ class _HostileSpecialSetattrProviderError(RuntimeError):
         return BaseException.__setattr__(self, name, value)
 
 
+class _HostileNoteProviderError(RuntimeError):
+    def __setattr__(self, name, value):
+        if name == "__notes__":
+            raise _HostileProtocolTrap("hostile note assignment")
+        return BaseException.__setattr__(self, name, value)
+
+
 class _MaskedAuditTraceError(TraceWriteError):
     def __init__(self, message: str, mask_mode: str = "return_none") -> None:
         super().__init__(message)
@@ -289,71 +296,34 @@ class _MaskedAuditTraceError(TraceWriteError):
         return self._masked()
 
 
+class _HostileStringTraceError(TraceWriteError):
+    def __str__(self):
+        raise _HostileProtocolTrap("hostile audit string conversion")
+
+
 class _AttachMutationCauseDescriptor:
     def __init__(
         self,
         provider_error: RuntimeError,
         trace_errors: tuple[TraceWriteError, ...],
-        graph_kind: str,
     ) -> None:
         self.delegate = _exception_slot("__cause__")
         self.provider_error = provider_error
-        self.trace_errors = trace_errors
         self.trace_error_ids = {id(error) for error in trace_errors}
-        self.graph_kind = graph_kind
-        self.attached_trace_ids: set[int] = set()
-        self.provider_slots_before_attach: list[tuple[object, object, object]] = []
-        self.restore_write_failed = False
-        self.restore_read_failed = False
-        self.restore_started = False
+        self.attach_mutations = 0
 
     def __get__(self, instance, owner=None):
-        if (
-            self.graph_kind == "unreadable"
-            and id(instance) in self.attached_trace_ids
-        ):
-            raise _HostileProtocolTrap("audit cause became unreadable")
-        value = self.delegate.__get__(instance, BaseException)
-        if (
-            self.graph_kind == "rollback_validation_once"
-            and instance is self.provider_error
-            and self.restore_started
-            and value is None
-            and not self.restore_read_failed
-        ):
-            self.restore_read_failed = True
-            raise _HostileProtocolTrap("restored provider cause unreadable once")
-        return value
+        return self.delegate.__get__(instance, BaseException)
 
     def __set__(self, instance, value) -> None:
         is_attach = (
             instance is self.provider_error
             and id(value) in self.trace_error_ids
         )
-        if is_attach:
-            self.provider_slots_before_attach.append((
-                _get_exception_slot(instance, "__cause__"),
-                _get_exception_slot(instance, "__context__"),
-                _get_exception_slot(instance, "__suppress_context__"),
-            ))
-        is_restore = (
-            instance is self.provider_error
-            and value is None
-            and self.attached_trace_ids
-        )
-        if (
-            is_restore
-            and self.graph_kind == "rollback_write_once"
-            and not self.restore_write_failed
-        ):
-            self.restore_write_failed = True
-            raise _HostileProtocolTrap("provider cause restore failed once")
         self.delegate.__set__(instance, value)
-        if is_restore:
-            self.restore_started = True
         if is_attach:
-            self.attached_trace_ids.add(id(value))
-            _configure_audit_graph(value, self.provider_error, self.graph_kind)
+            self.attach_mutations += 1
+            _set_exception_slot(value, "__context__", self.provider_error)
 
 
 def _trace_failure_kind(event_type: str, payload: dict) -> str | None:
@@ -483,9 +453,6 @@ def _configure_audit_graph(
     graph_kind: str,
 ) -> None:
     if graph_kind in {"clean", "unreadable"}:
-        return
-    if graph_kind in {"rollback_write_once", "rollback_validation_once"}:
-        _set_exception_slot(trace_error, "__cause__", provider_error)
         return
     if graph_kind == "cause_provider":
         _set_exception_slot(trace_error, "__cause__", provider_error)
@@ -2529,18 +2496,11 @@ def test_provider_error_remains_primary_when_failed_finished_trace_also_fails(
         workflow.run("question", "2025-05-01", registry=registry)
 
     assert caught.value is provider_error
-    expected_cause = (
-        trace_errors["writing_failed"]
-        if provider_diagnostics == "empty"
-        else original_cause
-    )
     _assert_provider_diagnostics(
         caught.value,
-        cause=expected_cause,
+        cause=original_cause,
         context=original_context,
-        suppress_context=(
-            True if provider_diagnostics == "empty" else original_suppress
-        ),
+        suppress_context=original_suppress,
     )
     assert active_exceptions == {"writing_failed": None}
     if trace_mode == "write_failure":
@@ -2564,7 +2524,7 @@ def test_provider_error_remains_primary_when_failed_finished_trace_also_fails(
     "provider_diagnostics",
     ("empty", "explicit_cause", "context", "suppressed_context"),
 )
-def test_provider_error_keeps_first_trace_cause_when_terminal_trace_also_fails(
+def test_provider_error_uses_event_notes_when_both_audit_writes_fail(
     tmp_path,
     monkeypatch,
     failed_attempt,
@@ -2617,18 +2577,11 @@ def test_provider_error_keeps_first_trace_cause_when_terminal_trace_also_fails(
         workflow.run("question", "2025-05-01", registry=registry)
 
     assert caught.value is provider_error
-    expected_cause = (
-        trace_errors["writing_failed"]
-        if provider_diagnostics == "empty"
-        else original_cause
-    )
     _assert_provider_diagnostics(
         caught.value,
-        cause=expected_cause,
+        cause=original_cause,
         context=original_context,
-        suppress_context=(
-            True if provider_diagnostics == "empty" else original_suppress
-        ),
+        suppress_context=original_suppress,
     )
     assert active_exceptions == {"writing_failed": None, "terminal": None}
     if trace_mode == "write_failure":
@@ -2659,7 +2612,7 @@ def test_provider_error_keeps_first_trace_cause_when_terminal_trace_also_fails(
     "provider_diagnostics",
     ("empty", "explicit_cause", "context", "suppressed_context"),
 )
-def test_provider_error_uses_terminal_trace_as_cause_when_only_terminal_fails(
+def test_provider_error_uses_note_when_only_terminal_audit_write_fails(
     tmp_path,
     monkeypatch,
     failed_attempt,
@@ -2715,18 +2668,11 @@ def test_provider_error_uses_terminal_trace_as_cause_when_only_terminal_fails(
         workflow.run("question", "2025-05-01", registry=registry)
 
     assert caught.value is provider_error
-    expected_cause = (
-        trace_errors["terminal"]
-        if provider_diagnostics == "empty"
-        else original_cause
-    )
     _assert_provider_diagnostics(
         caught.value,
-        cause=expected_cause,
+        cause=original_cause,
         context=original_context,
-        suppress_context=(
-            True if provider_diagnostics == "empty" else original_suppress
-        ),
+        suppress_context=original_suppress,
     )
     assert active_exceptions == {"terminal": None}
     if trace_mode == "write_failure":
@@ -2737,7 +2683,7 @@ def test_provider_error_uses_terminal_trace_as_cause_when_only_terminal_fails(
         origin_traceback,
     )
     terminal_notes = _audit_notes(caught.value, "research_workflow_completed")
-    assert len(terminal_notes) == (0 if provider_diagnostics == "empty" else 1)
+    assert len(terminal_notes) == 1
     if terminal_notes:
         assert "TraceWriteError" in terminal_notes[0]
         assert "\n" not in terminal_notes[0]
@@ -2770,6 +2716,35 @@ def test_masked_diagnostic_descriptors_cannot_hide_provider_slots(
     _set_exception_slot(provider_error, "__cause__", original_cause)
     _set_exception_slot(provider_error, "__context__", original_context)
     _set_exception_slot(provider_error, "__suppress_context__", True)
+    expected_visibility = (
+        {
+            "__cause__": "raised",
+            "__context__": "raised",
+            "__suppress_context__": "raised",
+            "__traceback__": "raised",
+        }
+        if mask_mode == "raise"
+        else {
+            "__cause__": None,
+            "__context__": None,
+            "__suppress_context__": False,
+            "__traceback__": None,
+        }
+    )
+
+    def visible_slots():
+        values = {}
+        for name in expected_visibility:
+            try:
+                values[name] = BaseException.__getattribute__(
+                    provider_error,
+                    name,
+                )
+            except _HostileProtocolTrap:
+                values[name] = "raised"
+        return values
+
+    assert visible_slots() == expected_visibility
     workflow, run, registry, trace_errors, active_exceptions = (
         _provider_failure_workflow(
             tmp_path,
@@ -2799,6 +2774,7 @@ def test_masked_diagnostic_descriptors_cannot_hide_provider_slots(
         context=original_context,
         suppress_context=True,
     )
+    assert visible_slots() == expected_visibility
     assert active_exceptions == {kind: None for kind in failed_kinds}
     _assert_acyclic_exception_graph(provider_error)
     assert _traceback_contains(
@@ -2841,7 +2817,7 @@ def test_masked_diagnostic_descriptors_cannot_hide_provider_slots(
         "clean",
     ),
 )
-def test_audit_graph_is_validated_before_attaching_provider_cause(
+def test_audit_graph_shape_never_changes_provider_diagnostics(
     tmp_path,
     monkeypatch,
     failed_attempt,
@@ -2875,16 +2851,11 @@ def test_audit_graph_is_validated_before_attaching_provider_cause(
 
     if caught.value is not provider_error:
         pytest.fail("audit graph replaced the provider error", pytrace=False)
-    first_audit = (
-        trace_errors["writing_failed"]
-        if "writing_failed" in failed_kinds
-        else trace_errors["terminal"]
-    )
     _assert_provider_diagnostics(
         provider_error,
-        cause=first_audit if graph_kind == "clean" else None,
+        cause=None,
         context=None,
-        suppress_context=(graph_kind == "clean"),
+        suppress_context=False,
     )
     assert active_exceptions == {kind: None for kind in failed_kinds}
     _assert_acyclic_exception_graph(provider_error)
@@ -2896,10 +2867,75 @@ def test_audit_graph_is_validated_before_attaching_provider_cause(
     writing_notes = _audit_notes(provider_error, "writing_attempt_finished")
     assert len(writing_notes) == (1 if "writing_failed" in failed_kinds else 0)
     terminal_notes = _audit_notes(provider_error, "research_workflow_completed")
-    expected_terminal_notes = int(
-        "terminal" in failed_kinds
-        and not (graph_kind == "clean" and failure_combination == "terminal_only")
+    expected_terminal_notes = int("terminal" in failed_kinds)
+    assert len(terminal_notes) == expected_terminal_notes
+    for note in [*writing_notes, *terminal_notes]:
+        assert "\n" not in note
+        assert len(note) <= 600
+
+
+@pytest.mark.parametrize("failed_attempt", (1, 2))
+@pytest.mark.parametrize(
+    ("failure_combination", "failed_kinds"),
+    (
+        ("failed_only", {"writing_failed"}),
+        ("persistent", {"writing_failed", "terminal"}),
+        ("terminal_only", {"terminal"}),
+    ),
+)
+def test_audit_failures_never_start_cause_attachment_transaction(
+    tmp_path,
+    monkeypatch,
+    failed_attempt,
+    failure_combination,
+    failed_kinds,
+):
+    provider_error, origin_traceback = _provider_error_with_origin(
+        "writer offline"
     )
+    workflow, run, registry, trace_errors, active_exceptions = (
+        _provider_failure_workflow(
+            tmp_path,
+            monkeypatch,
+            provider_error=provider_error,
+            failed_attempt=failed_attempt,
+            failed_kinds=failed_kinds,
+            run_id=f"no-attach-{failure_combination}-{failed_attempt}",
+        )
+    )
+    mutation_descriptor = _AttachMutationCauseDescriptor(
+        provider_error,
+        tuple(trace_errors.values()),
+    )
+    monkeypatch.setitem(
+        research_workflow._EXCEPTION_SLOT_DESCRIPTORS,
+        "__cause__",
+        mutation_descriptor,
+    )
+
+    with bind_run_context(run), pytest.raises(BaseException) as caught:
+        workflow.run("question", "2025-05-01", registry=registry)
+
+    if caught.value is not provider_error:
+        pytest.fail("post-attach mutation replaced provider error", pytrace=False)
+    _assert_provider_diagnostics(
+        provider_error,
+        cause=None,
+        context=None,
+        suppress_context=False,
+    )
+    assert mutation_descriptor.attach_mutations == 0
+    assert active_exceptions == {kind: None for kind in failed_kinds}
+    _assert_acyclic_exception_graph(provider_error)
+    assert _traceback_contains(
+        _get_exception_slot(provider_error, "__traceback__"),
+        origin_traceback,
+    )
+
+    writing_notes = _audit_notes(provider_error, "writing_attempt_finished")
+    assert len(writing_notes) == (1 if "writing_failed" in failed_kinds else 0)
+    terminal_notes = _audit_notes(provider_error, "research_workflow_completed")
+    expected_terminal_notes = int("terminal" in failed_kinds)
     assert len(terminal_notes) == expected_terminal_notes
     for note in [*writing_notes, *terminal_notes]:
         assert "\n" not in note
@@ -2919,17 +2955,14 @@ def test_audit_graph_is_validated_before_attaching_provider_cause(
     "graph_kind",
     (
         "cause_provider",
-        "context_provider",
         "self_cycle",
-        "two_node_cycle",
         "too_deep",
         "unreadable",
-        "rollback_write_once",
-        "rollback_validation_once",
+        "hostile_str",
         "clean",
     ),
 )
-def test_audit_graph_is_revalidated_transactionally_after_exact_attach(
+def test_note_only_audit_does_not_read_provider_slots_or_audit_graph(
     tmp_path,
     monkeypatch,
     failed_attempt,
@@ -2947,63 +2980,79 @@ def test_audit_graph_is_revalidated_transactionally_after_exact_attach(
             provider_error=provider_error,
             failed_attempt=failed_attempt,
             failed_kinds=failed_kinds,
-            run_id=(
-                f"post-attach-{graph_kind}-{failure_combination}-"
-                f"{failed_attempt}"
-            ),
+            run_id=f"note-only-{graph_kind}-{failure_combination}-{failed_attempt}",
         )
     )
-    mutation_descriptor = _AttachMutationCauseDescriptor(
-        provider_error,
-        tuple(trace_errors.values()),
-        graph_kind,
+    if graph_kind in {"unreadable", "hostile_str"}:
+        for kind in tuple(trace_errors):
+            trace_errors[kind] = (
+                _MaskedAuditTraceError(
+                    _trace_failure_message(kind),
+                    "raise",
+                )
+                if graph_kind == "unreadable"
+                else _HostileStringTraceError(_trace_failure_message(kind))
+            )
+    else:
+        for trace_error in trace_errors.values():
+            _configure_audit_graph(trace_error, provider_error, graph_kind)
+
+    original_read_slot = research_workflow._read_exception_slot
+    original_write_slot = research_workflow._write_exception_slot
+    forbidden_slot_accesses: list[tuple[str, str]] = []
+
+    def guarded_read_slot(error, name, default):
+        if name != "__traceback__":
+            forbidden_slot_accesses.append(("read", name))
+            raise _HostileProtocolTrap(f"forbidden provider slot read: {name}")
+        return original_read_slot(error, name, default)
+
+    def guarded_write_slot(error, name, value):
+        if name != "__traceback__":
+            forbidden_slot_accesses.append(("write", name))
+            raise _HostileProtocolTrap(f"forbidden provider slot write: {name}")
+        return original_write_slot(error, name, value)
+
+    def reject_graph_traversal(*args, **kwargs):
+        raise _HostileProtocolTrap("audit graph traversal is forbidden")
+
+    monkeypatch.setattr(
+        research_workflow,
+        "_read_exception_slot",
+        guarded_read_slot,
     )
-    monkeypatch.setitem(
-        research_workflow._EXCEPTION_SLOT_DESCRIPTORS,
-        "__cause__",
-        mutation_descriptor,
+    monkeypatch.setattr(
+        research_workflow,
+        "_write_exception_slot",
+        guarded_write_slot,
+    )
+    monkeypatch.setattr(
+        research_workflow,
+        "_exception_graph_is_safe",
+        reject_graph_traversal,
+        raising=False,
     )
 
     with bind_run_context(run), pytest.raises(BaseException) as caught:
         workflow.run("question", "2025-05-01", registry=registry)
 
-    if caught.value is not provider_error:
-        pytest.fail("post-attach mutation replaced provider error", pytrace=False)
-    first_audit = (
-        trace_errors["writing_failed"]
-        if "writing_failed" in failed_kinds
-        else trace_errors["terminal"]
-    )
-    attached = graph_kind == "clean"
+    assert caught.value is provider_error
+    assert forbidden_slot_accesses == []
     _assert_provider_diagnostics(
         provider_error,
-        cause=first_audit if attached else None,
+        cause=None,
         context=None,
-        suppress_context=attached,
-    )
-    expected_attach_attempts = 1 if attached else len(failed_kinds)
-    assert len(mutation_descriptor.provider_slots_before_attach) == (
-        expected_attach_attempts
-    )
-    assert all(
-        slots == (None, None, False)
-        for slots in mutation_descriptor.provider_slots_before_attach
+        suppress_context=False,
     )
     assert active_exceptions == {kind: None for kind in failed_kinds}
-    _assert_acyclic_exception_graph(provider_error)
     assert _traceback_contains(
         _get_exception_slot(provider_error, "__traceback__"),
         origin_traceback,
     )
-
     writing_notes = _audit_notes(provider_error, "writing_attempt_finished")
     assert len(writing_notes) == (1 if "writing_failed" in failed_kinds else 0)
     terminal_notes = _audit_notes(provider_error, "research_workflow_completed")
-    expected_terminal_notes = int(
-        "terminal" in failed_kinds
-        and not (attached and failure_combination == "terminal_only")
-    )
-    assert len(terminal_notes) == expected_terminal_notes
+    assert len(terminal_notes) == (1 if "terminal" in failed_kinds else 0)
     for note in [*writing_notes, *terminal_notes]:
         assert "\n" not in note
         assert len(note) <= 600
@@ -3105,16 +3154,11 @@ def test_hostile_special_setattr_cannot_replace_provider_during_attach(
             f"{str(caught.value)}",
             pytrace=False,
         )
-    first_audit = (
-        trace_errors["writing_failed"]
-        if "writing_failed" in failed_kinds
-        else trace_errors["terminal"]
-    )
     _assert_provider_diagnostics(
         provider_error,
-        cause=first_audit,
+        cause=None,
         context=None,
-        suppress_context=True,
+        suppress_context=False,
     )
     _assert_acyclic_exception_graph(provider_error)
     assert _traceback_contains(
@@ -3186,16 +3230,11 @@ def test_hostile_provider_protocols_cannot_replace_primary_error(
 
     if caught.value is not provider_error:
         pytest.fail("hostile protocol replaced the provider exception", pytrace=False)
-    first_audit = (
-        trace_errors["terminal"]
-        if failure_combination == "terminal_only"
-        else trace_errors["writing_failed"]
-    )
     _assert_provider_diagnostics(
         provider_error,
-        cause=first_audit,
+        cause=None,
         context=None,
-        suppress_context=True,
+        suppress_context=False,
     )
     assert active_exceptions == {kind: None for kind in failed_kinds}
     _assert_acyclic_exception_graph(provider_error)
@@ -3206,10 +3245,10 @@ def test_hostile_provider_protocols_cannot_replace_primary_error(
 
     writing_notes = _audit_notes(provider_error, "writing_attempt_finished")
     assert len(writing_notes) == (
-        0 if failure_combination == "terminal_only" else 1
+        1 if "writing_failed" in failed_kinds else 0
     )
     terminal_notes = _audit_notes(provider_error, "research_workflow_completed")
-    assert len(terminal_notes) == (1 if failure_combination == "persistent" else 0)
+    assert len(terminal_notes) == (1 if "terminal" in failed_kinds else 0)
     for note in [*writing_notes, *terminal_notes]:
         assert "\n" not in note
         assert len(note) <= 600
@@ -3231,6 +3270,57 @@ def test_hostile_provider_protocols_cannot_replace_primary_error(
         assert len(payload["failure_message"]) <= 512
         assert "private" not in payload["failure_message"]
         assert "\n" not in payload["failure_message"]
+
+
+@pytest.mark.parametrize("failed_attempt", (1, 2))
+@pytest.mark.parametrize(
+    ("failure_combination", "failed_kinds"),
+    (
+        ("failed_only", {"writing_failed"}),
+        ("persistent", {"writing_failed", "terminal"}),
+        ("terminal_only", {"terminal"}),
+    ),
+)
+def test_failed_nonvirtual_add_note_does_not_replace_provider(
+    tmp_path,
+    monkeypatch,
+    failed_attempt,
+    failure_combination,
+    failed_kinds,
+):
+    provider_error, origin_traceback = _error_with_origin(
+        _HostileNoteProviderError("writer offline")
+    )
+    workflow, run, registry, trace_errors, active_exceptions = (
+        _provider_failure_workflow(
+            tmp_path,
+            monkeypatch,
+            provider_error=provider_error,
+            failed_attempt=failed_attempt,
+            failed_kinds=failed_kinds,
+            run_id=f"note-failure-{failure_combination}-{failed_attempt}",
+        )
+    )
+
+    with bind_run_context(run), pytest.raises(BaseException) as caught:
+        workflow.run("question", "2025-05-01", registry=registry)
+
+    assert caught.value is provider_error
+    _assert_provider_diagnostics(
+        provider_error,
+        cause=None,
+        context=None,
+        suppress_context=False,
+    )
+    assert active_exceptions == {kind: None for kind in failed_kinds}
+    assert _traceback_contains(
+        _get_exception_slot(provider_error, "__traceback__"),
+        origin_traceback,
+    )
+    assert _audit_notes(provider_error, "writing_attempt_finished") == []
+    assert _audit_notes(provider_error, "research_workflow_completed") == []
+    for trace_error in trace_errors.values():
+        assert provider_error not in _assert_acyclic_exception_graph(trace_error)
 
 
 @pytest.mark.parametrize("interrupt_type", (KeyboardInterrupt, SystemExit))

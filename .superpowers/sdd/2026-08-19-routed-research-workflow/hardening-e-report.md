@@ -274,3 +274,36 @@ The resulting research boundary is:
 - Affected regression suite (`agent_loop_source`, `benchmark_worker`, `context_recovery`, `research_workflow`, and `trace`): `342 passed`.
 - Full suite: `657 passed, 1 deselected`; the sole deselection was `tests/test_source_audit.py::test_source_map_pins_baseline_and_classifies_every_top_level_source_block`, the approved linked-worktree source-map baseline test.
 - Final compile, baseline-range diff, commit, and clean-status evidence is included in the handoff.
+
+## Exception Fix Round 7: simplify audit failure diagnostics
+
+### Authorization and invariant
+
+- The user explicitly chose and authorized the simplified note-only design for this exception round.
+- Verified exact clean baseline `c43761077fd92d7679e3b6a135f57c2f34fc49d8` before edits.
+- When a non-`TraceWriteError` provider exception is already primary, a failed `writing_attempt_finished` or terminal `research_workflow_completed` audit write now only attempts one code-owned, event-specific, whitespace/control-normalized note bounded to 600 characters. An audit `TraceWriteError` never becomes the provider cause.
+- Provider cause, context, and suppress-context slots are never read, written, validated, or restored by the workflow. Their exact identities and masked virtual visibility remain unchanged from capture through rethrow. If nonvirtual `BaseException.add_note()` itself fails, the note is lost and the identical provider is still rethrown.
+- Production scope remained only `simple_cc/research_workflow.py`; the accepted embedded-scheme scanner limitation was not touched.
+
+### Simplification
+
+- Deleted `_attach_audit_cause()`, candidate/full graph traversal, graph limits, diagnostic matching, transaction rollback, and cause/context/suppress capture. Production changed by `+16/-235` lines relative to the Round 7 baseline.
+- The remaining exception snapshot contains only the exact BaseException traceback slot needed to preserve the original traceback tail. Safe failure metadata and note formatting remain bounded and hostile-protocol resistant.
+- Both writing-failed and terminal-audit paths now have the same shape: capture the provider and exact traceback outside audit I/O, record best-effort audit data, add the event-specific note when a `TraceWriteError` is returned, and rethrow the identical provider with its captured traceback.
+- Direct provider `TraceWriteError`, a successful provider call followed by a failed completion event, real `TraceRecorder` `OSError` translation, `KeyboardInterrupt`, and `SystemExit` retain their existing propagation semantics.
+
+### Regression and TDD evidence
+
+- RED migrated attempt 1/2 across failed-only, persistent, and terminal-only failures with both preconstructed and real-recorder audit errors. The valid run produced `108 failed, 36 passed`: empty providers acquired audit causes, attachment transactions ran, and the non-traceback slot/graph spy observed the old path.
+- GREEN after the note-only production change: `144 passed, 150 deselected` for the initial focused matrix.
+- The final focused matrix produced `190 passed, 68 deselected`, covering empty/explicit-cause/context/suppressed providers, masked/hostile descriptors, hostile `__setattr__`, attach-time mutation hooks, provider back-references, self/two-node cycles, deep/unreadable graphs, direct trace failures, failed note assignment, and recorder interrupts.
+- A dedicated spy rejects any non-traceback slot read/write and any audit graph traversal. Attach-time mutation counters remain zero for attempts 1/2 and all three failure combinations.
+- Masked provider diagnostics preserve both their underlying exact slot identities and their virtual return-`None`/raise visibility. Hostile audit string conversion is normalized safely. A provider that makes nonvirtual note assignment fail remains primary and receives no audit note.
+- Persistent failures receive distinct bounded `writing_attempt_finished` and `research_workflow_completed` notes; all emitted notes are single-line and control-normalized.
+
+### Verification
+
+- Complete workflow file after removing obsolete transaction cases: `258 passed`.
+- Affected regression suite (`agent_loop_source`, `benchmark_worker`, `context_recovery`, `research_workflow`, and `trace`): `336 passed`.
+- Full suite: `651 passed, 1 deselected`; the sole deselection was the approved linked-worktree source-map baseline test.
+- Final compile, baseline-range diff, commit, and clean-status evidence is included in the handoff.
