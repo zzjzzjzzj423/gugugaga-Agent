@@ -255,6 +255,7 @@ def _capture_exception_diagnostics(
             and suppress_context_readable
             and cause is None
             and context is None
+            and suppress_context is False
         ),
     )
 
@@ -272,51 +273,116 @@ def _restore_exception_traceback(
 def _exception_graph_is_safe(
     root: BaseException,
     *,
-    forbidden: BaseException,
+    forbidden: BaseException | None = None,
 ) -> bool:
-    visiting: set[int] = set()
-    visited: set[int] = set()
-    stack: list[tuple[BaseException, bool]] = [(root, False)]
-    node_count = 0
-    while stack:
-        node, leaving = stack.pop()
-        if node is forbidden:
-            return False
-        identity = id(node)
-        if leaving:
-            visiting.discard(identity)
-            visited.add(identity)
-            continue
-        if identity in visiting:
-            return False
-        if identity in visited:
-            continue
-        node_count += 1
-        if node_count > _EXCEPTION_GRAPH_NODE_LIMIT:
-            return False
-        cause, cause_readable = _read_exception_slot(
-            node,
-            "__cause__",
-            None,
+    try:
+        visiting: set[int] = set()
+        visited: set[int] = set()
+        stack: list[tuple[BaseException, bool]] = [(root, False)]
+        node_count = 0
+        while stack:
+            node, leaving = stack.pop()
+            if forbidden is not None and node is forbidden:
+                return False
+            identity = id(node)
+            if leaving:
+                visiting.discard(identity)
+                visited.add(identity)
+                continue
+            if identity in visiting:
+                return False
+            if identity in visited:
+                continue
+            node_count += 1
+            if node_count > _EXCEPTION_GRAPH_NODE_LIMIT:
+                return False
+            cause, cause_readable = _read_exception_slot(
+                node,
+                "__cause__",
+                None,
+            )
+            context, context_readable = _read_exception_slot(
+                node,
+                "__context__",
+                None,
+            )
+            if not cause_readable or not context_readable:
+                return False
+            if cause is not None and not isinstance(cause, BaseException):
+                return False
+            if context is not None and not isinstance(context, BaseException):
+                return False
+            visiting.add(identity)
+            stack.append((node, True))
+            if context is not None:
+                stack.append((context, False))
+            if cause is not None:
+                stack.append((cause, False))
+        return True
+    except BaseException:
+        return False
+
+
+def _exception_diagnostics_match(
+    error: BaseException,
+    diagnostics: _ExceptionDiagnostics,
+) -> bool:
+    cause, cause_readable = _read_exception_slot(error, "__cause__", None)
+    context, context_readable = _read_exception_slot(
+        error,
+        "__context__",
+        None,
+    )
+    suppress, suppress_readable = _read_exception_slot(
+        error,
+        "__suppress_context__",
+        False,
+    )
+    return (
+        cause_readable
+        and context_readable
+        and suppress_readable
+        and cause is diagnostics.cause
+        and context is diagnostics.context
+        and suppress is diagnostics.suppress_context
+    )
+
+
+def _restore_exception_diagnostics(
+    error: BaseException,
+    diagnostics: _ExceptionDiagnostics,
+) -> bool:
+    restored = True
+    restored = (
+        _write_exception_slot(error, "__cause__", diagnostics.cause)
+        and restored
+    )
+    restored = (
+        _write_exception_slot(error, "__context__", diagnostics.context)
+        and restored
+    )
+    restored = (
+        _write_exception_slot(
+            error,
+            "__suppress_context__",
+            diagnostics.suppress_context,
         )
-        context, context_readable = _read_exception_slot(
-            node,
-            "__context__",
-            None,
+        and restored
+    )
+    if not restored or not _exception_diagnostics_match(error, diagnostics):
+        # Keep restoration best-effort even when an exact descriptor was
+        # transiently unreadable or rejected one of the first writes.
+        _write_exception_slot(error, "__cause__", diagnostics.cause)
+        _write_exception_slot(error, "__context__", diagnostics.context)
+        _write_exception_slot(
+            error,
+            "__suppress_context__",
+            diagnostics.suppress_context,
         )
-        if not cause_readable or not context_readable:
-            return False
-        if cause is not None and not isinstance(cause, BaseException):
-            return False
-        if context is not None and not isinstance(context, BaseException):
-            return False
-        visiting.add(identity)
-        stack.append((node, True))
-        if context is not None:
-            stack.append((context, False))
-        if cause is not None:
-            stack.append((cause, False))
-    return True
+    return (
+        _exception_diagnostics_match(error, diagnostics)
+        and _exception_graph_is_safe(error)
+    )
 
 
 def _attach_audit_cause(
@@ -329,6 +395,7 @@ def _attach_audit_cause(
     if not _exception_graph_is_safe(trace_error, forbidden=error):
         return False
     if not _write_exception_slot(error, "__cause__", trace_error):
+        _restore_exception_diagnostics(error, diagnostics)
         return False
     attached_cause, cause_readable = _read_exception_slot(
         error,
@@ -352,15 +419,10 @@ def _attach_audit_cause(
         and attached_cause is trace_error
         and attached_context is None
         and attached_suppress is True
+        and _exception_graph_is_safe(error)
     ):
         return True
-    _write_exception_slot(error, "__cause__", diagnostics.cause)
-    _write_exception_slot(error, "__context__", diagnostics.context)
-    _write_exception_slot(
-        error,
-        "__suppress_context__",
-        diagnostics.suppress_context,
-    )
+    _restore_exception_diagnostics(error, diagnostics)
     return False
 
 

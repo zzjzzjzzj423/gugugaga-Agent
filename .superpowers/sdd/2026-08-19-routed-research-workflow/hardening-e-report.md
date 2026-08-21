@@ -240,3 +240,37 @@ The resulting research boundary is:
 - Affected regression suite: `299 passed`.
 - Full suite: `585 passed, 1 deselected`; the sole deselection was the approved source-map baseline test, using a unique external basetemp.
 - Final compile, baseline-range diff, commit, and clean-status evidence is included in the handoff.
+
+## Exception Fix Round 6: verify attached audit graphs
+
+### Authorization, baseline, and root cause
+
+- The controller received explicit user authorization for this exception round after the normal five-round repair cap.
+- Verified exact clean baseline `d0ba2b334823727fe3d1ecee3877d2ea46abba0e` before edits.
+- `_attach_audit_cause()` validated the candidate audit graph before the exact provider-cause write, but after that write it checked only the provider's three root diagnostic slots. If the audit cause/context graph changed during attachment, a provider back-reference, cycle, over-limit graph, or unreadable node could remain attached.
+- `audit_cause_allowed` also ignored an independently captured `__suppress_context__ = True` when cause and context were empty, replacing that diagnostic choice with an audit cause.
+- Production scope remained only `simple_cc/research_workflow.py`; the accepted embedded-scheme scanner limitation was not touched.
+
+### Transactional graph boundary
+
+- The existing exact-slot, bounded gray/visited traversal now supports two uses: candidate preflight with the provider forbidden, and a post-attach traversal rooted at the provider itself. The latter follows the complete exact cause/context graph and rejects cycles, provider back-references, non-exception children, unreadable slots, and graphs beyond the 32-node limit.
+- Cause attachment succeeds only when the exact root slots have the expected identities and the complete post-attach provider graph is safe. A clean graph remains attached.
+- Any failed write, root check, or full-graph check triggers best-effort restoration of the captured provider cause, context, and suppress-context slots. Restoration retries after a transient exact write/read failure, then verifies exact slot identity and validates the restored full graph. Helper failures remain contained; the identical provider stays primary and the existing event-specific, normalized, 600-character note path records the audit failure.
+- An explicitly true suppress-context slot now independently forces note-only handling even when cause and context are empty.
+
+### Regression coverage and TDD evidence
+
+- The attach-time fixture wraps the exact cause descriptor used by production and mutates the audit graph only after the provider cause write. It does not pre-pollute the candidate graph.
+- Attempt 1 and attempt 2 are each covered across failed-only, persistent, and terminal-only audit failure combinations for audit cause/context provider back-references, self-cycles, two-node cycles, over-limit graphs, slots becoming unreadable, transient rollback write/read failures, and a clean attach control.
+- Unsafe cases restore provider cause/context/suppress identities, leave no audit cause reachable from the provider, retain an acyclic provider graph, preserve the original traceback tail, and emit only bounded event-specific notes. Clean cases attach the first audit cause.
+- Provider traceback masking uses a setter that permits the exception's initial throw while a virtual getter returns `None` or raises; exact-slot capture still preserves its real traceback. Audit cause/context descriptors cover both return-`None` and raise modes. Hostile `__setattr__`, hostile provider protocols, real recorder `OSError` translation, direct `TraceWriteError`, `KeyboardInterrupt`, and `SystemExit` regressions remain in the complete workflow suite.
+- The first sandboxed RED attempt was invalid because Windows denied access to the pytest basetemp. A fresh escalated basetemp produced the valid RED: `42 failed, 78 passed`; 36 failures retained post-attach unsafe graphs and 6 failures attached despite explicit suppress-context.
+- After the minimal production change, the focused matrix was GREEN: `132 passed, 132 deselected`.
+- Removing the second best-effort restoration pass produced a mutation RED of `6 failed, 6 passed`; restoring it returned the rollback matrix to GREEN.
+
+### Verification
+
+- Complete workflow file: `264 passed`.
+- Affected regression suite (`agent_loop_source`, `benchmark_worker`, `context_recovery`, `research_workflow`, and `trace`): `342 passed`.
+- Full suite: `657 passed, 1 deselected`; the sole deselection was `tests/test_source_audit.py::test_source_map_pins_baseline_and_classifies_every_top_level_source_block`, the approved linked-worktree source-map baseline test.
+- Final compile, baseline-range diff, commit, and clean-status evidence is included in the handoff.
