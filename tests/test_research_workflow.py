@@ -129,6 +129,24 @@ def _set_exception_slot(error: BaseException, name: str, value) -> None:
     _exception_slot(name).__set__(error, value)
 
 
+def _exact_exception_dict(error: BaseException) -> dict:
+    return vars(BaseException)["__dict__"].__get__(error, BaseException)
+
+
+def _protocol_side_effect_count(error: BaseException) -> int:
+    return _exact_exception_dict(error).get("protocol_side_effect_count", 0)
+
+
+def _mutate_exception_diagnostics(error: BaseException) -> None:
+    instance_dict = _exact_exception_dict(error)
+    instance_dict["protocol_side_effect_count"] = (
+        instance_dict.get("protocol_side_effect_count", 0) + 1
+    )
+    _set_exception_slot(error, "__cause__", RuntimeError("mutated cause"))
+    _set_exception_slot(error, "__context__", RuntimeError("mutated context"))
+    _set_exception_slot(error, "__suppress_context__", False)
+
+
 def _provider_error_with_origin(message: str) -> tuple[RuntimeError, object]:
     return _error_with_origin(RuntimeError(message))
 
@@ -299,6 +317,77 @@ class _MaskedAuditTraceError(TraceWriteError):
 class _HostileStringTraceError(TraceWriteError):
     def __str__(self):
         raise _HostileProtocolTrap("hostile audit string conversion")
+
+
+class _SlotMutatingProviderError(RuntimeError):
+    def __init__(self, protocol_mode: str) -> None:
+        super().__init__("private provider details")
+        _exact_exception_dict(self)["protocol_mode"] = protocol_mode
+
+    @property
+    def failure_class(self):
+        mode = _exact_exception_dict(self)["protocol_mode"]
+        if mode.startswith("failure_class"):
+            _mutate_exception_diagnostics(self)
+            if mode.endswith("_raise"):
+                raise _HostileProtocolTrap("failure_class side effect")
+        return "PrivateProviderClass"
+
+    @property
+    def failure_message(self):
+        mode = _exact_exception_dict(self)["protocol_mode"]
+        if mode.startswith("failure_message"):
+            _mutate_exception_diagnostics(self)
+            if mode.endswith("_raise"):
+                raise _HostileProtocolTrap("failure_message side effect")
+        if mode.startswith("provider_str"):
+            return None
+        return "private provider message"
+
+    def __str__(self):
+        mode = _exact_exception_dict(self)["protocol_mode"]
+        if mode.startswith("provider_str"):
+            _mutate_exception_diagnostics(self)
+            if mode.endswith("_raise"):
+                raise _HostileProtocolTrap("provider string side effect")
+        return "private provider string"
+
+
+class _SlotMutatingAuditTraceError(TraceWriteError):
+    def __init__(self, provider_error: RuntimeError) -> None:
+        super().__init__("private audit details")
+        instance_dict = _exact_exception_dict(self)
+        instance_dict["provider_error"] = provider_error
+        instance_dict["protocol_side_effect_count"] = 0
+
+    def __str__(self):
+        instance_dict = _exact_exception_dict(self)
+        instance_dict["protocol_side_effect_count"] += 1
+        _mutate_exception_diagnostics(instance_dict["provider_error"])
+        return "private audit string"
+
+
+class _SlotMutatingNotesProviderError(RuntimeError):
+    def __init__(self, note_mode: str) -> None:
+        super().__init__("private note provider details")
+        _exact_exception_dict(self)["note_mode"] = note_mode
+
+    def __setattr__(self, name, value):
+        if name == "__notes__":
+            _mutate_exception_diagnostics(self)
+            if _exact_exception_dict(self)["note_mode"] == "raise":
+                raise _HostileProtocolTrap("hostile note assignment")
+        return BaseException.__setattr__(self, name, value)
+
+
+class _MaskedExceptionDictProviderError(RuntimeError):
+    @property
+    def __dict__(self):
+        raise _HostileProtocolTrap("virtual exception dict access")
+
+
+class _NotesListSubclass(list):
+    pass
 
 
 class _AttachMutationCauseDescriptor:
@@ -2341,8 +2430,8 @@ def test_writing_provider_failure_records_bounded_finished_then_reraises(
     assert failed["attempt"] == failed_attempt
     assert failed["repair"] is (failed_attempt == 2)
     assert failed["status"] == "failed"
-    assert failed["failure_class"] == "RuntimeError"
-    assert failed["failure_message"].startswith("writer offline x")
+    assert failed["failure_class"] == "ProviderError"
+    assert failed["failure_message"] == "provider stage failed"
     assert "\n" not in failed["failure_message"]
     assert len(failed["failure_message"]) <= 512
 
@@ -2435,6 +2524,58 @@ def test_writing_finished_trace_failure_preserves_identity_and_skips_gate(
     rows, incomplete = read_trace_lines(recorder.trajectory_path)
     assert incomplete is False
     assert not [row for row in rows if row["event_type"] == "writing_gate"]
+
+
+def test_successful_terminal_trace_failure_is_rethrown_unchanged(
+    tmp_path,
+    monkeypatch,
+):
+    registry = registry_with_two_sources()
+    provider = ScriptedProvider([
+        light_plan_response(),
+        gate_response(registry, covered=True),
+        valid_light_report(),
+    ])
+    recorder = TraceRecorder(tmp_path / "run", run_id="successful-terminal-trace")
+    recorder.start_run(
+        task_id="research-task",
+        question="question",
+        cutoff="2025-05-01",
+        metadata={"task_type": "research"},
+    )
+    run = RunContext(
+        recorder,
+        "successful-terminal-trace",
+        "research-task",
+        "2025-05-01",
+    )
+    trace_error = TraceWriteError("successful terminal trace unavailable")
+    original_record = recorder.record
+
+    def fail_successful_terminal(event_type, payload, **kwargs):
+        if (
+            event_type == "research_workflow_completed"
+            and payload.get("terminal_reason") != "failed"
+        ):
+            raise trace_error
+        return original_record(event_type, payload, **kwargs)
+
+    monkeypatch.setattr(recorder, "record", fail_successful_terminal)
+    workflow = ResearchWorkflow(
+        provider,
+        lambda prompt, max_rounds, evidence_registry: AgentLoopOutcome(
+            "completed", "notes", rounds_used=1
+        ),
+        run_context=run,
+    )
+
+    with bind_run_context(run), pytest.raises(TraceWriteError) as caught:
+        workflow.run("question", "2025-05-01", registry=registry)
+
+    assert caught.value is trace_error
+    rows, incomplete = read_trace_lines(recorder.trajectory_path)
+    assert incomplete is False
+    assert [row["event_type"] for row in rows][-1] == "writing_gate"
 
 
 @pytest.mark.parametrize("trace_mode", ("preconstructed", "write_failure"))
@@ -2601,7 +2742,9 @@ def test_provider_error_uses_event_notes_when_both_audit_writes_fail(
     assert len(writing_notes[0]) <= 600
     terminal_notes = _audit_notes(caught.value, "research_workflow_completed")
     assert len(terminal_notes) == 1
-    assert "TraceWriteError" in terminal_notes[0]
+    assert terminal_notes[0] == (
+        "research_workflow_completed trace write failed"
+    )
     assert "\n" not in terminal_notes[0]
     assert len(terminal_notes[0]) <= 600
 
@@ -2685,9 +2828,200 @@ def test_provider_error_uses_note_when_only_terminal_audit_write_fails(
     terminal_notes = _audit_notes(caught.value, "research_workflow_completed")
     assert len(terminal_notes) == 1
     if terminal_notes:
-        assert "TraceWriteError" in terminal_notes[0]
+        assert terminal_notes[0] == (
+            "research_workflow_completed trace write failed"
+        )
         assert "\n" not in terminal_notes[0]
         assert len(terminal_notes[0]) <= 600
+
+
+@pytest.mark.parametrize("failed_attempt", (1, 2))
+@pytest.mark.parametrize(
+    ("failure_combination", "failed_kinds"),
+    (
+        ("failed_only", {"writing_failed"}),
+        ("persistent", {"writing_failed", "terminal"}),
+        ("terminal_only", {"terminal"}),
+    ),
+)
+@pytest.mark.parametrize(
+    "side_effect_kind",
+    (
+        "failure_class",
+        "failure_class_raise",
+        "failure_message",
+        "failure_message_raise",
+        "provider_str",
+        "provider_str_raise",
+        "audit_str",
+        "note_setattr_success",
+        "note_setattr_raise",
+    ),
+)
+def test_audit_failure_handling_never_invokes_exception_protocols(
+    tmp_path,
+    monkeypatch,
+    failed_attempt,
+    failure_combination,
+    failed_kinds,
+    side_effect_kind,
+):
+    if side_effect_kind in {
+        "failure_class",
+        "failure_class_raise",
+        "failure_message",
+        "failure_message_raise",
+        "provider_str",
+        "provider_str_raise",
+    }:
+        raw_provider_error = _SlotMutatingProviderError(side_effect_kind)
+    elif side_effect_kind.startswith("note_setattr_"):
+        raw_provider_error = _SlotMutatingNotesProviderError(
+            side_effect_kind.removeprefix("note_setattr_")
+        )
+    else:
+        raw_provider_error = RuntimeError("private provider details")
+    provider_error, origin_traceback = _error_with_origin(raw_provider_error)
+    original_cause = LookupError("original provider cause")
+    original_context = OSError("original provider context")
+    _set_exception_slot(provider_error, "__cause__", original_cause)
+    _set_exception_slot(provider_error, "__context__", original_context)
+    _set_exception_slot(provider_error, "__suppress_context__", True)
+    original_visibility = (
+        BaseException.__getattribute__(provider_error, "__cause__"),
+        BaseException.__getattribute__(provider_error, "__context__"),
+        BaseException.__getattribute__(provider_error, "__suppress_context__"),
+    )
+    workflow, run, registry, trace_errors, active_exceptions = (
+        _provider_failure_workflow(
+            tmp_path,
+            monkeypatch,
+            provider_error=provider_error,
+            failed_attempt=failed_attempt,
+            failed_kinds=failed_kinds,
+            run_id=(
+                f"protocol-free-{side_effect_kind}-{failure_combination}-"
+                f"{failed_attempt}"
+            ),
+        )
+    )
+    if side_effect_kind == "audit_str":
+        for kind in tuple(trace_errors):
+            trace_errors[kind] = _SlotMutatingAuditTraceError(provider_error)
+
+    with bind_run_context(run), pytest.raises(BaseException) as caught:
+        workflow.run("question", "2025-05-01", registry=registry)
+
+    assert caught.value is provider_error
+    _assert_provider_diagnostics(
+        provider_error,
+        cause=original_cause,
+        context=original_context,
+        suppress_context=True,
+    )
+    assert (
+        BaseException.__getattribute__(provider_error, "__cause__"),
+        BaseException.__getattribute__(provider_error, "__context__"),
+        BaseException.__getattribute__(provider_error, "__suppress_context__"),
+    ) == original_visibility
+    assert _protocol_side_effect_count(provider_error) == 0
+    for trace_error in trace_errors.values():
+        assert _protocol_side_effect_count(trace_error) == 0
+    assert active_exceptions == {kind: None for kind in failed_kinds}
+    assert _traceback_contains(
+        _get_exception_slot(provider_error, "__traceback__"),
+        origin_traceback,
+    )
+
+    expected_notes = []
+    if "writing_failed" in failed_kinds:
+        expected_notes.append("writing_attempt_finished trace write failed")
+    if "terminal" in failed_kinds:
+        expected_notes.append("research_workflow_completed trace write failed")
+    assert _exact_exception_dict(provider_error).get("__notes__", []) == (
+        expected_notes
+    )
+
+    rows, incomplete = read_trace_lines(run.recorder.trajectory_path)
+    assert incomplete is False
+    failed_payloads = [
+        row["payload"]
+        for row in rows
+        if (
+            row["event_type"] == "writing_attempt_finished"
+            and row["payload"].get("status") == "failed"
+        )
+    ]
+    terminal_payloads = [
+        row["payload"]
+        for row in rows
+        if (
+            row["event_type"] == "research_workflow_completed"
+            and row["payload"].get("terminal_reason") == "failed"
+        )
+    ]
+    for payload in [*failed_payloads, *terminal_payloads]:
+        assert payload["failure_class"] == "ProviderError"
+        assert payload["failure_message"] == "provider stage failed"
+
+
+@pytest.mark.parametrize(
+    "notes_kind",
+    ("exact_list", "list_subclass", "tuple", "hostile_object"),
+)
+def test_audit_note_preserves_existing_or_malformed_exact_dict_value(
+    tmp_path,
+    monkeypatch,
+    notes_kind,
+):
+    provider_error, origin_traceback = _error_with_origin(
+        _MaskedExceptionDictProviderError("writer offline")
+    )
+    original_notes = {
+        "exact_list": ["existing one", "existing two"],
+        "list_subclass": _NotesListSubclass(["existing one"]),
+        "tuple": ("existing one",),
+        "hostile_object": object(),
+    }[notes_kind]
+    original_list_contents = (
+        list(original_notes)
+        if isinstance(original_notes, list)
+        else None
+    )
+    _exact_exception_dict(provider_error)["__notes__"] = original_notes
+    workflow, run, registry, _, _ = _provider_failure_workflow(
+        tmp_path,
+        monkeypatch,
+        provider_error=provider_error,
+        failed_attempt=1,
+        failed_kinds={"writing_failed"},
+        run_id=f"existing-notes-{notes_kind}",
+    )
+
+    with bind_run_context(run), pytest.raises(BaseException) as caught:
+        workflow.run("question", "2025-05-01", registry=registry)
+
+    assert caught.value is provider_error
+    assert _traceback_contains(
+        _get_exception_slot(provider_error, "__traceback__"),
+        origin_traceback,
+    )
+    stored_notes = _exact_exception_dict(provider_error)["__notes__"]
+    if notes_kind == "exact_list":
+        assert type(stored_notes) is list
+        assert stored_notes is not original_notes
+        assert stored_notes == [
+            "existing one",
+            "existing two",
+            "writing_attempt_finished trace write failed",
+        ]
+        assert original_notes == original_list_contents
+    else:
+        assert stored_notes is original_notes
+        if original_list_contents is not None:
+            assert list(stored_notes) == original_list_contents
+    with pytest.raises(_HostileProtocolTrap):
+        BaseException.__getattribute__(provider_error, "__dict__")
 
 
 @pytest.mark.parametrize("mask_mode", ("return_none", "raise"))
@@ -3270,6 +3604,8 @@ def test_hostile_provider_protocols_cannot_replace_primary_error(
         assert len(payload["failure_message"]) <= 512
         assert "private" not in payload["failure_message"]
         assert "\n" not in payload["failure_message"]
+        assert payload["failure_class"] == "ProviderError"
+        assert payload["failure_message"] == "provider stage failed"
 
 
 @pytest.mark.parametrize("failed_attempt", (1, 2))
@@ -3281,7 +3617,7 @@ def test_hostile_provider_protocols_cannot_replace_primary_error(
         ("terminal_only", {"terminal"}),
     ),
 )
-def test_failed_nonvirtual_add_note_does_not_replace_provider(
+def test_exact_dict_note_bypasses_hostile_note_setattr(
     tmp_path,
     monkeypatch,
     failed_attempt,
@@ -3317,8 +3653,14 @@ def test_failed_nonvirtual_add_note_does_not_replace_provider(
         _get_exception_slot(provider_error, "__traceback__"),
         origin_traceback,
     )
-    assert _audit_notes(provider_error, "writing_attempt_finished") == []
-    assert _audit_notes(provider_error, "research_workflow_completed") == []
+    expected_notes = []
+    if "writing_failed" in failed_kinds:
+        expected_notes.append("writing_attempt_finished trace write failed")
+    if "terminal" in failed_kinds:
+        expected_notes.append("research_workflow_completed trace write failed")
+    assert _exact_exception_dict(provider_error).get("__notes__", []) == (
+        expected_notes
+    )
     for trace_error in trace_errors.values():
         assert provider_error not in _assert_acyclic_exception_graph(trace_error)
 
@@ -3521,7 +3863,8 @@ def test_invalid_round_type_records_serializable_terminal_failure(tmp_path):
     )
     assert finished["payload"]["reported_rounds"] == "['three']"
     assert terminal["payload"]["terminal_reason"] == "failed"
-    assert terminal["payload"]["failure_class"] == "ResearchBudgetExceeded"
+    assert terminal["payload"]["failure_class"] == "ProviderError"
+    assert terminal["payload"]["failure_message"] == "provider stage failed"
     json.dumps(finished["payload"])
     json.dumps(terminal["payload"])
 
@@ -3581,8 +3924,8 @@ def test_failed_executor_consumes_reported_rounds_and_records_terminal(tmp_path)
     assert finished["payload"]["used_rounds"] == 2
     assert terminal["payload"]["research_rounds_used"] == 2
     assert terminal["payload"]["remaining_rounds"] == 8
-    assert terminal["payload"]["failure_class"] == "ProviderUnavailable"
-    assert terminal["payload"]["failure_message"] == "upstream timed out"
+    assert terminal["payload"]["failure_class"] == "ProviderError"
+    assert terminal["payload"]["failure_message"] == "provider stage failed"
 
 
 def test_model_error_is_preserved_and_records_workflow_terminal(tmp_path):
@@ -3625,8 +3968,8 @@ def test_model_error_is_preserved_and_records_workflow_terminal(tmp_path):
     )
     assert terminal["agent_id"] == "research-agent"
     assert terminal["payload"] == {
-        "failure_class": "RuntimeError",
-        "failure_message": "planner offline",
+        "failure_class": "ProviderError",
+        "failure_message": "provider stage failed",
         "final_validation_errors": [],
         "rank": None,
         "remaining_gaps": [],

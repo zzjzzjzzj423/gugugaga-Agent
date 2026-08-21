@@ -307,3 +307,40 @@ The resulting research boundary is:
 - Affected regression suite (`agent_loop_source`, `benchmark_worker`, `context_recovery`, `research_workflow`, and `trace`): `336 passed`.
 - Full suite: `651 passed, 1 deselected`; the sole deselection was the approved linked-worktree source-map baseline test.
 - Final compile, baseline-range diff, commit, and clean-status evidence is included in the handoff.
+
+## Exception Fix Round 8: make audit notes protocol-free
+
+### Authorization, baseline, and root cause
+
+- The user explicitly authorized this exception round and the protocol-free audit invariant.
+- Verified exact clean baseline `5cbb13f27953009fb09ac267bc0726bc3bab14d6` before edits.
+- Failure payload construction still called provider `failure_class`, `failure_message`, metaclass name lookup, and string conversion. Each protocol could mutate provider diagnostics before returning or raising.
+- Note construction still called the audit `TraceWriteError` type/name/string protocols, then used `BaseException.add_note()`, which invokes provider `__setattr__` when initializing notes. The Round 7 note-only design therefore still allowed both exceptions to mutate cause/context/suppress slots indirectly.
+- Production scope remained only `simple_cc/research_workflow.py`; the accepted embedded-scheme scanner limitation was not touched.
+
+### Protocol-free boundary
+
+- Failed writing and terminal audit payloads now use only the code-owned bounded constants `ProviderError` and `provider stage failed`. The audit path does not read provider metadata, class, args, or string representation.
+- Audit record helpers return only a boolean failure flag. The caught audit `TraceWriteError` object is not bound, formatted, type-inspected, or passed to the note layer.
+- Event notes are selected from a code-owned two-entry mapping and contain only `<event> trace write failed`. They are single-line and well below the existing bound.
+- Note storage uses the exact `BaseException.__dict__['__dict__']` getset descriptor. It proceeds only when the returned instance dictionary has exact type `dict`; a missing `__notes__` gets a new exact list, while an existing exact list is copied into a new exact list with its order/content preserved before the note is added.
+- Existing list subclasses, tuples, hostile objects, malformed dictionaries, or any descriptor/dictionary failure are left unchanged and simply lose the new note. The workflow never calls `BaseException.add_note`, provider `__setattr__`, a virtual `__dict__`, or list-subclass append behavior.
+- Exact traceback capture/restore remains the sole special-slot operation. Cause, context, and suppress-context are neither read nor written.
+- Production changed by `+42/-112` lines relative to the Round 8 baseline, a net deletion of 70 lines.
+
+### TDD and regression evidence
+
+- The valid RED produced `92 failed, 2 passed`. Ninety failures covered provider metadata/string protocols, audit string protocols, notes assignment, code-owned payload/note text, and exact-list copy semantics; tuple and hostile-object fail-closed controls already passed.
+- Attempt 1 and attempt 2 are covered across failed-only, persistent, and terminal-only audit failures. Provider protocol properties/string methods cover both mutate-then-return and mutate-then-raise behavior; audit strings retain a provider reference and mutate on conversion; notes `__setattr__` mutates before either succeeding or raising.
+- GREEN for the initial protocol-focused matrix: `94 passed, 222 deselected`.
+- Final focused matrix: `179 passed, 138 deselected`, including the earlier non-traceback slot/graph spy, masked/hostile provider descriptors, direct trace failures, real-recorder translation, note storage variants, and recorder interrupts.
+- All protocol side-effect counters remain zero. Provider exact diagnostic identities, virtual visibility, exception identity, and original traceback tail are preserved.
+- Existing exact notes retain order/content in a new exact list. List subclasses and malformed/hostile values retain object identity and content without mutation. A hostile virtual provider `__dict__` is never invoked.
+- Direct provider `TraceWriteError`, successful writing followed by completion-trace failure, successful terminal trace failure, real `TraceRecorder` `OSError`, `KeyboardInterrupt`, and `SystemExit` retain exact propagation behavior. Ordinary success/repair/gate order remains covered by the complete workflow suite.
+
+### Verification
+
+- Complete workflow file: `317 passed`.
+- Affected regression suite (`agent_loop_source`, `benchmark_worker`, `context_recovery`, `research_workflow`, and `trace`): `395 passed`.
+- Full suite: `710 passed, 1 deselected`; the sole deselection was the approved linked-worktree source-map baseline test.
+- Final compile, baseline-range diff, commit, and clean-status evidence is included in the handoff.
