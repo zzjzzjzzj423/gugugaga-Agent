@@ -5,16 +5,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "simple-cc"
 version = "0.1.0"
-description = "A compact financial-research agent harness using SiliconFlow"
+description = "A compact S01-S17 coding-agent harness using SiliconFlow"
 requires-python = ">=3.11"
-dependencies = [
-    "openai>=1.0",
-    "python-dotenv>=1.0",
-    "pyyaml>=6.0",
-    "ddgs>=9.0",
-    "trafilatura>=2.0",
-    "pdfplumber>=0.11.10",
-]
+dependencies = ["openai>=1.0", "python-dotenv>=1.0", "pyyaml>=6.0"]
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
@@ -22,8 +15,3 @@ test = ["pytest>=8"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-p no:cacheprovider"
-
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["simple_cc*", "eval*"]
-exclude = ["tests*"]

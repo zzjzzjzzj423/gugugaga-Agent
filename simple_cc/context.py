@@ -4,30 +4,13 @@ import json
 import re
 import time
 import uuid
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 from . import config
 from .subagents import extract_text
-from .memory import MemoryStore
-from .telemetry import model_call_scope
+
 
 client = None
-
-
-@dataclass(frozen=True)
-class CompactionReport:
-    method: str
-    original_message_count: int
-    retained_message_count: int
-    original_chars: int
-    retained_chars: int
-    transcript_path: str
-
-
-class LocalContextLimitExceeded(RuntimeError):
-    """The isolated local compactor could not produce a provider-safe context."""
 
 
 class SkillStore:
@@ -55,6 +38,34 @@ class SkillStore:
         item = self._skills.get(name)
         return item[1].read_text(encoding="utf-8") if item else f"Error: unknown skill '{name}'"
 
+
+class MemoryStore:
+    def __init__(self, directory: Path):
+        self.directory = Path(directory)
+        self.directory.mkdir(parents=True, exist_ok=True)
+
+    def remember(self, title: str, content: str) -> str:
+        safe = re.sub(r"[^A-Za-z0-9_-]+", "-", title).strip("-") or uuid.uuid4().hex[:8]
+        path = self.directory / f"{safe}.md"
+        path.write_text(f"# {title}\n\n{content}\n", encoding="utf-8")
+        return f"Remembered {title}"
+
+    def search(self, query: str, limit: int = 5) -> str:
+        terms = query.lower().split()
+        hits = []
+        for path in self.directory.glob("*.md"):
+            text = path.read_text(encoding="utf-8")
+            score = sum(term in text.lower() for term in terms)
+            if score:
+                hits.append((score, text))
+        return "\n\n".join(text for _, text in sorted(hits, reverse=True)[:limit]) or "No matching memories."
+
+    def index_text(self, limit: int = 20, max_chars: int = 4_000) -> str:
+        entries = []
+        for path in sorted(self.directory.glob("*.md"))[:limit]:
+            body = path.read_text(encoding="utf-8").strip().replace("\n", " ")
+            entries.append(f"- {path.stem}: {body[:240]}")
+        return ("\n".join(entries)[:max_chars] if entries else "No memories.")
 
 
 class ContextManager:
@@ -174,86 +185,51 @@ def collect_tool_results(messages: list):
     return found
 
 
-def utf8_size(value: object) -> int:
-    """返回内容使用 UTF-8 编码后的真实字节数。"""
-    return len(str(value).encode("utf-8"))
-
-
 def persist_large_output(tool_use_id: str, output: str) -> str:
-    # PERSIST_THRESHOLD 现在按 UTF-8 字节数计算
-    if utf8_size(output) <= config.PERSIST_THRESHOLD:
+    if len(output) <= config.PERSIST_THRESHOLD:
         return output
-
     config.TOOL_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     path = config.TOOL_RESULTS_DIR / f"{tool_use_id}.txt"
-
     if not path.exists():
-        path.write_text(output, encoding="utf-8")
-
+        path.write_text(output)
     return (
-        f"<persisted-output>\n"
-        f"Full output: {path}\n"
-        f"Preview:\n{output[:2000]}\n"
-        f"</persisted-output>"
+        f"<persisted-output>\nFull output: {path}\n"
+        f"Preview:\n{output[:2000]}\n</persisted-output>"
     )
 
 
-def tool_result_budget(
-    messages: list,
-    max_bytes: int = 200_000,
-) -> list:
+def tool_result_budget(messages: list, max_bytes: int = 200_000) -> list:
     if not messages:
         return messages
-
     last = messages[-1]
     content = last.get("content")
-
     if last.get("role") != "user" or not isinstance(content, list):
         return messages
-
     blocks = [
-        (index, block)
-        for index, block in enumerate(content)
-        if isinstance(block, dict)
-        and block.get("type") == "tool_result"
+        (i, block)
+        for i, block in enumerate(content)
+        if isinstance(block, dict) and block.get("type") == "tool_result"
     ]
-
-    # 按 UTF-8 真实字节数统计
-    total_bytes = sum(
-        utf8_size(block.get("content", ""))
-        for _, block in blocks
-    )
-
-    if total_bytes <= max_bytes:
+    total = sum(len(str(block.get("content", ""))) for _, block in blocks)
+    if total <= max_bytes:
         return messages
-
-    # 优先把占用字节数最大的工具结果写入文件
-    sorted_blocks = sorted(
+    for _, block in sorted(
         blocks,
-        key=lambda pair: utf8_size(
-            pair[1].get("content", "")
-        ),
+        key=lambda pair: len(str(pair[1].get("content", ""))),
         reverse=True,
-    )
-
-    for _, block in sorted_blocks:
-        if total_bytes <= max_bytes:
+    ):
+        if total <= max_bytes:
             break
-
-        output = str(block.get("content", ""))
-
+        text = str(block.get("content", ""))
         block["content"] = persist_large_output(
-            block.get("tool_use_id", "unknown"),
-            output,
+            block.get("tool_use_id", "unknown"), text
         )
-
-        # 替换成路径和预览后，重新计算上下文占用
-        total_bytes = sum(
-            utf8_size(candidate.get("content", ""))
+        total = sum(
+            len(str(candidate.get("content", "")))
             for _, candidate in blocks
         )
-
     return messages
+
 
 def snip_compact(messages: list, max_messages: int = 50) -> list:
     if len(messages) <= max_messages:
@@ -305,129 +281,31 @@ def write_transcript(messages: list) -> Path:
 def summarize_history(messages: list) -> str:
     conversation = json.dumps(messages, default=str)[:80000]
     prompt = (
-        "Summarize this financial-research conversation so work can continue. "
-        "Preserve the current question, key findings, source URLs, remaining "
-        "research, uncertainties, and user constraints.\n\n"
+        "Summarize this coding-agent conversation so work can continue. "
+        "Preserve current goal, key findings, changed files, remaining work, "
+        "and user constraints.\n\n"
         + conversation
     )
     if client is None:
         raise RuntimeError("Context provider is not configured")
-    with model_call_scope("context_compaction"):
-        response = client.create(
-            model=config.MODEL,
-            system="",
-            messages=[{"role": "user", "content": prompt}],
-            tools=[],
-            max_tokens=2000,
-        )
+    response = client.create(
+        model=config.MODEL,
+        system="",
+        messages=[{"role": "user", "content": prompt}],
+        tools=[],
+        max_tokens=2000,
+    )
     return extract_text(response.content) or "(empty summary)"
 
 
-def compact_history(
-    messages: list,
-    *,
-    on_compaction: Callable[[CompactionReport], None] | None = None,
-    method: str = "manual",
-    allow_model_summary: bool = True,
-) -> list:
-    if not allow_model_summary:
-        return _local_compact_history(
-            messages,
-            on_compaction=on_compaction,
-            method=method,
-        )
-    original_count = len(messages)
-    original_chars = estimate_size(messages)
+def compact_history(messages: list) -> list:
     transcript = write_transcript(messages)
     print(f"  \033[36m[compact] transcript saved: {transcript}\033[0m")
     summary = summarize_history(messages)
-    retained = [{"role": "user", "content": f"[Compacted]\n\n{summary}"}]
-    if on_compaction is not None:
-        on_compaction(
-            CompactionReport(
-                method,
-                original_count,
-                len(retained),
-                original_chars,
-                estimate_size(retained),
-                str(transcript),
-            )
-        )
-    return retained
+    return [{"role": "user", "content": f"[Compacted]\n\n{summary}"}]
 
 
-def _local_compact_history(
-    messages: list,
-    *,
-    on_compaction: Callable[[CompactionReport], None] | None,
-    method: str,
-) -> list:
-    original_count = len(messages)
-    original_chars = estimate_size(messages)
-    transcript = write_transcript(messages)
-    print(f"  \033[36m[local compact] transcript saved: {transcript}\033[0m")
-    tail_start = max(0, len(messages) - 5)
-    if (
-        tail_start > 0
-        and tail_start < len(messages)
-        and is_tool_result_message(messages[tail_start])
-        and message_has_tool_use(messages[tail_start - 1])
-    ):
-        tail_start -= 1
-    tail = list(messages[tail_start:])
-    marker = {
-        "role": "user",
-        "content": (
-            "[Locally compacted]\n\n"
-            "Earlier messages were archived without a model-generated summary."
-        ),
-    }
-    retained = [marker, *tail]
-    while len(tail) > 1 and estimate_size(retained) > config.CONTEXT_LIMIT:
-        remove_count = 1
-        if message_has_tool_use(tail[0]):
-            while (
-                remove_count < len(tail)
-                and is_tool_result_message(tail[remove_count])
-            ):
-                remove_count += 1
-        if remove_count >= len(tail):
-            break
-        del tail[:remove_count]
-        retained = [marker, *tail]
-    retained_chars = estimate_size(retained)
-    if retained_chars > config.CONTEXT_LIMIT:
-        raise LocalContextLimitExceeded(
-            "isolated context remains over the local compaction limit"
-        )
-    if on_compaction is not None:
-        on_compaction(
-            CompactionReport(
-                method,
-                original_count,
-                len(retained),
-                original_chars,
-                retained_chars,
-                str(transcript),
-            )
-        )
-    return retained
-
-
-def reactive_compact(
-    messages: list,
-    *,
-    on_compaction: Callable[[CompactionReport], None] | None = None,
-    allow_model_summary: bool = True,
-) -> list:
-    if not allow_model_summary:
-        return _local_compact_history(
-            messages,
-            on_compaction=on_compaction,
-            method="reactive",
-        )
-    original_count = len(messages)
-    original_chars = estimate_size(messages)
+def reactive_compact(messages: list) -> list:
     transcript = write_transcript(messages)
     print(
         f"  \033[31m[reactive compact] transcript saved: {transcript}\033[0m"
@@ -446,41 +324,19 @@ def reactive_compact(
         summary = (
             "Earlier conversation was trimmed after a prompt-too-long error."
         )
-    retained = [
+    return [
         {"role": "user", "content": f"[Reactive compact]\n\n{summary}"},
         *messages[tail_start:],
     ]
-    if on_compaction is not None:
-        on_compaction(
-            CompactionReport(
-                "reactive",
-                original_count,
-                len(retained),
-                original_chars,
-                estimate_size(retained),
-                str(transcript),
-            )
-        )
-    return retained
 
 
-def prepare_context(
-    messages: list,
-    *,
-    on_compaction: Callable[[CompactionReport], None] | None = None,
-    allow_model_summary: bool = True,
-) -> list:
+def prepare_context(messages: list) -> list:
     """Run every model turn through S20's layered context budget."""
     messages[:] = tool_result_budget(messages)
     messages[:] = snip_compact(messages)
     messages[:] = micro_compact(messages)
     if estimate_size(messages) > config.CONTEXT_LIMIT:
-        messages[:] = compact_history(
-            messages,
-            on_compaction=on_compaction,
-            method="proactive",
-            allow_model_summary=allow_model_summary,
-        )
+        messages[:] = compact_history(messages)
     return messages
 
 
@@ -514,9 +370,7 @@ def update_context(context: dict, messages: list) -> dict:
 
     memories = ""
     if config.MEMORY_INDEX.exists():
-        memories = config.MEMORY_INDEX.read_text(encoding="utf-8")[
-            : config.MEMORY_INDEX_MAX_CHARS
-        ]
+        memories = config.MEMORY_INDEX.read_text()[:2000]
     return {
         "memories": memories,
         "active_teammates": list(active_teammates.keys()),

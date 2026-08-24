@@ -24,12 +24,9 @@ from .teams import (
     run_spawn_teammate,
 )
 from .workspace import run_bash, run_edit, run_glob, run_read, run_write
-from .pdf_research import pdf_fetch
-from .web_research import web_fetch, web_search
 
 
-def call_tool_handler(handler, args: dict, name: str, *, capture=None) -> str:
-    del capture
+def call_tool_handler(handler, args: dict, name: str) -> str:
     if not handler:
         return f"Unknown: {name}"
     try:
@@ -101,71 +98,6 @@ TOOL_DEFINITIONS: list[dict] = [
             "type": "object",
             "properties": {"pattern": {"type": "string"}},
             "required": ["pattern"],
-        },
-    },
-    {
-        "name": "web_search",
-        "description": (
-            "Search the public web. When a cutoff date is supplied, pass it "
-            "through and verify candidate pages with web_fetch before citing."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"},
-                "max_results": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 10,
-                },
-                "cutoff": {
-                    "type": "string",
-                    "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
-                },
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "web_fetch",
-        "description": (
-            "Fetch and extract one public web page, checking its publication "
-            "date against an optional cutoff."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "url": {"type": "string"},
-                "cutoff": {
-                    "type": "string",
-                    "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
-                },
-            },
-            "required": ["url"],
-        },
-    },
-    {
-        "name": "pdf_fetch",
-        "description": (
-            "Fetch a public PDF and extract a bounded page range with page "
-            "numbers and table text. Use this instead of web_fetch for PDFs."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "url": {"type": "string"},
-                "start_page": {"type": "integer", "minimum": 1},
-                "page_count": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 20,
-                },
-                "cutoff": {
-                    "type": "string",
-                    "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
-                },
-            },
-            "required": ["url"],
         },
     },
     {
@@ -276,11 +208,9 @@ TOOL_DEFINITIONS: list[dict] = [
     {
         "name": "schedule_cron",
         "description": (
-            "Schedule a future agent run. You must use this tool when the user "
-            "asks to execute work after a delay or at a future time; do not "
-            "perform the requested work immediately. cron uses five fields: "
-            "minute hour day-of-month month day-of-week. Compute relative times "
-            "from the current time. For one-shot work set recurring=false."
+            "Schedule a cron job. cron is 5-field: min hour dom month dow. "
+            "For one-shot reminders, compute the target minute and set "
+            "recurring=false."
         ),
         "input_schema": {
             "type": "object",
@@ -387,9 +317,6 @@ TOOL_HANDLERS: dict[str, Callable] = {
     "write_file": run_write,
     "edit_file": run_edit,
     "glob": run_glob,
-    "web_search": web_search,
-    "web_fetch": web_fetch,
-    "pdf_fetch": pdf_fetch,
     "todo_write": run_todo_write,
     "task": spawn_subagent,
     "load_skill": load_skill,

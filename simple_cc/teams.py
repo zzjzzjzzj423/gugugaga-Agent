@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-import contextlib
-import contextvars
 import random
 import re
 import threading
@@ -15,12 +13,10 @@ from typing import Any, Callable
 from . import config
 from .hooks import trigger_hooks
 from .models import ToolCall
-from .permissions import PermissionDecision, PermissionPolicy
+from .permissions import PermissionPolicy
 from .planning import Task, TaskStore
 from .tasks import can_start, claim_task, complete_task, list_tasks
 from .workspace import run_bash, run_read, run_write
-from .telemetry import model_call_scope
-from .trace import bind_run_context, current_run_context
 
 
 # S15-S17 source-compatible team communication. Paths are resolved from
@@ -96,22 +92,12 @@ class ProtocolState:
     target: str
     status: str
     payload: str
-
-    tool_call_id: str = ""
-    tool_name: str = ""
-    arguments: dict[str, Any] = field(default_factory=dict)
-    feedback: str = ""
-
     created_at: float = field(default_factory=time.time)
 
 
 pending_requests: dict[str, ProtocolState] = {}
 _protocol_lock = threading.RLock()
-PERMISSION_POLL_SECONDS = 0.5
-PERMISSION_TIMEOUT_SECONDS = 60.0
 
-_lead_inbox_lock = threading.RLock()
-_lead_inbox_buffer: list[dict] = []
 
 def _new_request_id_locked() -> str:
     while True:
@@ -130,11 +116,9 @@ def _create_protocol_request(
     sender: str,
     target: str,
     payload: str,
-    *,
-    tool_call_id: str = "",
-    tool_name: str = "",
-    arguments: dict[str, Any] | None = None,
 ) -> ProtocolState:
+    # ID selection and reservation are one critical section. Otherwise two
+    # concurrent creators can both observe the same random ID as available.
     with _protocol_lock:
         request_id = _new_request_id_locked()
         state = ProtocolState(
@@ -144,81 +128,38 @@ def _create_protocol_request(
             target=target,
             status="pending",
             payload=payload,
-            tool_call_id=tool_call_id,
-            tool_name=tool_name,
-            arguments=dict(arguments or {}),
         )
         pending_requests[request_id] = state
         return state
 
 
-def match_response(
-    response_type: str,
-    request_id: str,
-    approve: bool,
-):
-    expected_types = {
-        "shutdown": "shutdown_response",
-        "plan_approval": "plan_approval_response",
-        "permission": "permission_response",
-    }
-
+def match_response(response_type: str, request_id: str, approve: bool):
     with _protocol_lock:
         state = pending_requests.get(request_id)
-        if state is None:
+        if not state:
             return
-
-        expected = expected_types.get(state.type)
-        if expected != response_type:
+        if state.type == "shutdown" and response_type != "shutdown_response":
             return
-
-        if state.status != "pending":
+        if (
+            state.type == "plan_approval"
+            and response_type != "plan_approval_response"
+        ):
             return
-
         state.status = "approved" if approve else "rejected"
 
 
-def _route_protocol_messages(messages: list[dict]) -> None:
-    for message in messages:
-        metadata = message.get("metadata", {})
-        request_id = metadata.get("request_id", "")
-        message_type = message.get("type", "")
-
-        if request_id and message_type.endswith("_response"):
-            match_response(
-                message_type,
-                request_id,
-                metadata.get("approve", False),
-            )
-
-
-def poll_lead_inbox(
-    route_protocol: bool = True,
-) -> list[dict]:
-    """读取新消息，但保留在缓冲区等待主循环消费。"""
-    messages = BUS.read_inbox("lead")
-
+def consume_lead_inbox(route_protocol: bool = True) -> list[dict]:
+    msgs = BUS.read_inbox("lead")
     if route_protocol:
-        _route_protocol_messages(messages)
-
-    if messages:
-        with _lead_inbox_lock:
-            _lead_inbox_buffer.extend(messages)
-
-    return messages
-
-
-def consume_lead_inbox(
-    route_protocol: bool = True,
-) -> list[dict]:
-    """取得所有已轮询和刚到达的 Lead 消息。"""
-    poll_lead_inbox(route_protocol=route_protocol)
-
-    with _lead_inbox_lock:
-        messages = list(_lead_inbox_buffer)
-        _lead_inbox_buffer.clear()
-
-    return messages
+        for msg in msgs:
+            meta = msg.get("metadata", {})
+            request_id = meta.get("request_id", "")
+            msg_type = msg.get("type", "")
+            if request_id and msg_type.endswith("_response"):
+                match_response(
+                    msg_type, request_id, meta.get("approve", False)
+                )
+    return msgs
 
 
 IDLE_POLL_INTERVAL = 5
@@ -312,209 +253,21 @@ def set_team_provider(
         if provider is not None and not _teammate_threads:
             _teammate_stop_event.clear()
 
-def request_teammate_permission(
-    agent_name: str,
-    call: ToolCall,
-) -> ProtocolState:
-    payload_data = {
-        "tool": call.name,
-        "arguments": call.arguments,
-        "tool_call_id": call.id,
-    }
-    payload = json.dumps(payload_data, ensure_ascii=False)
 
-    state = _create_protocol_request(
-        "permission",
-        agent_name,
-        "lead",
-        payload,
-        tool_call_id=call.id,
-        tool_name=call.name,
-        arguments=call.arguments,
-    )
-
-    BUS.send(
-        agent_name,
-        "lead",
-        payload,
-        "permission_request",
-        {
-            "request_id": state.request_id,
-            "tool_call_id": call.id,
-        },
-    )
-
-    return state
-
-
-def await_permission(
-    request_id: str,
-    *,
-    timeout: float = PERMISSION_TIMEOUT_SECONDS,
-    stop_event: threading.Event | None = None,
-) -> ProtocolState:
-    deadline = time.monotonic() + max(0.0, timeout)
-
-    while True:
-        with _protocol_lock:
-            state = pending_requests.get(request_id)
-            if state is None:
-                raise RuntimeError(
-                    f"permission request disappeared: {request_id}"
-                )
-
-            if state.status in {
-                "approved",
-                "rejected",
-                "expired",
-            }:
-                return state
-
-        if stop_event is not None and stop_event.is_set():
-            with _protocol_lock:
-                if state.status == "pending":
-                    state.status = "expired"
-                    state.feedback = "Teammate is shutting down."
-            return state
-
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            with _protocol_lock:
-                if state.status == "pending":
-                    state.status = "expired"
-                    state.feedback = "Approval timed out."
-            return state
-
-        wait_time = min(PERMISSION_POLL_SECONDS, remaining)
-
-        if stop_event is None:
-            time.sleep(wait_time)
-        else:
-            stop_event.wait(wait_time)
-
-
-def run_review_permission(
-    request_id: str,
-    approve: bool,
-    feedback: str = "",
-) -> str:
-    with _protocol_lock:
-        state = pending_requests.get(request_id)
-
-        if state is None:
-            return f"Error: request {request_id} not found"
-
-        if state.type != "permission":
-            return (
-                f"Error: request {request_id} is "
-                f"{state.type}, not permission"
-            )
-
-        if state.status != "pending":
-            return (
-                f"Error: request {request_id} "
-                f"is already {state.status}"
-            )
-
-        state.status = "approved" if approve else "rejected"
-        state.feedback = feedback
-        target = state.sender
-
-    BUS.send(
-        "lead",
-        target,
-        feedback or state.status,
-        "permission_response",
-        {
-            "request_id": request_id,
-            "approve": approve,
-            "tool_call_id": state.tool_call_id,
-        },
-    )
-
-    return (
-        f"Permission {state.status}: {request_id} "
-        f"({state.tool_name})"
-    )
-
-
-def run_list_permissions() -> str:
-    with _protocol_lock:
-        requests = [
-            state
-            for state in pending_requests.values()
-            if state.type == "permission"
-            and state.status == "pending"
-        ]
-
-    if not requests:
-        return "No pending permission requests."
-
-    return "\n".join(
-        f"  {state.request_id}: {state.sender} requests "
-        f"{state.tool_name} {json.dumps(state.arguments, ensure_ascii=False)}"
-        for state in requests
-    )
-
-def _dispatch_teammate_tool(
-    agent_name: str,
-    block,
-    handlers: dict[str, Callable],
-    *,
-    permission_timeout: float = PERMISSION_TIMEOUT_SECONDS,
-) -> str:
+def _dispatch_teammate_tool(block, handlers: dict[str, Callable]) -> str:
     from .tools import call_tool_handler
 
     blocked = trigger_hooks("PreToolUse", block)
     if blocked:
         return str(blocked)
-
-    call = ToolCall(
-        block.id,
-        block.name,
-        dict(block.input),
-    )
-    decision = _team_permissions.decide(call)
-
-    if decision is PermissionDecision.DENY:
+    call = ToolCall(block.id, block.name, block.input)
+    if not _team_permissions.approve(call, _team_approval_callback):
         return (
-            f"Permission denied for tool '{call.name}'. "
+            f"Permission denied for tool '{block.name}'. "
             "Choose a safer approach."
         )
-
-    if decision is PermissionDecision.ASK:
-        if _team_approval_callback is not None:
-            if not _team_approval_callback(call):
-                return (
-                    f"Permission denied for tool '{call.name}'. "
-                    "Choose a safer approach."
-                )
-        else:
-            request = request_teammate_permission(
-                agent_name,
-                call,
-            )
-            resolved = await_permission(
-                request.request_id,
-                timeout=permission_timeout,
-                stop_event=_teammate_stop_event,
-            )
-
-            if resolved.status != "approved":
-                detail = (
-                    f": {resolved.feedback}"
-                    if resolved.feedback
-                    else ""
-                )
-                return (
-                    f"Permission {resolved.status} for tool "
-                    f"'{call.name}'{detail}"
-                )
-
     output = call_tool_handler(
-        handlers.get(block.name),
-        block.input,
-        block.name,
+        handlers.get(block.name), block.input, block.name
     )
     trigger_hooks("PostToolUse", block, output)
     return str(output)
@@ -730,14 +483,13 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                                 }
                             )
                     try:
-                        with model_call_scope("teammate"):
-                            response = _team_provider.create(
-                                model=config.MODEL or None,
-                                system=system,
-                                messages=messages[-20:],
-                                tools=sub_tools,
-                                max_tokens=8000,
-                            )
+                        response = _team_provider.create(
+                            model=config.MODEL or None,
+                            system=system,
+                            messages=messages[-20:],
+                            tools=sub_tools,
+                            max_tokens=8000,
+                        )
                     except Exception:
                         break
                     if _teammate_stop_event.is_set():
@@ -758,11 +510,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                         if _teammate_stop_event.is_set():
                             should_shutdown = True
                             break
-                        output = _dispatch_teammate_tool(
-                            name,
-                            block,
-                            sub_handlers,
-                        )
+                        output = _dispatch_teammate_tool(block, sub_handlers)
                         if block.name == "submit_plan" and output.startswith(
                             "Plan submitted ("
                         ):
@@ -817,23 +565,8 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                 active_teammates.pop(name, None)
                 _teammate_threads.pop(name, None)
 
-    copied_context = contextvars.copy_context()
-    parent_run = current_run_context()
-
-    def run_in_copied_context():
-        scope = (
-            bind_run_context(parent_run.child(f"teammate:{name}"))
-            if parent_run is not None
-            else contextlib.nullcontext()
-        )
-        with scope:
-            run()
-
-    def run_with_context():
-        copied_context.run(run_in_copied_context)
-
     thread = threading.Thread(
-        target=run_with_context, name=f"teammate-{name}", daemon=True
+        target=run, name=f"teammate-{name}", daemon=True
     )
     with _teammate_lock:
         _teammate_threads[name] = thread
@@ -934,16 +667,6 @@ def run_send_message(to: str, content: str) -> str:
         _validate_agent_name(to)
     except ValueError as error:
         return f"Error: {error}"
-
-    with _teammate_lock:
-        active = to in active_teammates
-
-    if not active:
-        return (
-            f"Error: teammate '{to}' is not active. "
-            "Call spawn_teammate first."
-        )
-
     BUS.send("lead", to, content)
     return f"Sent to {to}"
 

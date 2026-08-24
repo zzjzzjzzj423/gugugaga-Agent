@@ -1,5 +1,3 @@
-import copy
-
 from simple_cc.models import ModelResponse
 from simple_cc.provider import ProviderResponse, TextBlock, ToolUseBlock
 
@@ -15,8 +13,8 @@ class ScriptedProvider:
     def create(self, messages, system, tools, max_tokens=8192, model=None):
         self.requests.append({
             "system": system,
-            "messages": copy.deepcopy(messages),
-            "tools": copy.deepcopy(tools),
+            "messages": [dict(message) for message in messages],
+            "tools": list(tools),
             "max_tokens": max_tokens,
             "model": model,
         })

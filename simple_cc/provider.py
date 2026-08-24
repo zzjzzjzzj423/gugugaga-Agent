@@ -15,15 +15,6 @@ class ContextLengthError(RuntimeError):
     pass
 
 
-class ProviderRequestError(RuntimeError):
-    def __init__(
-        self, message: str, *, attempts: int, status_code: int | None = None
-    ):
-        super().__init__(message)
-        self.attempts = attempts
-        self.status_code = status_code
-
-
 @dataclass(frozen=True)
 class TextBlock:
     text: str
@@ -39,21 +30,9 @@ class ToolUseBlock:
 
 
 @dataclass(frozen=True)
-class ProviderUsage:
-    prompt_tokens: int | None
-    completion_tokens: int | None
-    total_tokens: int | None
-
-
-@dataclass(frozen=True)
 class ProviderResponse:
     content: list[TextBlock | ToolUseBlock]
     stop_reason: str
-    usage: ProviderUsage = field(
-        default_factory=lambda: ProviderUsage(None, None, None)
-    )
-    request_id: str | None = None
-    attempts: int = 1
 
 
 def _value(item: Any, name: str, default: Any = None) -> Any:
@@ -219,19 +198,7 @@ class SiliconFlowProvider(ChatProvider):
                 if message.content:
                     content.append(TextBlock(text=message.content))
                 content.extend(_tool_use_block(call) for call in (message.tool_calls or []))
-                raw_usage = _value(response, "usage")
-                usage = ProviderUsage(
-                    _value(raw_usage, "prompt_tokens"),
-                    _value(raw_usage, "completion_tokens"),
-                    _value(raw_usage, "total_tokens"),
-                )
-                return ProviderResponse(
-                    content=content,
-                    stop_reason=_stop_reason(choice.finish_reason),
-                    usage=usage,
-                    request_id=_value(response, "id"),
-                    attempts=attempt + 1,
-                )
+                return ProviderResponse(content=content, stop_reason=_stop_reason(choice.finish_reason))
             except Exception as error:
                 if is_context_length_error(error):
                     raise ContextLengthError(str(error)) from error
@@ -243,8 +210,4 @@ class SiliconFlowProvider(ChatProvider):
                     break
                 time.sleep(min(2**attempt, 4))
         assert last_error is not None
-        raise ProviderRequestError(
-            str(last_error),
-            attempts=4,
-            status_code=_status_code(last_error),
-        ) from last_error
+        raise last_error

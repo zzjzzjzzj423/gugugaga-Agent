@@ -27,25 +27,6 @@ BASE_DELAY_MS = 500
 CONTEXT_LIMIT = 50000
 KEEP_RECENT_TOOL_RESULTS = 3
 PERSIST_THRESHOLD = 30000
-MEMORY_ENABLED = os.getenv("SIMPLE_CC_MEMORY_ENABLED", "1").strip().lower() not in {
-    "0", "false", "no", "off",
-}
-MEMORY_MAX_SELECTED = int(os.getenv("SIMPLE_CC_MEMORY_MAX_SELECTED", "5"))
-MEMORY_MAX_INJECTED_CHARS = int(
-    os.getenv("SIMPLE_CC_MEMORY_MAX_INJECTED_CHARS", "12000")
-)
-MEMORY_INDEX_MAX_CHARS = int(
-    os.getenv("SIMPLE_CC_MEMORY_INDEX_MAX_CHARS", "8000")
-)
-MEMORY_CONSOLIDATE_THRESHOLD = int(
-    os.getenv("SIMPLE_CC_MEMORY_CONSOLIDATE_THRESHOLD", "30")
-)
-MEMORY_CONSOLIDATE_TARGET = int(
-    os.getenv("SIMPLE_CC_MEMORY_CONSOLIDATE_TARGET", "24")
-)
-MEMORY_CONSOLIDATE_COOLDOWN_SECONDS = int(
-    os.getenv("SIMPLE_CC_MEMORY_CONSOLIDATE_COOLDOWN", "86400")
-)
 CONTINUATION_PROMPT = (
     "Continue from the previous response. Do not repeat completed work."
 )
@@ -88,15 +69,10 @@ class Settings:
 
     @classmethod
     def from_env(
-        cls,
-        workspace: Path | str,
-        model_override: str | None = None,
-        *,
-        create_dirs: bool = True,
+        cls, workspace: Path | str, model_override: str | None = None
     ) -> "Settings":
         workspace_path = Path(workspace).expanduser().resolve()
-        if create_dirs:
-            workspace_path.mkdir(parents=True, exist_ok=True)
+        workspace_path.mkdir(parents=True, exist_ok=True)
         api_key = os.getenv("SILICONFLOW_API_KEY", "").strip()
         model = (model_override or os.getenv("SILICONFLOW_MODEL", "")).strip()
         if not api_key:
@@ -112,10 +88,9 @@ class Settings:
             "outputs_dir": state / "outputs",
             "skills_dir": state / "skills",
         }
-        if create_dirs:
-            state.mkdir(parents=True, exist_ok=True)
-            for path in paths.values():
-                path.mkdir(parents=True, exist_ok=True)
+        state.mkdir(parents=True, exist_ok=True)
+        for path in paths.values():
+            path.mkdir(parents=True, exist_ok=True)
         return cls(
             workspace=workspace_path,
             state_dir=state,

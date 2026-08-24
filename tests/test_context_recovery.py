@@ -15,15 +15,7 @@ from simple_cc.context import (
 from simple_cc.prompts import PROMPT_SECTIONS
 from simple_cc.provider import ProviderResponse, TextBlock
 from simple_cc.recovery import RecoveryState, is_prompt_too_long_error, with_retry
-from simple_cc.memory import MemoryStore
-from simple_cc.telemetry import TracingProvider
 from simple_cc.tools import TOOL_DEFINITIONS, TOOL_HANDLERS
-from simple_cc.trace import (
-    RunContext,
-    TraceRecorder,
-    TraceWriteError,
-    bind_run_context,
-)
 
 
 @pytest.fixture
@@ -149,9 +141,9 @@ def test_summarize_history_calls_provider_with_anthropic_shaped_message(monkeypa
                 {
                     "role": "user",
                     "content": (
-                        "Summarize this financial-research conversation so work can continue. "
-                        "Preserve the current question, key findings, source URLs, remaining "
-                        "research, uncertainties, and user constraints.\n\n"
+                        "Summarize this coding-agent conversation so work can continue. "
+                        "Preserve current goal, key findings, changed files, remaining work, "
+                        "and user constraints.\n\n"
                         '[{"role": "user", "content": "fix the parser"}]'
                     ),
                 }
@@ -177,105 +169,6 @@ def test_with_retry_recovers_a_scripted_transient_rate_limit(monkeypatch):
 
     assert with_retry(operation, RecoveryState()) == "ok"
     assert outcomes == []
-
-
-def test_with_retry_never_classifies_trace_failure_as_transient(monkeypatch):
-    error = TraceWriteError("trace unavailable: 429 overloaded 529")
-    calls = 0
-    sleeps = []
-    monkeypatch.setattr(recovery_module, "retry_delay", lambda attempt: 0)
-    monkeypatch.setattr(
-        recovery_module.time,
-        "sleep",
-        lambda delay: sleeps.append(delay),
-    )
-
-    def operation():
-        nonlocal calls
-        calls += 1
-        raise error
-
-    with pytest.raises(TraceWriteError) as caught:
-        with_retry(operation, RecoveryState())
-
-    assert caught.value is error
-    assert str(caught.value) == "trace unavailable: 429 overloaded 529"
-    assert calls == 1
-    assert sleeps == []
-
-
-@pytest.mark.parametrize(
-    ("call_kind", "operation"),
-    (
-        ("memory_retrieval", "retrieve"),
-        ("memory_extraction", "extract"),
-        ("memory_consolidation", "consolidate"),
-    ),
-)
-def test_memory_model_trace_failures_escape_internal_fallbacks(
-    tmp_path,
-    monkeypatch,
-    call_kind,
-    operation,
-):
-    delegate = ScriptedSummaryProvider('["project-alpha.md"]')
-    recorder = TraceRecorder(
-        tmp_path / f"trace-{operation}",
-        run_id=f"memory-{operation}-run",
-    )
-    recorder.start_run(
-        task_id="research-task",
-        question="Remember project alpha",
-        cutoff=None,
-        metadata={"task_type": "research"},
-    )
-    original_record = recorder.record
-    trace_error = TraceWriteError(f"{call_kind} trace unavailable")
-
-    def fail_internal_memory_trace(event_type, payload, **kwargs):
-        if (
-            event_type == "llm_request_started"
-            and payload.get("call_kind") == call_kind
-        ):
-            raise trace_error
-        return original_record(event_type, payload, **kwargs)
-
-    monkeypatch.setattr(recorder, "record", fail_internal_memory_trace)
-    store = MemoryStore(
-        tmp_path / f"memory-{operation}",
-        provider=TracingProvider(delegate),
-        consolidate_threshold=1,
-        consolidate_cooldown_seconds=0,
-    )
-    assert store.upsert(
-        action="create",
-        name="project-alpha",
-        mem_type="project",
-        description="Project alpha requirements",
-        body="Use the verified research workflow.",
-    )
-    run = RunContext(
-        recorder,
-        f"memory-{operation}-run",
-        "research-task",
-        None,
-    )
-
-    with bind_run_context(run), pytest.raises(TraceWriteError) as caught:
-        if operation == "retrieve":
-            store.load_relevant([
-                {"role": "user", "content": "Research project alpha"}
-            ])
-        elif operation == "extract":
-            store.extract(
-                [{"role": "user", "content": "Remember project alpha"}],
-                "Acknowledged.",
-            )
-        else:
-            store.consolidate_if_needed()
-
-    assert caught.value is trace_error
-    assert delegate.requests == []
 
 
 def test_prompt_too_long_classification_allows_one_reactive_compaction(
@@ -327,21 +220,3 @@ def test_compact_tool_has_a_fixed_dispatch_placeholder_for_agent_loop_handling()
     assert TOOL_HANDLERS["compact"](focus="preserve test failures") == (
         "[Compaction requested.]"
     )
-def test_prepare_context_reports_proactive_compaction(tmp_path, monkeypatch):
-    from simple_cc import config, context
-
-    old_workspace = config.WORKDIR
-    config.configure_workspace(tmp_path)
-    monkeypatch.setattr(config, "CONTEXT_LIMIT", 10)
-    monkeypatch.setattr(context, "summarize_history", lambda messages: "summary")
-    reports = []
-    messages = [{"role": "user", "content": "x" * 100}]
-    try:
-        context.prepare_context(messages, on_compaction=reports.append)
-    finally:
-        config.configure_workspace(old_workspace)
-
-    assert reports[0].method == "proactive"
-    assert reports[0].original_message_count == 1
-    assert reports[0].retained_message_count == 1
-    assert reports[0].transcript_path.endswith(".jsonl")

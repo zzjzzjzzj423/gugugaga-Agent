@@ -30,31 +30,21 @@ TARGET_MODULES = (
     "simple_cc.__main__",
     "simple_cc.agent",
     "simple_cc.background",
-    "simple_cc.benchmark",
     "simple_cc.config",
     "simple_cc.context",
     "simple_cc.cron",
-    "simple_cc.eval_metrics",
-    "simple_cc.evidence",
     "simple_cc.hooks",
-    "simple_cc.memory",
     "simple_cc.models",
     "simple_cc.permissions",
-    "simple_cc.pdf_research",
     "simple_cc.planning",
     "simple_cc.prompts",
     "simple_cc.provider",
     "simple_cc.recovery",
-    "simple_cc.research_models",
-    "simple_cc.research_workflow",
     "simple_cc.skills",
     "simple_cc.subagents",
     "simple_cc.tasks",
     "simple_cc.teams",
-    "simple_cc.telemetry",
     "simple_cc.tools",
-    "simple_cc.trace",
-    "simple_cc.web_research",
     "simple_cc.workspace",
 )
 
@@ -109,8 +99,6 @@ RETAINED_TOOL_NAMES = (
     "request_plan",
     "review_plan",
 )
-
-RESEARCH_EXTENSION_TOOL_NAMES = ("web_search", "web_fetch", "pdf_fetch")
 
 FORBIDDEN_IMPLEMENTATION_TERMS = re.compile(
     r"worktree|mcpclient|connect_mcp|mcp__|connected_mcp", re.IGNORECASE
@@ -373,18 +361,10 @@ def test_source_map_row_audit_rejects_symbol_found_only_in_another_module():
         _validate_retained_mapping_rows(wrong_row, {"create_task"}, PROJECT_ROOT)
 
 
-def test_baseline_and_research_extension_tools_are_classified_and_bijective():
+def test_fixed_s01_s17_tool_definitions_and_handlers_are_a_bijection():
     definition_names = [definition["name"] for definition in BUILTIN_TOOLS]
 
-    retained_names = [
-        name for name in definition_names if name not in RESEARCH_EXTENSION_TOOL_NAMES
-    ]
-    extension_names = [
-        name for name in definition_names if name in RESEARCH_EXTENSION_TOOL_NAMES
-    ]
-
-    assert retained_names == list(RETAINED_TOOL_NAMES)
-    assert extension_names == list(RESEARCH_EXTENSION_TOOL_NAMES)
+    assert definition_names == list(RETAINED_TOOL_NAMES)
     assert len(definition_names) == len(set(definition_names))
     assert set(BUILTIN_HANDLERS) == set(definition_names)
     assert all(callable(BUILTIN_HANDLERS[name]) for name in definition_names)

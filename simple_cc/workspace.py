@@ -68,9 +68,7 @@ def run_read(
     path: str, limit: int | None = None, offset: int = 0, cwd: Path = None
 ) -> str:
     try:
-        lines = safe_path(path, cwd).read_text(
-            encoding="utf-8"
-        ).splitlines()
+        lines = safe_path(path, cwd).read_text().splitlines()
         offset = max(int(offset or 0), 0)
         limit = int(limit) if limit is not None else None
         lines = lines[offset:]
@@ -80,49 +78,25 @@ def run_read(
     except Exception as error:
         return f"Error: {error}"
 
-def run_write(
-    path: str,
-    content: str,
-    cwd: Path = None,
-) -> str:
+def run_write(path: str, content: str, cwd: Path = None) -> str:
     try:
         target = safe_path(path, cwd)
         target.parent.mkdir(parents=True, exist_ok=True)
-
-        target.write_text(
-            content,
-            encoding="utf-8",
-            newline="\n",
-        )
-
-        return (
-            f"Wrote {len(content.encode('utf-8'))} "
-            f"bytes to {path}"
-        )
+        target.write_text(content)
+        return f"Wrote {len(content)} bytes to {path}"
     except Exception as error:
         return f"Error: {error}"
 
 
 def run_edit(
-    path: str,
-    old_text: str,
-    new_text: str,
-    cwd: Path = None,
+    path: str, old_text: str, new_text: str, cwd: Path = None
 ) -> str:
     try:
         target = safe_path(path, cwd)
-
-        text = target.read_text(encoding="utf-8")
-
+        text = target.read_text()
         if old_text not in text:
             return f"Error: text not found in {path}"
-
-        target.write_text(
-            text.replace(old_text, new_text, 1),
-            encoding="utf-8",
-            newline="\n",
-        )
-
+        target.write_text(text.replace(old_text, new_text, 1))
         return f"Edited {path}"
     except Exception as error:
         return f"Error: {error}"
