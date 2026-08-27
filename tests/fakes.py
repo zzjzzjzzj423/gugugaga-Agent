@@ -1,5 +1,5 @@
-from simple_cc.models import ModelResponse
-from simple_cc.provider import ProviderResponse, TextBlock, ToolUseBlock
+from gugugaga.models import ModelResponse
+from gugugaga.provider import ProviderResponse, TextBlock, ToolUseBlock
 
 
 class ScriptedProvider:

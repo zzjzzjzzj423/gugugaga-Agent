@@ -11,12 +11,12 @@ import time
 
 import pytest
 
-from simple_cc import agent, config, context, cron, subagents, teams, tools
-from simple_cc import __main__ as cli
-from simple_cc.config import Settings
-from simple_cc.models import ToolCall
-from simple_cc.permissions import PermissionPolicy
-from simple_cc.provider import ProviderResponse, TextBlock, ToolUseBlock
+from gugugaga import agent, config, context, cron, subagents, teams, tools
+from gugugaga import __main__ as cli
+from gugugaga.config import Settings
+from gugugaga.models import ToolCall
+from gugugaga.permissions import PermissionPolicy
+from gugugaga.provider import ProviderResponse, TextBlock, ToolUseBlock
 
 
 ALL_DERIVED_PATHS = {
@@ -139,8 +139,8 @@ def test_importing_cli_does_not_load_cron_state_from_launch_directory(
             sys.executable,
             "-c",
             (
-                "import json; import simple_cc.__main__; "
-                "from simple_cc import cron; "
+                "import json; import gugugaga.__main__; "
+                "from gugugaga import cron; "
                 "print(json.dumps(sorted(cron.scheduled_jobs)))"
             ),
         ],

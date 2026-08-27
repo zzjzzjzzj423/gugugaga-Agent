@@ -1,12 +1,13 @@
-from simple_cc.agent import AgentRuntime
-from simple_cc.background import BackgroundManager, CronScheduler
-from simple_cc.context import ContextManager
-from simple_cc.hooks import HookEvent, HookManager
-from simple_cc.models import ModelResponse, ToolCall
-from simple_cc.permissions import PermissionPolicy
-from simple_cc.prompts import PromptAssembler
-from simple_cc.provider import ContextLengthError
-from simple_cc.tools import ToolRegistry, WorkspaceTools
+from gugugaga.agent import AgentRuntime
+from gugugaga import config
+from gugugaga.background import BackgroundManager, CronScheduler
+from gugugaga.context import ContextManager
+from gugugaga.hooks import HookEvent, HookManager
+from gugugaga.models import ModelResponse, ToolCall
+from gugugaga.permissions import PermissionPolicy
+from gugugaga.prompts import PromptAssembler
+from gugugaga.provider import ContextLengthError
+from gugugaga.tools import ToolRegistry, WorkspaceTools
 from tests.fakes import ScriptedProvider
 
 
@@ -18,11 +19,11 @@ def make_runtime(tmp_path, provider, approval=lambda _: True):
         registry=registry,
         hooks=HookManager(),
         permissions=PermissionPolicy(),
-        context=ContextManager(tmp_path / ".simple_cc/outputs", tmp_path / ".simple_cc/transcripts"),
+        context=ContextManager(tmp_path / ".gugugaga/outputs", tmp_path / ".gugugaga/transcripts"),
         prompts=PromptAssembler(),
         state_builder=lambda: {"workspace": str(tmp_path), "tools": "files"},
         background=BackgroundManager(),
-        cron=CronScheduler(tmp_path / ".simple_cc/cron.json"),
+        cron=CronScheduler(tmp_path / ".gugugaga/cron.json"),
         approval_callback=approval,
         max_rounds=5,
     )
@@ -98,20 +99,28 @@ def test_compact_tool_forces_transcript_archive(tmp_path):
     ])
     runtime = make_runtime(tmp_path, provider)
     runtime.registry.register("compact", "Compact", {"type": "object"}, lambda: "requested")
-    runtime.messages.extend({"role": "user", "content": str(i)} for i in range(5))
+    runtime.messages.extend(
+        {"role": "user", "content": f"{i}-" + "x" * 1_000}
+        for i in range(5)
+    )
     assert runtime.run_turn("compact now") == "Compacted"
-    assert list((tmp_path / ".simple_cc/transcripts").glob("*.json"))
-    assert "Manual summary with goals and decisions" in runtime.messages[0]["content"]
+    assert list((tmp_path / ".gugugaga/transcripts").glob("*.jsonl"))
+    assert "Manual summary with goals and decisions" in (
+        runtime.context_coordinator.project(runtime.messages)[0]["content"]
+    )
 
 
-def test_automatic_compaction_uses_provider_summary(tmp_path):
+def test_automatic_compaction_uses_provider_summary(tmp_path, monkeypatch):
     provider = ScriptedProvider([
         ModelResponse("A concise history summary", [], "stop"),
         ModelResponse("Done", [], "stop"),
     ])
     runtime = make_runtime(tmp_path, provider)
-    runtime.context.max_messages = 3
-    runtime.messages.extend({"role": "user", "content": str(i)} for i in range(4))
+    monkeypatch.setattr(config, "CONTEXT_LIMIT", 100)
+    runtime.messages.extend(
+        {"role": "user", "content": f"{i}-" + "x" * 200}
+        for i in range(4)
+    )
     assert runtime.run_turn("continue") == "Done"
     assert provider.requests[0]["tools"] == []
     assert "A concise history summary" in provider.requests[1]["messages"][0]["content"]

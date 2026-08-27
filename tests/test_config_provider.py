@@ -3,9 +3,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from simple_cc.config import Settings
-from simple_cc.models import ToolCall, ToolSpec
-from simple_cc.provider import normalize_tool_call, to_openai_tool
+from gugugaga.config import Settings
+from gugugaga.models import ToolCall, ToolSpec
+from gugugaga.provider import normalize_tool_call, to_openai_tool
 
 
 def test_settings_builds_state_paths(tmp_path, monkeypatch):
@@ -15,7 +15,7 @@ def test_settings_builds_state_paths(tmp_path, monkeypatch):
     settings = Settings.from_env(tmp_path)
 
     assert settings.base_url == "https://api.siliconflow.cn/v1"
-    assert settings.state_dir == tmp_path / ".simple_cc"
+    assert settings.state_dir == tmp_path / ".gugugaga"
     assert settings.tasks_dir.exists()
     assert settings.mailboxes_dir.exists()
 

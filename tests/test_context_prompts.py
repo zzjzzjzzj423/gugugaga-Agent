@@ -1,5 +1,6 @@
-from simple_cc.context import ContextManager, MemoryStore, SkillStore
-from simple_cc.prompts import PromptAssembler
+from gugugaga.context import ContextManager, MemoryStore, SkillStore
+from gugugaga.prompts import PromptAssembler
+from gugugaga.provider import ProviderResponse, TextBlock
 
 
 def test_skill_store_discovers_metadata_then_loads_body(tmp_path):
@@ -17,6 +18,48 @@ def test_memory_store_persists_and_searches(tmp_path):
     memory = MemoryStore(tmp_path / "memory")
     memory.remember("python-style", "Use pathlib for paths")
     assert "pathlib" in memory.search("paths")
+
+
+def test_memory_store_extracts_records_and_rebuilds_prompt_index(tmp_path):
+    class ExtractionProvider:
+        def create(self, **request):
+            assert request["tools"] == []
+            return ProviderResponse(
+                content=[
+                    TextBlock(
+                        text=(
+                            '[{"title":"python-style",'
+                            '"content":"Always use pathlib for paths."}]'
+                        )
+                    )
+                ],
+                stop_reason="end_turn",
+            )
+
+    memory = MemoryStore(tmp_path / "memory", provider=ExtractionProvider())
+
+    saved = memory.extract(
+        [{"role": "user", "content": "Always use pathlib."}],
+        "Understood.",
+    )
+
+    assert saved == 1
+    assert "Always use pathlib" in (tmp_path / "memory" / "MEMORY.md").read_text()
+
+
+def test_memory_store_preserves_a_legacy_manual_index(tmp_path):
+    directory = tmp_path / "memory"
+    directory.mkdir()
+    (directory / "MEMORY.md").write_text(
+        "Keep this existing project fact.", encoding="utf-8"
+    )
+
+    memory = MemoryStore(directory)
+    memory.remember("new-fact", "Keep this new fact too.")
+
+    index = (directory / "MEMORY.md").read_text(encoding="utf-8")
+    assert "Keep this existing project fact." in index
+    assert "Keep this new fact too." in index
 
 
 def test_large_tool_output_is_persisted(tmp_path):

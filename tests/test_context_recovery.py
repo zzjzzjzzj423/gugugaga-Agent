@@ -2,20 +2,20 @@ import json
 
 import pytest
 
-from simple_cc import config
-from simple_cc import context as context_module
-from simple_cc import recovery as recovery_module
-from simple_cc.context import (
+from gugugaga import config
+from gugugaga import context as context_module
+from gugugaga import recovery as recovery_module
+from gugugaga.context import (
     reactive_compact,
     snip_compact,
     summarize_history,
     tool_result_budget,
     write_transcript,
 )
-from simple_cc.prompts import PROMPT_SECTIONS
-from simple_cc.provider import ProviderResponse, TextBlock
-from simple_cc.recovery import RecoveryState, is_prompt_too_long_error, with_retry
-from simple_cc.tools import TOOL_DEFINITIONS, TOOL_HANDLERS
+from gugugaga.prompts import PROMPT_SECTIONS
+from gugugaga.provider import ProviderResponse, TextBlock
+from gugugaga.recovery import RecoveryState, is_prompt_too_long_error, with_retry
+from gugugaga.tools import TOOL_DEFINITIONS, TOOL_HANDLERS
 
 
 @pytest.fixture

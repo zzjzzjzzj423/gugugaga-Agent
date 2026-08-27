@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="gugugaga Agent runtime, memory and SQLite console">
+  <title>gugugaga Console</title>
+  <link rel="icon" type="image/png" href="/assets/gugugaga-avatar.png">
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="#overview" aria-label="gugugaga 首页">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span><strong>gugugaga</strong><small>Agent Console</small></span>
+      </a>
+      <nav class="main-nav" aria-label="主要导航">
+        <button class="nav-item is-active" type="button" data-page="overview" aria-current="page"><span class="nav-icon">▦</span><span>Overview</span></button>
+        <button class="nav-item" type="button" data-page="memory"><span class="nav-icon">◎</span><span>Memory</span></button>
+        <button class="nav-item" type="button" data-page="database"><span class="nav-icon">▤</span><span>Database</span></button>
+      </nav>
+      <div class="sidebar-footer">
+        <button class="settings-button" id="settings-button" type="button"><span>⚙</span><span>配置</span><i id="search-config-dot"></i></button>
+        <div class="agent-card">
+          <span class="status-dot"></span>
+          <div><strong id="sidebar-status">Agent online</strong><small id="sidebar-model">loading…</small></div>
+        </div>
+      </div>
+    </aside>
+
+    <main class="workspace">
+      <div id="config-banner" class="config-banner" hidden>
+        <span>聊天尚未配置。请点击左侧“配置”填写模型和 API Key。</span>
+      </div>
+
+      <section class="page is-active" id="page-overview" aria-labelledby="overview-title" aria-hidden="false">
+        <header class="page-header">
+          <div><p class="eyebrow">Live runtime</p><h1 id="overview-title">Agent Overview</h1><p>实时观察一次 Turn 的检索、上下文、推理、工具与记忆流动。</p></div>
+          <div class="live-state"><span class="status-dot"></span><span id="runtime-label">等待输入</span></div>
+        </header>
+
+        <div class="metric-grid">
+          <article class="metric"><span>当前 Turn</span><strong id="metric-turn">#0</strong><small id="metric-turn-time">尚无记录</small></article>
+          <article class="metric"><span>响应耗时</span><strong id="metric-latency">—</strong><small>最近一次完整回复</small></article>
+          <article class="metric"><span>记忆命中</span><strong id="metric-memory">0</strong><small id="metric-memory-total">0 条长期记忆</small></article>
+          <article class="metric"><span>上下文占用</span><strong id="metric-context">—</strong><small id="metric-context-mode">CC mode</small></article>
+        </div>
+
+        <section class="runtime-panel">
+          <div class="panel-heading">
+            <div><h2>Agent Runtime Graph</h2><p>事件来自 gugugaga 进程内 Observer；当前动作会实时点亮。</p></div>
+            <span class="event-chip" id="event-chip">idle</span>
+          </div>
+
+          <div class="runtime-graph" aria-live="polite">
+            <div class="flow-row flow-main">
+              <article class="runtime-node" data-stage="input"><span class="node-index">01</span><strong>输入入口</strong><small>接收用户提问</small></article>
+              <span class="flow-arrow">→</span>
+              <article class="runtime-node" data-stage="retrieval_gate"><span class="node-index">02</span><strong>Retrieval Gate</strong><small>判断是否需要记忆</small></article>
+              <span class="flow-arrow">→</span>
+              <article class="runtime-node" data-stage="memory_injection"><span class="node-index">03</span><strong>记忆注入</strong><small>装载命中的记忆</small></article>
+              <span class="flow-arrow">→</span>
+              <article class="runtime-node" data-stage="working_context"><span class="node-index">04</span><strong>Working Context</strong><small>组装当前上下文</small></article>
+            </div>
+            <div class="flow-row flow-loop">
+              <article class="runtime-node" data-stage="compression_gate"><span class="node-index">05</span><strong>Compression Gate</strong><small>判断是否需要压缩</small></article>
+              <span class="flow-arrow">→</span>
+              <article class="runtime-node" data-stage="compression"><span class="node-index">06</span><strong>Context Compression</strong><small>压缩并提交上下文</small></article>
+              <span class="flow-arrow">→</span>
+              <article class="runtime-node node-primary" data-stage="agent"><span class="node-index">07</span><strong>LLM Agent</strong><small>推理与决策</small></article>
+              <span class="flow-arrow loop-arrow">⇄</span>
+              <article class="runtime-node" data-stage="tools"><span class="node-index">08</span><strong>Tools</strong><small>执行行动并返回</small></article>
+              <span class="flow-arrow">→</span>
+              <article class="runtime-node" data-stage="reply"><span class="node-index">09</span><strong>回复用户</strong><small>完成本次 Turn</small></article>
+            </div>
+            <div class="memory-bridge"><span>可检索</span><span class="bridge-line"></span><span>每 6 个 Exchange 自动沉淀</span></div>
+            <div class="memory-pillars">
+              <article data-memory-stage="procedural"><span class="pillar-icon purple">P</span><div><strong>Procedural Memory</strong><small>Skills · 行为规则</small></div></article>
+              <article data-memory-stage="semantic"><span class="pillar-icon teal">S</span><div><strong>Semantic Memory</strong><small>Facts · 用户事实与偏好</small></div></article>
+              <article data-memory-stage="episodic"><span class="pillar-icon amber">E</span><div><strong>Episodic Memory</strong><small>历史事件摘要</small></div></article>
+              <article data-stage="consolidation"><span class="pillar-icon blue">C</span><div><strong>Consolidation</strong><small>提炼事实与事件</small></div></article>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <section class="page" id="page-memory" aria-labelledby="memory-title" aria-hidden="true">
+        <header class="page-header">
+          <div><p class="eyebrow">Memory system</p><h1 id="memory-title">Memory</h1><p>分别管理 Agent 的行为规则、稳定事实与历史经历。</p></div>
+          <label class="search-field"><span class="sr-only">搜索记忆</span><input id="memory-search" type="search" placeholder="搜索记忆…"><span>⌕</span></label>
+        </header>
+
+        <div class="memory-types" role="tablist" aria-label="记忆类型">
+          <button class="memory-type is-active" type="button" data-memory-kind="procedural" role="tab" aria-selected="true"><span class="type-icon purple">P</span><span><strong>Procedural</strong><small>程序性记忆 · 怎么做</small></span><b id="count-procedural">0</b></button>
+          <button class="memory-type" type="button" data-memory-kind="semantic" role="tab" aria-selected="false"><span class="type-icon teal">S</span><span><strong>Semantic</strong><small>语义记忆 · 知道什么</small></span><b id="count-semantic">0</b></button>
+          <button class="memory-type" type="button" data-memory-kind="episodic" role="tab" aria-selected="false"><span class="type-icon amber">E</span><span><strong>Episodic</strong><small>情景记忆 · 发生过什么</small></span><b id="count-episodic">0</b></button>
+        </div>
+
+        <div class="memory-layout">
+          <section class="memory-list-panel">
+            <div class="panel-heading compact"><div><h2 id="memory-list-title">程序性记忆</h2><p>选择一条记录查看完整信息</p></div><span id="memory-result-count">0 items</span></div>
+            <div id="memory-list" class="memory-list"></div>
+          </section>
+          <aside class="memory-detail-panel">
+            <div class="panel-heading compact"><div><h2>Memory Detail</h2><p>来自真实运行时或 SQLite</p></div></div>
+            <div id="memory-detail" class="memory-detail empty-state">选择一条记忆</div>
+          </aside>
+        </div>
+      </section>
+
+      <section class="page" id="page-database" aria-labelledby="database-title" aria-hidden="true">
+        <header class="page-header">
+          <div><p class="eyebrow">SQLite inspector</p><h1 id="database-title">Database</h1><p>只读浏览 <code>.gugugaga/state.db</code> 的原型表、字段和索引。</p></div>
+          <div class="live-state"><span class="status-dot"></span><span>state.db · connected</span></div>
+        </header>
+
+        <div class="database-layout">
+          <aside class="table-tree">
+            <div class="database-name"><span>▤</span><div><strong>state.db</strong><small id="table-count">0 tables</small></div></div>
+            <div id="table-list" class="table-list"></div>
+          </aside>
+          <section class="table-inspector">
+            <div class="table-toolbar">
+              <div><h2 id="selected-table">—</h2><p id="selected-table-meta">选择一张表</p></div>
+              <div class="view-tabs" role="tablist" aria-label="数据表视图">
+                <button type="button" data-db-view="rows" class="is-active" aria-selected="true">Rows</button>
+                <button type="button" data-db-view="schema" aria-selected="false">Schema</button>
+                <button type="button" data-db-view="indexes" aria-selected="false">Indexes</button>
+              </div>
+            </div>
+            <div class="query-line"><span class="query-prompt">sqlite&gt;</span><code id="query-text">SELECT name FROM sqlite_schema;</code></div>
+            <div class="data-table-wrap"><table class="data-table"><thead id="data-head"></thead><tbody id="data-body"></tbody></table></div>
+            <div class="table-footer"><span id="row-count">0 rows</span><span>read-only · query_only=ON</span></div>
+          </section>
+        </div>
+      </section>
+    </main>
+
+    <aside class="chat-panel">
+      <header class="chat-header"><div><h2>Chat</h2><p id="chat-session-label">当前对话 · 尚未开始</p></div><span class="model-chip"><span class="status-dot"></span><span id="chat-model">Agent</span></span></header>
+      <div class="conversation-toolbar">
+        <button id="history-toggle" class="conversation-action" type="button" aria-expanded="false" aria-controls="session-drawer"><span>◷</span> 历史对话</button>
+        <button id="new-chat-button" class="conversation-action primary" type="button"><span>＋</span> 新对话</button>
+      </div>
+      <div class="context-mode-control">
+        <label for="context-mode-select"><span>上下文压缩</span><small id="context-mode-hint">仅在对话开始前可选择</small></label>
+        <select id="context-mode-select" aria-describedby="context-mode-hint">
+          <option value="cc">CC</option>
+          <option value="hermes">Hermes</option>
+          <option value="pi">Pi</option>
+        </select>
+      </div>
+      <section id="session-drawer" class="session-drawer" hidden aria-label="历史对话">
+        <div class="session-drawer-heading"><div><strong>历史对话</strong><small>旧会话仅供查看</small></div><button id="history-close" type="button" aria-label="关闭历史对话">×</button></div>
+        <div id="session-list" class="session-list"></div>
+      </section>
+      <div id="history-mode-banner" class="history-mode-banner" hidden><span>正在查看历史对话</span><div><button id="resume-session-button" class="resume-session-button" type="button">从这里继续</button><button id="back-current-button" type="button">返回当前</button></div></div>
+      <div id="chat-messages" class="chat-messages" aria-live="polite"></div>
+      <div class="typing-state" id="typing-state" hidden><span class="typing-dots"><i></i><i></i><i></i></span><span id="typing-label">Agent 正在工作</span></div>
+      <form id="chat-form" class="composer">
+        <label for="chat-input" class="sr-only">发送给 gugugaga</label>
+        <textarea id="chat-input" rows="3" placeholder="Message gugugaga…" maxlength="20000"></textarea>
+        <div class="composer-footer"><span>Enter 发送 · Shift+Enter 换行</span><button id="send-button" type="submit" aria-label="发送消息">↑</button></div>
+      </form>
+    </aside>
+  </div>
+
+  <div class="settings-backdrop" id="settings-backdrop" hidden>
+    <section class="settings-dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+      <header class="settings-heading">
+        <div><p class="eyebrow">Runtime settings</p><h2 id="settings-title">Agent 配置</h2><p>配置保存在当前工作区本机，不会在页面中回显 Key。</p></div>
+        <button id="settings-close" type="button" aria-label="关闭配置">×</button>
+      </header>
+      <form id="settings-form" class="settings-form">
+        <label><span>主模型</span><small>用于聊天、推理和工具调用</small><input id="settings-model" name="model" type="text" required maxlength="300" placeholder="Qwen/Qwen3-Coder-30B-A3B-Instruct" autocomplete="off"></label>
+        <label><span>记忆整理小模型</span><small>用于后台 Memory Consolidation；留空则使用主模型</small><input id="settings-small-model" name="consolidation_model" type="text" maxlength="300" placeholder="Qwen/Qwen3-8B" autocomplete="off"></label>
+        <label><span>SiliconFlow API Key</span><small id="siliconflow-key-state">尚未配置</small><input id="settings-siliconflow-key" name="siliconflow_api_key" type="password" maxlength="1000" placeholder="输入 Key" autocomplete="new-password"></label>
+        <label><span>Tavily API Key</span><small id="tavily-key-state">尚未配置 · web_search 不可用</small><input id="settings-tavily-key" name="tavily_api_key" type="password" maxlength="1000" placeholder="tvly-…" autocomplete="new-password"></label>
+        <div class="settings-note"><span>⌁</span><p>Tavily 搜索默认使用 Basic 深度。Key 以本地配置文件保存，请不要把工作区配置文件分享给他人。</p></div>
+        <p class="settings-result" id="settings-result" aria-live="polite"></p>
+        <footer class="settings-actions"><button id="settings-cancel" type="button">取消</button><button class="primary" id="settings-save" type="submit">保存并应用</button></footer>
+      </form>
+    </section>
+  </div>
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>

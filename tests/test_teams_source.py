@@ -6,10 +6,10 @@ from collections import deque
 
 import pytest
 
-from simple_cc import config, tasks
-import simple_cc.teams as teams
-from simple_cc.permissions import PermissionPolicy
-from simple_cc.provider import ProviderResponse, TextBlock, ToolUseBlock
+from gugugaga import config, tasks
+import gugugaga.teams as teams
+from gugugaga.permissions import PermissionPolicy
+from gugugaga.provider import ProviderResponse, TextBlock, ToolUseBlock
 
 
 SOURCE_TEAM_API = {
@@ -439,8 +439,8 @@ class LateWriteProvider:
 
 def test_app_close_discards_late_teammate_provider_tool_response(monkeypatch):
     require_source_team_api()
-    from simple_cc.__main__ import build_runtime
-    from simple_cc.config import Settings
+    from gugugaga.__main__ import build_runtime
+    from gugugaga.config import Settings
 
     monkeypatch.setenv("SILICONFLOW_API_KEY", "test-key")
     monkeypatch.setenv("SILICONFLOW_MODEL", "test-model")
@@ -471,9 +471,9 @@ def test_runtime_bootstrap_installs_provider_before_source_spawn_handler(
     monkeypatch,
 ):
     require_source_team_api()
-    from simple_cc.__main__ import build_runtime
-    from simple_cc.config import Settings
-    from simple_cc.tools import TOOL_HANDLERS
+    from gugugaga.__main__ import build_runtime
+    from gugugaga.config import Settings
+    from gugugaga.tools import TOOL_HANDLERS
 
     monkeypatch.setenv("SILICONFLOW_API_KEY", "test-key")
     monkeypatch.setenv("SILICONFLOW_MODEL", "test-model")
@@ -506,8 +506,8 @@ def test_runtime_bootstrap_installs_provider_before_source_spawn_handler(
 
 def test_team_tool_definitions_and_handlers_are_bijective_and_prompted():
     require_source_team_api()
-    from simple_cc.prompts import assemble_system_prompt
-    from simple_cc.tools import TOOL_DEFINITIONS, TOOL_HANDLERS
+    from gugugaga.prompts import assemble_system_prompt
+    from gugugaga.tools import TOOL_DEFINITIONS, TOOL_HANDLERS
 
     team_tools = {
         "spawn_teammate",

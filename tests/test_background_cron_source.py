@@ -8,13 +8,13 @@ from threading import Event
 
 import pytest
 
-import simple_cc.background as background
-from simple_cc import config
-from simple_cc.provider import ToolUseBlock
+import gugugaga.background as background
+from gugugaga import config
+from gugugaga.provider import ToolUseBlock
 
 
 def _cron_module():
-    return importlib.import_module("simple_cc.cron")
+    return importlib.import_module("gugugaga.cron")
 
 
 @pytest.fixture
@@ -341,7 +341,7 @@ def test_scheduler_removes_exhausted_durable_job_and_handlers_are_fixed(
     isolated_scheduling_state, monkeypatch
 ):
     cron = _cron_module()
-    from simple_cc.tools import TOOL_DEFINITIONS, TOOL_HANDLERS
+    from gugugaga.tools import TOOL_DEFINITIONS, TOOL_HANDLERS
 
     names = [definition["name"] for definition in TOOL_DEFINITIONS]
     assert {"schedule_cron", "list_crons", "cancel_cron"} <= set(names)

@@ -1,4 +1,4 @@
-# Simple CC 源码忠实拆分设计（S01–S17）
+# gugugaga 源码忠实拆分设计（S01–S17）
 
 日期：2026-08-07
 
@@ -9,7 +9,7 @@
 `9EACF2F2C6F6DBE3B31117008A1A0BE44F52EE29585E5AFA0F4126D8D964D213`，
 内容完全一致。
 
-在当前 `simple_cc` 仓库的新分支上，将这份综合源码拆成清晰的小型模块，
+在当前 `gugugaga` 仓库的新分支上，将这份综合源码拆成清晰的小型模块，
 保留 S01 Agent Loop 到 S17 Autonomous Agents 的教学实现和控制流，完整删除
 S18 Worktree Isolation 与 S19 MCP Plugin，并继续通过硅基流动的 OpenAI 兼容
 接口调用模型。
@@ -44,8 +44,8 @@ S18 Worktree Isolation 与 S19 MCP Plugin，并继续通过硅基流动的 OpenA
 ## 目录和职责
 
 ```text
-simple_cc/
-├─ simple_cc/
+gugugaga/
+├─ gugugaga/
 │  ├─ __init__.py
 │  ├─ __main__.py       # 参数解析、交互循环、退出和 Cron autorun
 │  ├─ config.py         # 环境、模型、工作空间和共享常量

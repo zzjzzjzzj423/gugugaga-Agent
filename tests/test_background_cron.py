@@ -1,8 +1,8 @@
 import time
 from datetime import datetime
 
-from simple_cc.background import BackgroundManager, CronScheduler, cron_matches, validate_cron
-from simple_cc.models import ToolCall
+from gugugaga.background import BackgroundManager, CronScheduler, cron_matches, validate_cron
+from gugugaga.models import ToolCall
 
 
 def wait_until(predicate, timeout=2):

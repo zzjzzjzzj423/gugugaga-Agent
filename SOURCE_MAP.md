@@ -40,6 +40,47 @@ and returns `ProviderResponse(content=[TextBlock | ToolUseBlock],
 stop_reason=...)`. `length` is mapped to `max_tokens`; a function-call finish
 maps to `tool_use`.
 
+## Post-S20 context-mode extension
+
+`gugugaga/context_modes.py` is a gugugaga product extension layered above
+the retained S20 context primitives. It owns session-scoped CC, Hermes, and Pi
+selection, deterministic token accounting, protocol-safe cuts, Pi compaction
+entries, redacted events, and shared recovery coordination. The original CC
+primitives remain in `gugugaga/context.py`; this extension is not claimed as
+part of the pinned S20 source baseline.
+
+## Post-S20 observability extension
+
+`gugugaga/observability.py` is a gugugaga product extension layered around
+the retained Agent, Provider, tool, context, memory, Subagent, and Teammate
+boundaries. It owns the in-process Observer, daily Trace JSONL, Usage JSONL,
+SQLite Chat Log, event context, redaction, and per-turn metadata capture. It is
+not claimed as part of the pinned S20 source baseline and does not alter the
+fixed S01-S17 tool registry.
+
+## Post-S20 structured-memory extension
+
+`gugugaga/memory/` is a gugugaga product extension. It owns the SQLite
+`facts`, `episodes`, consolidation-batch and audit schema; exact deduplication;
+explicit `save_note`; post-turn six-exchange consolidation; leases, retry,
+recall, update, and forget behavior. `save_note` is appended only to the main
+Runtime's Provider tool request and is intentionally not added to
+`tools.py::BUILTIN_TOOLS`, so the pinned S01-S17 registry remains unchanged.
+The legacy Markdown `MemoryStore` remains available only to callers that use
+the compatibility `agent_loop` without a `MemoryService`; the production
+`SourceRuntime` uses the structured service and does not double-write through
+the legacy batch extractor.
+
+## Post-S20 Web Console extension
+
+`gugugaga/web.py` and `gugugaga/web_assets/` are gugugaga product
+extensions layered on top of the existing `SourceRuntime`, Observer, and
+structured-memory SQLite boundary. They provide a localhost-only HTTP API,
+long-poll runtime events, read-only Memory and SQLite inspection, and the
+Overview/Memory/Database/Chat browser interface. The console does not add or
+change Provider tools and is not claimed as part of the pinned S20 source
+baseline.
+
 ## Explicit exclusions
 
 ### S18 Worktree Isolation

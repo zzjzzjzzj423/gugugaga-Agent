@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-import simple_cc.config as config
-import simple_cc.skills as skills
-import simple_cc.tasks as tasks
-from simple_cc.prompts import assemble_system_prompt
-from simple_cc.tools import TOOL_DEFINITIONS, TOOL_HANDLERS, call_tool_handler
-from simple_cc.workspace import run_edit, run_read
+import gugugaga.config as config
+import gugugaga.skills as skills
+import gugugaga.tasks as tasks
+from gugugaga.prompts import assemble_system_prompt
+from gugugaga.tools import TOOL_DEFINITIONS, TOOL_HANDLERS, call_tool_handler
+from gugugaga.workspace import run_edit, run_read, run_write
 
 
 def test_file_tools_reject_workspace_escape_and_edit_exactly_once(tmp_path):
@@ -24,6 +24,24 @@ def test_file_tools_reject_workspace_escape_and_edit_exactly_once(tmp_path):
         "Error: text not found in notes.txt"
     )
     assert target.read_text(encoding="utf-8") == "beta alpha"
+
+
+def test_file_tools_write_read_and_edit_utf8_on_windows(tmp_path):
+    original = "# 深圳室内景点推荐\n\n适合雨天。"
+    updated = "# 深圳室内景点推荐\n\n适合高温或雨天。"
+
+    assert run_write("深圳推荐.md", original, cwd=tmp_path).startswith("Wrote")
+    target = tmp_path / "深圳推荐.md"
+    assert target.read_bytes() == original.encode("utf-8")
+    assert run_read("深圳推荐.md", cwd=tmp_path) == original
+
+    assert run_edit(
+        "深圳推荐.md",
+        "适合雨天。",
+        "适合高温或雨天。",
+        cwd=tmp_path,
+    ) == "Edited 深圳推荐.md"
+    assert target.read_bytes() == updated.encode("utf-8")
 
 
 def test_todo_normalization_accepts_serialized_lists_and_rejects_bad_status():
@@ -187,6 +205,9 @@ def test_system_prompt_rebuilds_from_live_workspace_skills_and_memory(
     second = assemble_system_prompt({"memories": "Prefer pathlib."})
 
     assert f"Working directory: {tmp_path}" in first
+    assert "trustworthy personal assistant" in first
+    assert "planning, writing, research, decisions" in first
+    assert "never pretend an action was completed" in first
     assert "- review: Review changes" in first
     assert "Relevant memories:\nPrefer pathlib." not in first
     assert "Relevant memories:\nPrefer pathlib." in second

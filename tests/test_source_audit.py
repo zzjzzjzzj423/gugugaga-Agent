@@ -12,10 +12,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from simple_cc import agent, config
-from simple_cc.config import Settings
-from simple_cc.provider import SiliconFlowProvider
-from simple_cc.tools import BUILTIN_HANDLERS, BUILTIN_TOOLS
+from gugugaga import agent, config
+from gugugaga.config import Settings
+from gugugaga.provider import SiliconFlowProvider
+from gugugaga.tools import BUILTIN_HANDLERS, BUILTIN_TOOLS
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -26,26 +26,31 @@ SOURCE_MAP = PROJECT_ROOT / "SOURCE_MAP.md"
 S20_SHA256 = "9EACF2F2C6F6DBE3B31117008A1A0BE44F52EE29585E5AFA0F4126D8D964D213"
 
 TARGET_MODULES = (
-    "simple_cc",
-    "simple_cc.__main__",
-    "simple_cc.agent",
-    "simple_cc.background",
-    "simple_cc.config",
-    "simple_cc.context",
-    "simple_cc.cron",
-    "simple_cc.hooks",
-    "simple_cc.models",
-    "simple_cc.permissions",
-    "simple_cc.planning",
-    "simple_cc.prompts",
-    "simple_cc.provider",
-    "simple_cc.recovery",
-    "simple_cc.skills",
-    "simple_cc.subagents",
-    "simple_cc.tasks",
-    "simple_cc.teams",
-    "simple_cc.tools",
-    "simple_cc.workspace",
+    "gugugaga",
+    "gugugaga.__main__",
+    "gugugaga.agent",
+    "gugugaga.background",
+    "gugugaga.config",
+    "gugugaga.context",
+    "gugugaga.context_modes",
+    "gugugaga.cron",
+    "gugugaga.hooks",
+    "gugugaga.models",
+    "gugugaga.observability",
+    "gugugaga.permissions",
+    "gugugaga.planning",
+    "gugugaga.prompts",
+    "gugugaga.provider",
+    "gugugaga.recovery",
+    "gugugaga.skills",
+    "gugugaga.subagents",
+    "gugugaga.tasks",
+    "gugugaga.teams",
+    "gugugaga.tools",
+    "gugugaga.web",
+    "gugugaga.web_config",
+    "gugugaga.web_search",
+    "gugugaga.workspace",
 )
 
 EXCLUDED_SOURCE_SYMBOLS = {
@@ -84,6 +89,7 @@ RETAINED_TOOL_NAMES = (
     "task",
     "load_skill",
     "compact",
+    "web_search",
     "create_task",
     "list_tasks",
     "get_task",
@@ -187,7 +193,7 @@ def _validate_retained_mapping_rows(
         assert module_names, f"mapping row has no target module: {source_cell}"
         row_claims: set[str] = set()
         for module_name in module_names:
-            module_path = project_root / "simple_cc" / module_name
+            module_path = project_root / "gugugaga" / module_name
             assert module_path.is_file(), (
                 f"mapping row target module does not exist: {module_name}"
             )
@@ -252,7 +258,7 @@ def _implementation_findings(path: Path, source: str) -> list[str]:
 
 
 def _settings(workspace: Path) -> Settings:
-    state = workspace / ".simple_cc"
+    state = workspace / ".gugugaga"
     return Settings(
         workspace=workspace,
         state_dir=state,
@@ -304,13 +310,13 @@ class ScriptedOpenAITransport:
 def test_all_target_modules_import_and_match_the_audited_module_set():
     package_modules = {
         path.stem
-        for path in (PROJECT_ROOT / "simple_cc").glob("*.py")
+        for path in (PROJECT_ROOT / "gugugaga").glob("*.py")
         if path.name != "__init__.py"
     }
     assert package_modules == {
-        name.removeprefix("simple_cc.")
+        name.removeprefix("gugugaga.")
         for name in TARGET_MODULES
-        if name != "simple_cc"
+        if name != "gugugaga"
     }
     assert [importlib.import_module(name).__name__ for name in TARGET_MODULES] == list(
         TARGET_MODULES
@@ -334,7 +340,7 @@ def test_source_map_pins_baseline_and_classifies_every_top_level_source_block():
     target_names = set().union(
         *(
             _top_level_names(path.read_text(encoding="utf-8"))
-            for path in (PROJECT_ROOT / "simple_cc").glob("*.py")
+            for path in (PROJECT_ROOT / "gugugaga").glob("*.py")
         )
     )
     retained_section, exclusions = source_map.split("## Explicit exclusions", 1)
@@ -372,7 +378,7 @@ def test_fixed_s01_s17_tool_definitions_and_handlers_are_a_bijection():
 
 def test_s18_s19_symbols_are_absent_from_implementation_but_documented_as_deleted():
     findings = []
-    for path in sorted((PROJECT_ROOT / "simple_cc").glob("*.py")):
+    for path in sorted((PROJECT_ROOT / "gugugaga").glob("*.py")):
         source = path.read_text(encoding="utf-8")
         findings.extend(_implementation_findings(path, source))
 

@@ -33,6 +33,9 @@ class ToolUseBlock:
 class ProviderResponse:
     content: list[TextBlock | ToolUseBlock]
     stop_reason: str
+    usage: dict[str, int | None] = field(default_factory=dict)
+    model: str | None = None
+    provider: str | None = None
 
 
 def _value(item: Any, name: str, default: Any = None) -> Any:
@@ -116,7 +119,13 @@ def to_openai_messages(messages: list[dict[str, Any]], system: str) -> list[dict
             if text_blocks:
                 rendered.append({"role": "user", "content": _text_from_content(text_blocks)})
             continue
-        rendered.append(dict(message))
+        rendered.append(
+            {
+                key: value
+                for key, value in message.items()
+                if key not in {"message_id", "_context_meta"}
+            }
+        )
     return rendered
 
 
@@ -198,7 +207,19 @@ class SiliconFlowProvider(ChatProvider):
                 if message.content:
                     content.append(TextBlock(text=message.content))
                 content.extend(_tool_use_block(call) for call in (message.tool_calls or []))
-                return ProviderResponse(content=content, stop_reason=_stop_reason(choice.finish_reason))
+                usage = getattr(response, "usage", None)
+                return ProviderResponse(
+                    content=content,
+                    stop_reason=_stop_reason(choice.finish_reason),
+                    usage={
+                        "input_tokens": getattr(usage, "prompt_tokens", None),
+                        "output_tokens": getattr(usage, "completion_tokens", None),
+                    },
+                    model=getattr(response, "model", None)
+                    or model
+                    or self.settings.model,
+                    provider="siliconflow",
+                )
             except Exception as error:
                 if is_context_length_error(error):
                     raise ContextLengthError(str(error)) from error

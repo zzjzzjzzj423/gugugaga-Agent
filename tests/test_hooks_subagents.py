@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import simple_cc.config as config
-import simple_cc.hooks as hooks
-import simple_cc.subagents as subagents
-from simple_cc.provider import ProviderResponse, TextBlock
+import gugugaga.config as config
+import gugugaga.hooks as hooks
+import gugugaga.subagents as subagents
+from gugugaga.provider import ProviderResponse, TextBlock
 
 
 def test_hooks_run_in_registration_order_and_stop_on_first_result(monkeypatch):

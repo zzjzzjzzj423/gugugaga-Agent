@@ -241,7 +241,7 @@ def initialize_cron() -> threading.Thread:
         _cron_thread = threading.Thread(
             target=cron_scheduler_loop,
             args=(_cron_stop_event,),
-            name="simple-cc-cron-scheduler",
+            name="gugugaga-cron-scheduler",
             daemon=True,
         )
         thread = _cron_thread

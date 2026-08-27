@@ -1,8 +1,8 @@
 import json
 from types import SimpleNamespace
 
-from simple_cc.config import Settings
-from simple_cc.provider import SiliconFlowProvider
+from gugugaga.config import Settings
+from gugugaga.provider import SiliconFlowProvider
 
 
 class ScriptedOpenAIClient:
@@ -21,13 +21,13 @@ class ScriptedOpenAIClient:
 def settings(tmp_path):
     return Settings(
         workspace=tmp_path,
-        state_dir=tmp_path / ".simple_cc",
-        tasks_dir=tmp_path / ".simple_cc" / "tasks",
-        memory_dir=tmp_path / ".simple_cc" / "memory",
-        mailboxes_dir=tmp_path / ".simple_cc" / "mailboxes",
-        transcripts_dir=tmp_path / ".simple_cc" / "transcripts",
-        outputs_dir=tmp_path / ".simple_cc" / "outputs",
-        skills_dir=tmp_path / ".simple_cc" / "skills",
+        state_dir=tmp_path / ".gugugaga",
+        tasks_dir=tmp_path / ".gugugaga" / "tasks",
+        memory_dir=tmp_path / ".gugugaga" / "memory",
+        mailboxes_dir=tmp_path / ".gugugaga" / "mailboxes",
+        transcripts_dir=tmp_path / ".gugugaga" / "transcripts",
+        outputs_dir=tmp_path / ".gugugaga" / "outputs",
+        skills_dir=tmp_path / ".gugugaga" / "skills",
         api_key="test-key",
         model="default-model",
     )
@@ -170,3 +170,35 @@ def test_create_renders_s20_tool_history_as_openai_assistant_and_tool_messages(t
         {"role": "tool", "tool_call_id": "call_read", "content": "contents"},
         {"role": "tool", "tool_call_id": "call_glob", "content": "a.py\nb.py"},
     ]
+
+
+def test_internal_context_metadata_is_not_sent_to_openai(tmp_path):
+    completion = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                finish_reason="stop",
+                message=SimpleNamespace(content="ok", tool_calls=[]),
+            )
+        ]
+    )
+    client = ScriptedOpenAIClient(completion)
+    provider = SiliconFlowProvider(settings(tmp_path), client=client)
+
+    provider.create(
+        system="system",
+        messages=[
+            {
+                "role": "user",
+                "content": "hello",
+                "message_id": "msg_internal",
+                "_context_meta": {"synthetic": False},
+            }
+        ],
+        tools=[],
+        max_tokens=20,
+    )
+
+    assert client.requests[0]["messages"][1] == {
+        "role": "user",
+        "content": "hello",
+    }

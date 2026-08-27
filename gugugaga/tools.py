@@ -24,6 +24,7 @@ from .teams import (
     run_spawn_teammate,
 )
 from .workspace import run_bash, run_edit, run_glob, run_read, run_write
+from .web_search import run_web_search
 
 
 def call_tool_handler(handler, args: dict, name: str) -> str:
@@ -155,6 +156,30 @@ TOOL_DEFINITIONS: list[dict] = [
             "type": "object",
             "properties": {"focus": {"type": "string"}},
             "required": [],
+        },
+    },
+    {
+        "name": "web_search",
+        "description": (
+            "Search the current public web with Tavily. Use for recent, changing, "
+            "or externally verifiable information and cite returned source URLs."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "minLength": 1, "maxLength": 400},
+                "max_results": {"type": "integer", "minimum": 1, "maximum": 10},
+                "topic": {
+                    "type": "string",
+                    "enum": ["general", "news", "finance"],
+                },
+                "search_depth": {
+                    "type": "string",
+                    "enum": ["basic", "advanced"],
+                },
+            },
+            "required": ["query"],
+            "additionalProperties": False,
         },
     },
     {
@@ -317,6 +342,7 @@ TOOL_HANDLERS: dict[str, Callable] = {
     "write_file": run_write,
     "edit_file": run_edit,
     "glob": run_glob,
+    "web_search": run_web_search,
     "todo_write": run_todo_write,
     "task": spawn_subagent,
     "load_skill": load_skill,

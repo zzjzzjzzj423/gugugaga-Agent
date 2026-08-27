@@ -1,7 +1,7 @@
 import pytest
 
-from simple_cc.planning import TaskStore, TodoStore
-from simple_cc.planning import Task
+from gugugaga.planning import TaskStore, TodoStore
+from gugugaga.planning import Task
 
 
 def test_todo_store_normalizes_single_in_progress_item():

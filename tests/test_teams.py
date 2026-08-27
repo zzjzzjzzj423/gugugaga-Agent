@@ -4,9 +4,9 @@ import threading
 
 import pytest
 
-from simple_cc.planning import TaskStore
-from simple_cc.models import ToolCall
-from simple_cc.teams import Mailbox, ProtocolError, ProtocolStore, TeamManager
+from gugugaga.planning import TaskStore
+from gugugaga.models import ToolCall
+from gugugaga.teams import Mailbox, ProtocolError, ProtocolStore, TeamManager
 
 
 class DummyRuntime:

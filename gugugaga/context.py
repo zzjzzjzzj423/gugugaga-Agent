@@ -5,12 +5,80 @@ import re
 import time
 import uuid
 from pathlib import Path
+from typing import Callable, Protocol
 
 from . import config
+from .observability import notify, record_llm_call
 from .subagents import extract_text
 
 
 client = None
+MEMORY_INDEX_MARKER = "<!-- gugugaga-memory-index:v1 -->"
+
+
+class ContextCompactor(Protocol):
+    """Replaceable policy for fitting conversation history into a model call."""
+
+    def prepare(
+        self,
+        messages: list[dict],
+        summarizer: Callable[[list[dict]], str] | None = None,
+    ) -> list[dict]: ...
+
+    def compact(
+        self,
+        messages: list[dict],
+        summary: str | None = None,
+        force: bool = False,
+        *,
+        reason: str = "manual",
+    ) -> list[dict]: ...
+
+
+class MemorySystem(Protocol):
+    """Replaceable long-term memory boundary used by an agent runtime."""
+
+    def recall(self, query: str = "") -> str: ...
+
+    def record_turn(
+        self, snapshot: list[dict], final_assistant_text: str
+    ) -> None: ...
+
+
+class NullMemorySystem:
+    """Memory implementation for stateless agents and tests."""
+
+    def recall(self, query: str = "") -> str:
+        del query
+        return ""
+
+    def record_turn(
+        self, snapshot: list[dict], final_assistant_text: str
+    ) -> None:
+        del snapshot, final_assistant_text
+
+
+class NoOpContextCompactor:
+    """Context implementation that leaves history untouched."""
+
+    def prepare(
+        self,
+        messages: list[dict],
+        summarizer: Callable[[list[dict]], str] | None = None,
+    ) -> list[dict]:
+        del summarizer
+        return messages
+
+    def compact(
+        self,
+        messages: list[dict],
+        summary: str | None = None,
+        force: bool = False,
+        *,
+        reason: str = "manual",
+    ) -> list[dict]:
+        del summary, force, reason
+        return messages
 
 
 class SkillStore:
@@ -40,20 +108,51 @@ class SkillStore:
 
 
 class MemoryStore:
-    def __init__(self, directory: Path):
+    def __init__(
+        self,
+        directory: Path,
+        provider=None,
+        extraction_interval: int | None = None,
+    ):
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
+        self.index_path = self.directory / "MEMORY.md"
+        self.provider = provider
+        self.extraction_interval = extraction_interval or (
+            config.MEMORY_EXTRACTION_INTERVAL
+        )
+        self._pending_turns: list[tuple[list[dict], str]] = []
+        self._migrate_legacy_index()
+
+    def _migrate_legacy_index(self) -> None:
+        """Keep a manually maintained MEMORY.md when records are introduced."""
+        if not self.index_path.exists():
+            return
+        text = self.index_path.read_text(encoding="utf-8")
+        if not text.strip() or text.startswith(MEMORY_INDEX_MARKER):
+            return
+        path = self.directory / "legacy-memory.md"
+        if not path.exists():
+            path.write_text(
+                f"# Legacy memory\n\n{text.strip()}\n", encoding="utf-8"
+            )
+        self.rebuild_index()
 
     def remember(self, title: str, content: str) -> str:
         safe = re.sub(r"[^A-Za-z0-9_-]+", "-", title).strip("-") or uuid.uuid4().hex[:8]
+        if safe.lower() == "memory":
+            safe = f"memory-{uuid.uuid4().hex[:8]}"
         path = self.directory / f"{safe}.md"
         path.write_text(f"# {title}\n\n{content}\n", encoding="utf-8")
+        self.rebuild_index()
         return f"Remembered {title}"
 
     def search(self, query: str, limit: int = 5) -> str:
         terms = query.lower().split()
         hits = []
         for path in self.directory.glob("*.md"):
+            if path == self.index_path:
+                continue
             text = path.read_text(encoding="utf-8")
             score = sum(term in text.lower() for term in terms)
             if score:
@@ -62,10 +161,194 @@ class MemoryStore:
 
     def index_text(self, limit: int = 20, max_chars: int = 4_000) -> str:
         entries = []
-        for path in sorted(self.directory.glob("*.md"))[:limit]:
+        paths = [
+            path
+            for path in sorted(self.directory.glob("*.md"))
+            if path != self.index_path
+        ]
+        for path in paths[:limit]:
             body = path.read_text(encoding="utf-8").strip().replace("\n", " ")
             entries.append(f"- {path.stem}: {body[:240]}")
         return ("\n".join(entries)[:max_chars] if entries else "No memories.")
+
+    def recall(self, query: str = "") -> str:
+        """Return prompt-facing memory; backends may use query for retrieval."""
+        del query
+        if self.index_path.exists():
+            return self.index_path.read_text(encoding="utf-8")[:4_000]
+        return ""
+
+    def record_turn(
+        self, snapshot: list[dict], final_assistant_text: str
+    ) -> None:
+        """Buffer completed turns and periodically extract durable memories."""
+        self._pending_turns.append((snapshot, final_assistant_text))
+        if len(self._pending_turns) < self.extraction_interval:
+            return
+        batch = self._pending_turns[: self.extraction_interval]
+        del self._pending_turns[: self.extraction_interval]
+        self.extract_batch(batch)
+
+    def rebuild_index(self) -> None:
+        """Rebuild the prompt-facing memory file from durable records."""
+        parts = []
+        for path in sorted(self.directory.glob("*.md")):
+            if path == self.index_path:
+                continue
+            parts.append(path.read_text(encoding="utf-8").strip())
+        if parts:
+            self.index_path.write_text(
+                MEMORY_INDEX_MARKER + "\n\n" + "\n\n".join(parts) + "\n",
+                encoding="utf-8",
+            )
+
+    @staticmethod
+    def _message_text(message: dict) -> str:
+        content = message.get("content", "")
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return ""
+        return "\n".join(
+            str(
+                block.get("text", "")
+                if isinstance(block, dict)
+                else getattr(block, "text", "")
+            )
+            for block in content
+            if block_type(block) == "text"
+        ).strip()
+
+    @staticmethod
+    def _response_text(content) -> str:
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return str(content or "")
+        return "\n".join(
+            str(
+                block.get("text", "")
+                if isinstance(block, dict)
+                else getattr(block, "text", "")
+            )
+            for block in content
+            if block_type(block) == "text"
+        ).strip()
+
+    @staticmethod
+    def _json_array(text: str) -> list:
+        cleaned = text.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, count=1)
+            cleaned = re.sub(r"\s*```$", "", cleaned, count=1)
+        start = cleaned.find("[")
+        if start < 0:
+            raise ValueError("memory extractor returned no JSON array")
+        value, _ = json.JSONDecoder().raw_decode(cleaned[start:])
+        if not isinstance(value, list):
+            raise ValueError("memory extractor response must be a JSON array")
+        return value
+
+    @classmethod
+    def _dialogue(cls, snapshot: list[dict], final_assistant_text: str) -> str:
+        parts = []
+        for message in snapshot[-10:]:
+            if message.get("role") not in {"user", "assistant"}:
+                continue
+            text = cls._message_text(message)
+            if text:
+                parts.append(f"{message['role']}: {text}")
+        if final_assistant_text.strip():
+            parts.append(f"assistant: {final_assistant_text.strip()}")
+        return "\n".join(parts)[-8_000:]
+
+    @staticmethod
+    def _should_extract(dialogue: str) -> bool:
+        markers = (
+            "remember", "prefer", "always", "never", "must", "requirement",
+            "constraint", "project uses", "记住", "记忆", "偏好", "以后",
+            "始终", "不要", "必须", "项目", "约束", "需要",
+        )
+        lowered = dialogue.lower()
+        return any(marker in lowered for marker in markers)
+
+    def _extract_dialogue(self, dialogue: str) -> int:
+        if self.provider is None or not self._should_extract(dialogue):
+            return 0
+        existing = [
+            path.stem
+            for path in sorted(self.directory.glob("*.md"))
+            if path != self.index_path
+        ]
+        prompt = (
+            "Extract only durable user preferences, reusable feedback, stable "
+            "project facts, constraints, or useful references. Ignore temporary "
+            "tasks, guesses, raw tool output, credentials, and secrets. Return "
+            "only a JSON array of at most 4 objects. Each object must be "
+            '{"title":"short stable title","content":"concise markdown"}. '
+            "Return [] when nothing durable is new. Existing memory names: "
+            f"{json.dumps(existing, ensure_ascii=False)}\n\nDialogue:\n{dialogue}"
+        )
+        try:
+            response = record_llm_call(
+                self.provider,
+                model=config.MODEL or None,
+                system=(
+                    "You extract durable agent memories. Never store secrets or "
+                    "transient task state. Return JSON only."
+                ),
+                messages=[{"role": "user", "content": prompt}],
+                tools=[],
+                max_tokens=1_000,
+                call_type="memory_consolidation",
+            )
+            values = self._json_array(self._response_text(response.content))
+            saved = 0
+            for value in values[:4]:
+                if not isinstance(value, dict):
+                    continue
+                title, content = value.get("title"), value.get("content")
+                if not isinstance(title, str) or not isinstance(content, str):
+                    continue
+                if not title.strip() or not content.strip():
+                    continue
+                self.remember(title.strip()[:120], content.strip()[:8_000])
+                saved += 1
+            if saved:
+                print(f"  \033[33m[memory] saved {saved} item(s)\033[0m")
+            notify("memory", {"action": "consolidate", "saved": saved})
+            return saved
+        except Exception as error:
+            notify(
+                "memory",
+                {
+                    "action": "consolidate",
+                    "status": "error",
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                },
+            )
+            print(f"  \033[33m[memory warning] extraction failed: {error}\033[0m")
+            return 0
+
+    def extract(
+        self, snapshot: list[dict], final_assistant_text: str
+    ) -> int:
+        """Extract durable memories from one uncompressed turn snapshot."""
+        return self._extract_dialogue(
+            self._dialogue(snapshot, final_assistant_text)
+        )
+
+    def extract_batch(self, turns: list[tuple[list[dict], str]]) -> int:
+        """Extract once from a batch of completed, pre-compaction turns."""
+        dialogues = list(
+            dict.fromkeys(
+                self._dialogue(snapshot, final_text)
+                for snapshot, final_text in turns
+            )
+        )
+        combined = "\n\n--- completed turn ---\n\n".join(dialogues)
+        return self._extract_dialogue(combined[-40_000:])
 
 
 class ContextManager:
@@ -112,7 +395,15 @@ class ContextManager:
             start -= 1
         return messages[start:]
 
-    def compact(self, messages: list[dict], summary: str | None = None, force: bool = False) -> list[dict]:
+    def compact(
+        self,
+        messages: list[dict],
+        summary: str | None = None,
+        force: bool = False,
+        *,
+        reason: str = "manual",
+    ) -> list[dict]:
+        del reason
         if len(messages) <= self.max_messages and not force:
             return self.apply_output_budget(messages)
         stamp = f"{int(time.time())}_{uuid.uuid4().hex[:6]}"
@@ -185,11 +476,14 @@ def collect_tool_results(messages: list):
     return found
 
 
-def persist_large_output(tool_use_id: str, output: str) -> str:
+def persist_large_output(
+    tool_use_id: str, output: str, output_dir: Path | None = None
+) -> str:
     if len(output) <= config.PERSIST_THRESHOLD:
         return output
-    config.TOOL_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    path = config.TOOL_RESULTS_DIR / f"{tool_use_id}.txt"
+    directory = Path(output_dir or config.TOOL_RESULTS_DIR)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{tool_use_id}.txt"
     if not path.exists():
         path.write_text(output)
     return (
@@ -198,7 +492,11 @@ def persist_large_output(tool_use_id: str, output: str) -> str:
     )
 
 
-def tool_result_budget(messages: list, max_bytes: int = 200_000) -> list:
+def tool_result_budget(
+    messages: list,
+    max_bytes: int = 200_000,
+    output_dir: Path | None = None,
+) -> list:
     if not messages:
         return messages
     last = messages[-1]
@@ -222,7 +520,7 @@ def tool_result_budget(messages: list, max_bytes: int = 200_000) -> list:
             break
         text = str(block.get("content", ""))
         block["content"] = persist_large_output(
-            block.get("tool_use_id", "unknown"), text
+            block.get("tool_use_id", "unknown"), text, output_dir
         )
         total = sum(
             len(str(candidate.get("content", "")))
@@ -288,12 +586,14 @@ def summarize_history(messages: list) -> str:
     )
     if client is None:
         raise RuntimeError("Context provider is not configured")
-    response = client.create(
+    response = record_llm_call(
+        client,
         model=config.MODEL,
         system="",
         messages=[{"role": "user", "content": prompt}],
         tools=[],
         max_tokens=2000,
+        call_type="context_summary",
     )
     return extract_text(response.content) or "(empty summary)"
 
@@ -364,13 +664,18 @@ def inject_background_notifications(messages: list):
         )
 
 
-def update_context(context: dict, messages: list) -> dict:
+def update_context(
+    context: dict,
+    messages: list,
+    memory_index: Path | None = None,
+) -> dict:
     del context, messages
     from .teams import active_teammates
 
     memories = ""
-    if config.MEMORY_INDEX.exists():
-        memories = config.MEMORY_INDEX.read_text()[:2000]
+    index = Path(memory_index or config.MEMORY_INDEX)
+    if index.exists():
+        memories = index.read_text()[:2000]
     return {
         "memories": memories,
         "active_teammates": list(active_teammates.keys()),

@@ -4,13 +4,14 @@ import copy
 
 import pytest
 
-from simple_cc import agent, config, context, subagents, teams, tools
-from simple_cc.provider import (
+from gugugaga import agent, config, context, subagents, teams, tools
+from gugugaga.provider import (
     ContextLengthError,
     ProviderResponse,
     TextBlock,
     ToolUseBlock,
 )
+from gugugaga.context_modes import SessionContextConfig, SessionContextCoordinator
 
 
 class ScriptedProvider:
@@ -114,6 +115,87 @@ def test_agent_loop_writes_file_then_returns_exact_tool_result_order(
     ]
 
 
+def test_completed_turn_extracts_memory_from_pre_compaction_snapshot(
+    source_loop, monkeypatch
+):
+    provider = ScriptedProvider(
+        [
+            ProviderResponse(
+                content=[TextBlock(text=f"Finished {index}.")],
+                stop_reason="end_turn",
+            )
+            for index in range(10)
+        ]
+    )
+    install(provider, monkeypatch)
+    captured = {}
+
+    class RecordingMemoryStore:
+        def __init__(self, directory, provider=None):
+            pass
+
+        def extract_batch(self, turns):
+            captured["turns"] = copy.deepcopy(turns)
+            return 0
+
+    def compact_in_place(messages):
+        messages[:] = [{"role": "user", "content": "[Compacted]"}]
+        return messages
+
+    monkeypatch.setattr(agent, "MemoryStore", RecordingMemoryStore)
+    monkeypatch.setattr(agent, "prepare_context", compact_in_place)
+    memory_state = {"pending_turns": []}
+
+    for index in range(9):
+        messages = [
+            {
+                "role": "user",
+                "content": f"Always keep original constraint {index}.",
+            }
+        ]
+        agent.agent_loop(messages, {}, memory_state=memory_state)
+        assert "turns" not in captured
+
+    messages = [
+        {"role": "user", "content": "Always keep original constraint 9."}
+    ]
+    agent.agent_loop(messages, {}, memory_state=memory_state)
+
+    assert len(captured["turns"]) == 10
+    first_snapshot, first_text = captured["turns"][0]
+    assert first_text == "Finished 0."
+    assert first_snapshot[0]["content"] == "Always keep original constraint 0."
+    assert first_snapshot[1]["role"] == "assistant"
+    last_snapshot, last_text = captured["turns"][-1]
+    assert last_text == "Finished 9."
+    assert last_snapshot[0]["content"] == "Always keep original constraint 9."
+    assert last_snapshot[1]["role"] == "assistant"
+    assert messages[0]["content"] == "Always keep original constraint 9."
+    assert memory_state["pending_turns"] == []
+
+
+def test_stop_reason_is_authoritative_for_turn_completion(
+    source_loop, tmp_path, monkeypatch
+):
+    provider = ScriptedProvider([
+        ProviderResponse(
+            content=[
+                ToolUseBlock(
+                    id="unexpected-tool",
+                    name="write_file",
+                    input={"path": "should-not-exist.txt", "content": "no"},
+                )
+            ],
+            stop_reason="end_turn",
+        )
+    ])
+    install(provider, monkeypatch)
+
+    agent.agent_loop([{"role": "user", "content": "Finish now"}], {})
+
+    assert not (tmp_path / "should-not-exist.txt").exists()
+
+
 def test_prompt_too_long_runs_one_real_reactive_compaction_retry(
     source_loop, tmp_path, monkeypatch
 ):
@@ -153,6 +235,10 @@ def test_maximum_context_length_error_retries_once_then_records_second_error(
     provider = ScriptedProvider(
         [
             ContextLengthError("maximum context length exceeded"),
+            ProviderResponse(
+                content=[TextBlock(text="Earlier work.")],
+                stop_reason="end_turn",
+            ),
             ContextLengthError("maximum context length exceeded"),
         ]
     )
@@ -167,7 +253,7 @@ def test_maximum_context_length_error_retries_once_then_records_second_error(
 
     agent.agent_loop(messages, {})
 
-    assert len(provider.requests) == 2
+    assert len(provider.requests) == 3
     assert len(list((tmp_path / ".transcripts").glob("*.jsonl"))) == 1
     assert messages[-1] == {
         "role": "assistant",
@@ -175,8 +261,9 @@ def test_maximum_context_length_error_retries_once_then_records_second_error(
             {
                 "type": "text",
                 "text": (
-                    "[Error] ContextLengthError: "
-                    "maximum context length exceeded"
+                    "[CONTEXT_RECOVERY_EXHAUSTED] The Provider still rejected "
+                    "the rebuilt context. History preserved: True. Next: start "
+                    "a new session or use a model with a larger context window."
                 ),
             }
         ],
@@ -204,19 +291,20 @@ def test_compact_tool_mutates_history_without_dispatching_placeholder(
         ),
     ])
     install(provider, monkeypatch)
-    messages = [{"role": "user", "content": "Compact now"}]
+    messages = [
+        {"role": "user", "content": "Old goal " + "x" * 2_000},
+        {"role": "assistant", "content": [{"type": "text", "text": "Old work " + "y" * 2_000}]},
+        {"role": "user", "content": "Compact now " + "z" * 2_000},
+    ]
+    memory_state = {"pending_turns": []}
 
-    agent.agent_loop(messages, {})
+    agent.agent_loop(messages, {}, memory_state=memory_state)
 
-    assert messages[0] == {
-        "role": "user",
-        "content": "[Compacted]\n\nPreserve the current goal.",
-    }
-    assert messages[1] == {
-        "role": "user",
-        "content": "[Compacted. Continue with summarized context.]",
-    }
-    assert not any(
+    assert messages[0]["content"].startswith("Old goal ")
+    coordinator = memory_state["context_coordinator"]
+    assert coordinator.status()["successful_compactions"] == 1
+    assert coordinator.project(messages)[0]["content"].startswith("[Compacted]")
+    assert any(
         isinstance(message.get("content"), list)
         and any(
             isinstance(block, dict)
@@ -225,3 +313,104 @@ def test_compact_tool_mutates_history_without_dispatching_placeholder(
         )
         for message in messages
     )
+
+
+def test_two_source_runtimes_bind_files_and_memory_to_their_own_workspace(
+    source_loop, tmp_path, monkeypatch
+):
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    (first_root / ".memory").mkdir(parents=True)
+    (second_root / ".memory").mkdir(parents=True)
+    (first_root / ".memory" / "MEMORY.md").write_text("first-memory")
+    (second_root / ".memory" / "MEMORY.md").write_text("second-memory")
+    provider = ScriptedProvider(
+        [
+            ProviderResponse(
+                content=[ToolUseBlock(id="first-write", name="write_file", input={"path": "first.txt", "content": "one"})],
+                stop_reason="tool_use",
+            ),
+            ProviderResponse(content=[TextBlock(text="first done")], stop_reason="end_turn"),
+            ProviderResponse(
+                content=[ToolUseBlock(id="second-write", name="write_file", input={"path": "second.txt", "content": "two"})],
+                stop_reason="tool_use",
+            ),
+            ProviderResponse(content=[TextBlock(text="second done")], stop_reason="end_turn"),
+        ]
+    )
+    install(provider, monkeypatch)
+
+    def runtime(root):
+        coordinator = SessionContextCoordinator(
+            SessionContextConfig.parse(),
+            summary_callback=agent._summary_callback(provider),
+            workspace=root,
+        )
+        return agent.SourceRuntime(provider, context_coordinator=coordinator)
+
+    first = runtime(first_root)
+    second = runtime(second_root)
+    config.configure_workspace(second_root)
+
+    assert first.run_turn("write first") == "first done"
+    assert second.run_turn("write second") == "second done"
+    assert (first_root / "first.txt").read_text() == "one"
+    assert (second_root / "second.txt").read_text() == "two"
+    assert not (first_root / "second.txt").exists()
+    assert not (second_root / "first.txt").exists()
+    assert "first-memory" in first.context["memories"]
+    assert "second-memory" in second.context["memories"]
+
+
+def test_source_runtime_new_session_resets_transient_state_only(
+    source_loop, tmp_path, monkeypatch
+):
+    provider = ScriptedProvider([])
+    install(provider, monkeypatch)
+    coordinator = SessionContextCoordinator(
+        SessionContextConfig.parse(),
+        summary_callback=agent._summary_callback(provider),
+        workspace=tmp_path,
+    )
+    runtime = agent.SourceRuntime(provider, context_coordinator=coordinator)
+    original_session = runtime.context_coordinator.session_id
+    original_recording = runtime.recording
+    original_memory_service = runtime.memory_service
+    runtime.messages.append({"role": "user", "content": "old conversation"})
+    runtime.memory_state["pending_turns"].append("turn_old")
+
+    try:
+        new_session = runtime.start_new_session("hermes")
+
+        assert new_session != original_session
+        assert runtime.context_coordinator.session_id == new_session
+        assert runtime.context_coordinator.status()["lifecycle"] == "configuring"
+        assert runtime.context_coordinator.status()["mode"] == "hermes"
+        assert runtime.context_coordinator.status()["locked"] is False
+        assert runtime.messages == []
+        assert runtime.memory_state == {"pending_turns": []}
+        assert runtime.recording is original_recording
+        assert runtime.memory_service is original_memory_service
+
+        restored_messages = [
+            {"role": "user", "content": "saved question"},
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "saved answer"}],
+            },
+        ]
+        resumed_session = runtime.resume_session(
+            "session_saved", restored_messages, "pi"
+        )
+        restored_messages[0]["content"] = "mutated outside runtime"
+
+        assert resumed_session == "session_saved"
+        assert runtime.context_coordinator.session_id == "session_saved"
+        assert runtime.context_coordinator.status()["mode"] == "pi"
+        assert runtime.context_coordinator.status()["locked"] is True
+        assert runtime.messages[0]["content"] == "saved question"
+        assert runtime.recording is original_recording
+        assert runtime.memory_service is original_memory_service
+    finally:
+        runtime.memory_service.close(1)
+        runtime.context_coordinator.close()

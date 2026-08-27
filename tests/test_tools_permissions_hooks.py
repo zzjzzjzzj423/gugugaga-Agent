@@ -1,7 +1,7 @@
-from simple_cc.hooks import HookEvent, HookManager
-from simple_cc.models import ToolCall
-from simple_cc.permissions import PermissionDecision, PermissionPolicy
-from simple_cc.tools import ToolRegistry, WorkspaceTools
+from gugugaga.hooks import HookEvent, HookManager
+from gugugaga.models import ToolCall
+from gugugaga.permissions import PermissionDecision, PermissionPolicy
+from gugugaga.tools import ToolRegistry, WorkspaceTools
 
 
 def test_workspace_tools_write_read_edit_and_glob(tmp_path):

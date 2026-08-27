@@ -6,6 +6,7 @@ import re
 import threading
 import time
 import uuid
+from contextvars import copy_context
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -13,6 +14,7 @@ from typing import Any, Callable
 from . import config
 from .hooks import trigger_hooks
 from .models import ToolCall
+from .observability import event_scope, notify, record_llm_call
 from .permissions import PermissionPolicy
 from .planning import Task, TaskStore
 from .tasks import can_start, claim_task, complete_task, list_tasks
@@ -325,6 +327,12 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
         return False
 
     def run():
+        scope = event_scope(agent_type="teammate", agent_id=name)
+        scope.__enter__()
+        notify(
+            "teammate_start",
+            {"name": name, "role": role, "prompt": prompt},
+        )
         messages = [{"role": "user", "content": prompt}]
         sub_tools = [
             {
@@ -436,6 +444,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
         }
 
         try:
+            iteration = 0
             while not _teammate_stop_event.is_set():
                 if len(messages) <= 3:
                     messages.insert(
@@ -483,12 +492,15 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                                 }
                             )
                     try:
-                        response = _team_provider.create(
+                        iteration += 1
+                        response = record_llm_call(
+                            _team_provider,
                             model=config.MODEL or None,
                             system=system,
                             messages=messages[-20:],
                             tools=sub_tools,
                             max_tokens=8000,
+                            call_type="teammate",
                         )
                     except Exception:
                         break
@@ -510,7 +522,21 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                         if _teammate_stop_event.is_set():
                             should_shutdown = True
                             break
+                        tool_started = time.monotonic()
                         output = _dispatch_teammate_tool(block, sub_handlers)
+                        notify(
+                            "tool",
+                            {
+                                "iteration": iteration,
+                                "tool": block.name,
+                                "args": block.input,
+                                "output": output,
+                                "status": "ok",
+                                "latency_ms": round(
+                                    (time.monotonic() - tool_started) * 1000
+                                ),
+                            },
+                        )
                         if block.name == "submit_plan" and output.startswith(
                             "Plan submitted ("
                         ):
@@ -561,12 +587,17 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                 break
             BUS.send(name, "lead", summary, "result")
         finally:
+            notify("teammate_end", {"name": name})
+            scope.__exit__(None, None, None)
             with _teammate_lock:
                 active_teammates.pop(name, None)
                 _teammate_threads.pop(name, None)
 
+    parent_context = copy_context()
     thread = threading.Thread(
-        target=run, name=f"teammate-{name}", daemon=True
+        target=lambda: parent_context.run(run),
+        name=f"teammate-{name}",
+        daemon=True,
     )
     with _teammate_lock:
         _teammate_threads[name] = thread

@@ -117,7 +117,7 @@ def start_background_task(block, handlers: dict) -> str:
         bg_id = f"bg_{_bg_counter:04d}"
         thread = threading.Thread(
             target=worker,
-            name=f"simple-cc-background-{bg_id}",
+            name=f"gugugaga-background-{bg_id}",
             daemon=True,
         )
         background_tasks[bg_id] = {

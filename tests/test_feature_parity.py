@@ -1,7 +1,7 @@
-from simple_cc import config
-from simple_cc.__main__ import build_runtime
-from simple_cc.config import Settings
-from simple_cc.tools import TOOL_DEFINITIONS
+from gugugaga import config
+from gugugaga.__main__ import build_runtime
+from gugugaga.config import Settings
+from gugugaga.tools import TOOL_DEFINITIONS
 from tests.fakes import ScriptedProvider
 
 
