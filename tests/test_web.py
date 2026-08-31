@@ -267,6 +267,76 @@ def test_chat_publishes_runtime_and_observer_events():
         gc.collect()
 
 
+def test_store_exposes_task_board_and_scheduled_jobs():
+    with TemporaryDirectory(prefix=".web-test-", dir=Path.cwd()) as directory:
+        root = Path(directory)
+        tasks_dir = root / ".tasks"
+        tasks_dir.mkdir()
+        first_id = "task_1780000000_0001"
+        second_id = "task_1780000001_0002"
+        (tasks_dir / f"{first_id}.json").write_text(
+            json.dumps(
+                {
+                    "id": first_id,
+                    "subject": "Prepare dataset",
+                    "description": "Collect the inputs",
+                    "status": "pending",
+                    "owner": None,
+                    "blockedBy": [second_id],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (tasks_dir / f"{second_id}.json").write_text(
+            json.dumps(
+                {
+                    "id": second_id,
+                    "subject": "Approve scope",
+                    "description": "",
+                    "status": "completed",
+                    "owner": "reviewer",
+                    "blockedBy": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (root / ".scheduled_tasks.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "cron_daily",
+                        "cron": "0 9 * * *",
+                        "prompt": "Create a daily report",
+                        "recurring": True,
+                        "durable": True,
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        store = DashboardStore(root)
+        payload = store.task_system()
+
+        assert payload["counts"] == {
+            "total": 2,
+            "pending": 1,
+            "in_progress": 0,
+            "completed": 1,
+            "blocked": 0,
+            "scheduled": 1,
+            "progress": 50,
+        }
+        pending = next(item for item in payload["tasks"] if item["id"] == first_id)
+        assert pending["ready"] is True
+        assert pending["dependencies"] == [
+            {"id": second_id, "status": "completed"}
+        ]
+        assert payload["scheduled_tasks"][0]["next_run"] is not None
+        del store
+        gc.collect()
+
+
 def test_http_server_serves_console_and_api():
     with TemporaryDirectory(prefix=".web-test-", dir=Path.cwd()) as directory:
         application = DashboardApplication(directory, runtime_factory=FakeApp)
@@ -292,6 +362,11 @@ def test_http_server_serves_console_and_api():
                 assert "上下文压缩" in html
                 assert "Agent 配置" in html
                 assert "Tavily API Key" in html
+                assert "任务可视化" in html
+            with urlopen(f"{base}/api/tasks", timeout=3) as response:
+                payload = json.loads(response.read())
+                assert payload["counts"]["total"] == 0
+                assert payload["scheduled_tasks"] == []
             with urlopen(f"{base}/api/database/tables", timeout=3) as response:
                 payload = json.loads(response.read())
                 assert any(item["name"] == "facts" for item in payload["items"])

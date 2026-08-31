@@ -577,6 +577,11 @@ class SessionContextCoordinator:
             raise ContextModeError(
                 "SUMMARY_FAILED", "No summary provider is configured."
             )
+        if headings:
+            system = (
+                f"{system}\nThe required headings, in exact order, are:\n"
+                + "\n".join(headings)
+            )
         chunks = self._summary_chunks(prompt, 60_000)
         try:
             if len(chunks) == 1:
@@ -1212,3 +1217,23 @@ class SessionContextCoordinator:
                 transcript=transcript, result=result,
             )
             return strip_internal_metadata(candidate)
+
+
+def create_child_context_coordinator(
+    parent: SessionContextCoordinator,
+    *,
+    agent_type: str,
+    agent_id: str,
+) -> SessionContextCoordinator:
+    """Create isolated child state while inheriting the parent's context policy."""
+    namespace = f"{agent_type}s"
+    return SessionContextCoordinator(
+        parent.config,
+        counter_registry=parent.registry,
+        summary_callback=parent.summary_callback,
+        workspace=parent.workspace,
+        transcripts_dir=parent.transcripts_dir / namespace,
+        memory_dir=parent.memory_dir,
+        tool_results_dir=parent.tool_results_dir / namespace / agent_id,
+        session_id=f"{agent_type}_{agent_id}_{uuid.uuid4().hex}",
+    )

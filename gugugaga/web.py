@@ -11,6 +11,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -454,6 +455,157 @@ class DashboardStore:
                 ]
         return {"table": name, "view": view, "columns": columns, "rows": data}
 
+    @staticmethod
+    def _next_cron_run(expression: str) -> str | None:
+        """Return the next local-time match supported by gugugaga's cron parser."""
+        from .cron import cron_matches
+
+        candidate = datetime.now().astimezone().replace(second=0, microsecond=0)
+        candidate += timedelta(minutes=1)
+        for _ in range(366 * 24 * 60):
+            try:
+                if cron_matches(expression, candidate):
+                    return candidate.isoformat()
+            except (TypeError, ValueError, ZeroDivisionError):
+                return None
+            candidate += timedelta(minutes=1)
+        return None
+
+    def _scheduled_tasks(self) -> list[dict[str, Any]]:
+        values: dict[str, dict[str, Any]] = {}
+        durable_path = self.workspace / ".scheduled_tasks.json"
+        if durable_path.exists():
+            try:
+                raw_jobs = json.loads(durable_path.read_text(encoding="utf-8"))
+                if isinstance(raw_jobs, list):
+                    for raw in raw_jobs:
+                        if isinstance(raw, dict) and raw.get("id") and raw.get("cron"):
+                            values[str(raw["id"])] = dict(raw)
+            except (OSError, TypeError, ValueError):
+                pass
+
+        # Once the runtime is active, include non-durable jobs that exist only
+        # in memory. Guard against exposing another configured workspace in tests.
+        from . import config as runtime_config
+        from .cron import cron_lock, scheduled_jobs
+
+        try:
+            same_workspace = runtime_config.WORKDIR.resolve() == self.workspace
+        except OSError:
+            same_workspace = False
+        if same_workspace:
+            with cron_lock:
+                for job_id, job in scheduled_jobs.items():
+                    values[job_id] = {
+                        "id": job.id,
+                        "cron": job.cron,
+                        "prompt": job.prompt,
+                        "recurring": job.recurring,
+                        "durable": job.durable,
+                    }
+
+        items = []
+        for raw in values.values():
+            expression = str(raw.get("cron", ""))
+            items.append(
+                {
+                    "id": str(raw.get("id", "")),
+                    "cron": expression,
+                    "prompt": self._excerpt(raw.get("prompt"), 500),
+                    "recurring": bool(raw.get("recurring", True)),
+                    "durable": bool(raw.get("durable", True)),
+                    "next_run": self._next_cron_run(expression),
+                }
+            )
+        return sorted(
+            items,
+            key=lambda item: (
+                item["next_run"] is None,
+                item["next_run"] or "",
+                item["id"],
+            ),
+        )
+
+    def task_system(self) -> dict[str, Any]:
+        tasks_dir = self.workspace / ".tasks"
+        raw_tasks: list[dict[str, Any]] = []
+        if tasks_dir.exists():
+            for path in sorted(tasks_dir.glob("task_*.json")):
+                try:
+                    raw = json.loads(path.read_text(encoding="utf-8"))
+                    if not isinstance(raw, dict) or not raw.get("id"):
+                        continue
+                    raw["_path"] = path
+                    raw_tasks.append(raw)
+                except (OSError, TypeError, ValueError):
+                    continue
+
+        status_by_id = {
+            str(raw["id"]): str(raw.get("status", "pending")) for raw in raw_tasks
+        }
+        tasks = []
+        for raw in raw_tasks:
+            task_id = str(raw["id"])
+            dependencies = [str(value) for value in (raw.get("blockedBy") or [])]
+            dependency_details = [
+                {"id": dependency, "status": status_by_id.get(dependency, "missing")}
+                for dependency in dependencies
+            ]
+            blocked = any(item["status"] != "completed" for item in dependency_details)
+            path = raw.pop("_path")
+            timestamp_match = re.match(r"task_(\d+)_", task_id)
+            created_at = None
+            if timestamp_match:
+                try:
+                    created_at = datetime.fromtimestamp(
+                        int(timestamp_match.group(1)), timezone.utc
+                    ).isoformat()
+                except (OverflowError, OSError, ValueError):
+                    pass
+            try:
+                updated_at = datetime.fromtimestamp(
+                    path.stat().st_mtime, timezone.utc
+                ).isoformat()
+            except OSError:
+                updated_at = None
+            tasks.append(
+                {
+                    "id": task_id,
+                    "subject": self._excerpt(raw.get("subject"), 200) or "未命名任务",
+                    "description": self._excerpt(raw.get("description"), 1000),
+                    "status": status_by_id[task_id],
+                    "owner": raw.get("owner"),
+                    "blocked_by": dependencies,
+                    "dependencies": dependency_details,
+                    "blocked": blocked and status_by_id[task_id] == "pending",
+                    "ready": status_by_id[task_id] == "pending" and not blocked,
+                    "created_at": created_at,
+                    "updated_at": updated_at,
+                }
+            )
+
+        order = {"in_progress": 0, "pending": 1, "completed": 2}
+        tasks.sort(
+            key=lambda item: (
+                order.get(item["status"], 3),
+                item["created_at"] or "",
+                item["id"],
+            )
+        )
+        scheduled = self._scheduled_tasks()
+        counts = {
+            "total": len(tasks),
+            "pending": sum(item["status"] == "pending" for item in tasks),
+            "in_progress": sum(item["status"] == "in_progress" for item in tasks),
+            "completed": sum(item["status"] == "completed" for item in tasks),
+            "blocked": sum(item["blocked"] for item in tasks),
+            "scheduled": len(scheduled),
+        }
+        counts["progress"] = round(
+            (counts["completed"] / counts["total"] * 100) if counts["total"] else 0
+        )
+        return {"counts": counts, "tasks": tasks, "scheduled_tasks": scheduled}
+
 
 @dataclass
 class ChatResult:
@@ -838,6 +990,8 @@ def _handler_factory(application: DashboardApplication):
                     kind = query.get("kind", ["semantic"])[0]
                     search = query.get("q", [None])[0]
                     self._json(application.store.memories(kind, search))
+                elif parsed.path == "/api/tasks":
+                    self._json(application.store.task_system())
                 elif parsed.path == "/api/database/tables":
                     self._json({"items": application.store.tables()})
                 elif parsed.path == "/api/database/table":

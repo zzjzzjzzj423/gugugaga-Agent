@@ -15,7 +15,7 @@
     contextMode: 'cc',
     contextModeLocked: false,
     turnRunning: false,
-    pageScroll: { overview: 0, memory: 0, database: 0 },
+    pageScroll: { overview: 0, tasks: 0, memory: 0, database: 0 },
   };
 
   const $ = (selector, root = document) => root.querySelector(selector);
@@ -83,11 +83,124 @@
     }
 
     if (page === 'overview') loadOverview();
+    if (page === 'tasks') loadTasks();
     if (page === 'memory') loadMemories();
     if (page === 'database') loadTables();
   }
 
   $$('.nav-item').forEach((button) => button.addEventListener('click', () => setPage(button.dataset.page)));
+
+  const taskColumns = [
+    { status: 'pending', title: '待处理', hint: '等待领取或解除依赖' },
+    { status: 'in_progress', title: '进行中', hint: 'Agent 正在执行' },
+    { status: 'completed', title: '已完成', hint: '任务已经交付' },
+  ];
+
+  function taskBadge(task) {
+    if (task.blocked) return ['blocked', '被阻塞'];
+    if (task.status === 'in_progress') return ['in-progress', '进行中'];
+    if (task.status === 'completed') return ['completed', '已完成'];
+    return ['ready', '可开始'];
+  }
+
+  function makeTaskCard(task) {
+    const card = document.createElement('article');
+    card.className = `task-card status-${task.status}${task.blocked ? ' is-blocked' : ''}`;
+    const top = document.createElement('div'); top.className = 'task-card-top';
+    const id = document.createElement('code'); id.textContent = task.id;
+    const [badgeClass, badgeText] = taskBadge(task);
+    const badge = document.createElement('span'); badge.className = `task-badge ${badgeClass}`; badge.textContent = badgeText;
+    top.append(id, badge);
+    const title = document.createElement('h3'); title.textContent = task.subject;
+    card.append(top, title);
+    if (task.description) {
+      const description = document.createElement('p'); description.textContent = task.description; card.append(description);
+    }
+    if (task.dependencies?.length) {
+      const dependencies = document.createElement('div'); dependencies.className = 'task-dependencies';
+      const label = document.createElement('small'); label.textContent = '依赖'; dependencies.append(label);
+      task.dependencies.forEach((dependency) => {
+        const chip = document.createElement('span');
+        chip.className = `dependency-chip is-${dependency.status}`;
+        chip.textContent = dependency.id;
+        chip.title = `${dependency.id}: ${dependency.status}`;
+        dependencies.append(chip);
+      });
+      card.append(dependencies);
+    }
+    const footer = document.createElement('footer');
+    const owner = document.createElement('span'); owner.textContent = task.owner ? `负责人 · ${task.owner}` : '尚未分配';
+    const updated = document.createElement('time'); updated.textContent = `更新于 ${formatDate(task.updated_at)}`;
+    footer.append(owner, updated); card.append(footer);
+    return card;
+  }
+
+  function renderTasks(data) {
+    const counts = data.counts || {};
+    $('#task-count-total').textContent = counts.total || 0;
+    $('#task-count-progress').textContent = counts.in_progress || 0;
+    $('#task-count-blocked').textContent = counts.blocked || 0;
+    $('#task-count-completed').textContent = counts.completed || 0;
+    $('#task-count-scheduled').textContent = counts.scheduled || 0;
+    $('#task-progress-label').textContent = `整体进度 ${counts.progress || 0}%`;
+    $('#task-progress-bar').style.width = `${counts.progress || 0}%`;
+
+    const board = $('#task-board'); board.replaceChildren();
+    taskColumns.forEach((column) => {
+      const tasks = (data.tasks || []).filter((task) => task.status === column.status);
+      const section = document.createElement('section'); section.className = `task-column column-${column.status}`;
+      const heading = document.createElement('header');
+      const title = document.createElement('div');
+      const name = document.createElement('strong'); name.textContent = column.title;
+      const hint = document.createElement('small'); hint.textContent = column.hint;
+      const count = document.createElement('span'); count.textContent = tasks.length;
+      title.append(name, hint); heading.append(title, count); section.append(heading);
+      const list = document.createElement('div'); list.className = 'task-column-list';
+      if (!tasks.length) {
+        const empty = document.createElement('div'); empty.className = 'task-column-empty'; empty.textContent = '暂无任务'; list.append(empty);
+      } else tasks.forEach((task) => list.append(makeTaskCard(task)));
+      section.append(list); board.append(section);
+    });
+
+    const scheduled = $('#scheduled-list'); scheduled.replaceChildren();
+    const jobs = data.scheduled_tasks || [];
+    $('#scheduled-count-label').textContent = `${jobs.length} schedules`;
+    if (!jobs.length) {
+      const empty = document.createElement('div'); empty.className = 'scheduled-empty'; empty.textContent = '暂无定时任务'; scheduled.append(empty);
+      return;
+    }
+    jobs.forEach((job) => {
+      const row = document.createElement('article'); row.className = 'scheduled-task';
+      const clock = document.createElement('span'); clock.className = 'scheduled-clock'; clock.textContent = '◷';
+      const body = document.createElement('div'); body.className = 'scheduled-body';
+      const top = document.createElement('div');
+      const name = document.createElement('strong'); name.textContent = job.prompt || '未命名定时任务';
+      const id = document.createElement('code'); id.textContent = job.id;
+      top.append(name, id);
+      const meta = document.createElement('div'); meta.className = 'scheduled-meta';
+      const cron = document.createElement('code'); cron.textContent = job.cron;
+      const recurring = document.createElement('span'); recurring.textContent = job.recurring ? '循环' : '单次';
+      const durable = document.createElement('span'); durable.textContent = job.durable ? '持久化' : '本次会话';
+      meta.append(cron, recurring, durable); body.append(top, meta);
+      const next = document.createElement('div'); next.className = 'scheduled-next';
+      const label = document.createElement('small'); label.textContent = '下次运行';
+      const time = document.createElement('strong'); time.textContent = job.next_run ? formatDate(job.next_run) : '无可用时间';
+      next.append(label, time); row.append(clock, body, next); scheduled.append(row);
+    });
+  }
+
+  async function loadTasks() {
+    const button = $('#task-refresh');
+    button.disabled = true;
+    try {
+      renderTasks(await api('/api/tasks'));
+    } catch (error) {
+      const board = $('#task-board'); board.replaceChildren();
+      const failed = document.createElement('div'); failed.className = 'task-load-error'; failed.textContent = `任务数据加载失败：${error.message}`; board.append(failed);
+    } finally { button.disabled = false; }
+  }
+
+  $('#task-refresh').addEventListener('click', loadTasks);
 
   async function loadStatus() {
     try {
@@ -906,6 +1019,7 @@
       await loadOverview();
       await loadSessions();
       if (state.page === 'memory') await loadMemories();
+      if (state.page === 'tasks') await loadTasks();
       if (state.page === 'database') await loadTables();
     } catch (error) {
       addMessage('assistant', `无法完成本次请求：${error.message}`);
@@ -931,6 +1045,7 @@
     await loadHistory();
     pollEvents();
     setInterval(() => { if (!state.turnRunning) loadOverview(); }, 5000);
+    setInterval(() => { if (!state.turnRunning && state.page === 'tasks') loadTasks(); }, 15000);
   }
 
   init();

@@ -1037,12 +1037,3 @@ class AgentRuntime:
                 )
             self.messages.append({"role": "user", "content": results})
         raise RuntimeError(f"agent exceeded maximum rounds ({self.max_rounds})")
-
-
-class SubagentRunner:
-    def __init__(self, runtime_factory: Callable[[str], AgentRuntime]):
-        self.runtime_factory = runtime_factory
-
-    def run(self, prompt: str, agent_type: str = "general-purpose") -> str:
-        runtime = self.runtime_factory(agent_type)
-        return runtime.run_turn(prompt)

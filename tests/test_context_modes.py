@@ -16,6 +16,7 @@ from gugugaga.context_modes import (
     SessionContextConfig,
     SessionContextCoordinator,
     TokenCounterRegistry,
+    create_child_context_coordinator,
     ensure_message_ids,
     legal_cut,
     validate_tool_protocol,
@@ -51,6 +52,36 @@ def summary_callback(system, prompt, max_tokens):
     if "Hermes Markdown" in system:
         return structured(HERMES_HEADINGS)
     return "Goal, constraints, completed work, and next step."
+
+
+def test_child_agent_inherits_context_policy_with_isolated_state(tmp_path):
+    parent = SessionContextCoordinator(
+        SessionContextConfig.parse("pi"),
+        summary_callback=summary_callback,
+        workspace=tmp_path,
+        transcripts_dir=tmp_path / ".gugugaga" / "transcripts",
+        memory_dir=tmp_path / ".gugugaga" / "memory",
+        tool_results_dir=tmp_path / ".gugugaga" / "tool-results",
+    )
+
+    child = create_child_context_coordinator(
+        parent,
+        agent_type="subagent",
+        agent_id="child-1",
+    )
+
+    assert child is not parent
+    assert child.config == parent.config
+    assert child.registry is parent.registry
+    assert child.state is not parent.state
+    assert child.transcripts_dir == parent.transcripts_dir / "subagents"
+    assert child.tool_results_dir == (
+        parent.tool_results_dir / "subagents" / "child-1"
+    )
+    child.set_mode("pi")
+    assert parent.status()["lifecycle"] == "configuring"
+    child.close()
+    assert child.status()["lifecycle"] == "closed"
 
 
 def coordinator(tmp_path, mode="cc", **overrides):
@@ -90,6 +121,21 @@ def test_mode_defaults_validation_and_locking(tmp_path):
         session.set_mode("pi")
     assert locked.value.code == "CONTEXT_MODE_LOCKED"
     assert session.status()["mode"] == "hermes"
+
+
+def test_structured_summary_prompt_names_every_required_heading(tmp_path):
+    systems = []
+
+    def recording_summary(system, prompt, max_tokens):
+        systems.append(system)
+        return structured(HERMES_HEADINGS)
+
+    session = coordinator(tmp_path, "hermes")
+    session.summary_callback = recording_summary
+    session._summary("Return structured Markdown.", "history", HERMES_HEADINGS)
+
+    assert len(systems) == 1
+    assert all(heading in systems[0] for heading in HERMES_HEADINGS)
 
 
 def test_unknown_counter_fails_before_session_use(tmp_path):

@@ -104,6 +104,8 @@ class GugugagaApp:
             self.runtime.context_coordinator.close()
             background_outcome = shutdown_background_tasks(remaining())
             teammate_outcome = stop_all_teammates(remaining())
+            set_team_provider(None)
+            subagents.reset_subagent_runtime()
             cron_stopped = shutdown_cron(remaining())
             if (
                 self.autorun_thread is not None
@@ -203,18 +205,36 @@ def build_runtime(
     )
     permissions = PermissionPolicy()
     initialize_background_tasks()
-    set_team_provider(provider, permissions, approval_callback)
     initialize_cron()
+    runtime = SourceRuntime(
+        provider,
+        permissions,
+        approval_callback,
+        coordinator,
+        recording,
+        memory_service,
+    )
+    context_parent_resolver = lambda: runtime.context_coordinator
+    subagents.configure_subagent_runtime(
+        provider,
+        model=settings.model,
+        permissions=permissions,
+        approval_callback=approval_callback,
+        context_parent_resolver=context_parent_resolver,
+        max_rounds=settings.max_rounds,
+        max_tokens=settings.max_tokens,
+    )
+    set_team_provider(
+        provider,
+        permissions,
+        approval_callback,
+        context_parent_resolver=context_parent_resolver,
+        max_tokens=settings.max_tokens,
+        max_rounds_per_burst=settings.max_rounds,
+    )
     return GugugagaApp(
         settings=settings,
-        runtime=SourceRuntime(
-            provider,
-            permissions,
-            approval_callback,
-            coordinator,
-            recording,
-            memory_service,
-        ),
+        runtime=runtime,
     )
 
 

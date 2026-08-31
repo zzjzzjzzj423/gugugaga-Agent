@@ -8,6 +8,11 @@ import pytest
 
 from gugugaga import config, tasks
 import gugugaga.teams as teams
+from gugugaga.context_modes import (
+    SessionContextConfig,
+    SessionContextCoordinator,
+    validate_tool_protocol,
+)
 from gugugaga.permissions import PermissionPolicy
 from gugugaga.provider import ProviderResponse, TextBlock, ToolUseBlock
 
@@ -134,6 +139,54 @@ def test_protocol_response_rejects_wrong_type_and_request_id():
     teams.match_response("plan_approval_response", "req_other", True)
 
     assert teams.pending_requests["req_plan"].status == "pending"
+
+
+def test_protocol_response_requires_the_expected_sender_and_target():
+    request = teams.ProtocolState(
+        request_id="req_shutdown",
+        type="shutdown",
+        sender="lead",
+        target="alice",
+        status="pending",
+        payload="",
+    )
+    teams.pending_requests[request.request_id] = request
+
+    assert not teams.match_response(
+        "shutdown_response",
+        request.request_id,
+        True,
+        sender="mallory",
+        target="lead",
+    )
+    assert request.status == "pending"
+    assert teams.match_response(
+        "shutdown_response",
+        request.request_id,
+        True,
+        sender="alice",
+        target="lead",
+    )
+    assert request.status == "approved"
+
+
+def test_plan_review_rejects_non_plan_and_terminal_requests():
+    shutdown = teams._create_protocol_request(
+        "shutdown", "lead", "alice", ""
+    )
+    assert teams.run_review_plan(shutdown.request_id, True) == (
+        f"Request {shutdown.request_id} is not a plan approval request"
+    )
+    assert shutdown.status == "pending"
+
+    plan = teams._create_protocol_request(
+        "plan_approval", "alice", "lead", "plan"
+    )
+    plan.status = "expired"
+    assert teams.run_review_plan(plan.request_id, True) == (
+        f"Request {plan.request_id} is already expired"
+    )
+    assert plan.status == "expired"
 
 
 def test_concurrent_colliding_request_ids_preserve_both_protocol_states(
@@ -502,6 +555,167 @@ def test_runtime_bootstrap_installs_provider_before_source_spawn_handler(
         assert len(provider.requests) == 2
     finally:
         app.close()
+
+
+def test_plan_wait_preserves_ordinary_messages_until_approval(monkeypatch):
+    provider = ScriptedContentBlockProvider()
+    provider.responses = [
+        ProviderResponse(
+            content=[
+                ToolUseBlock(
+                    id="toolu_plan",
+                    name="submit_plan",
+                    input={"plan": "Inspect, edit, verify."},
+                )
+            ],
+            stop_reason="tool_use",
+        ),
+        ProviderResponse(
+            content=[TextBlock(text="Approved plan and urgent message handled.")],
+            stop_reason="end_turn",
+        ),
+    ]
+    teams.set_team_provider(provider)
+    monkeypatch.setattr(teams, "IDLE_POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(teams, "IDLE_TIMEOUT", 0.02)
+    monkeypatch.setattr(teams, "PLAN_APPROVAL_TIMEOUT", 1.0)
+
+    assert teams.spawn_teammate_thread(
+        "plan-alice", "developer", "Submit a plan"
+    ).startswith("Teammate")
+    deadline = time.monotonic() + 2
+    while not teams.BUS.read_inbox("lead") and time.monotonic() < deadline:
+        time.sleep(0.01)
+    request_id = next(iter(teams.pending_requests))
+    teams.run_send_message("plan-alice", "Urgent requirement from Lead")
+    assert teams.run_review_plan(request_id, True) == "Plan approved"
+
+    deadline = time.monotonic() + 2
+    while "plan-alice" in teams.active_teammates and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert "plan-alice" not in teams.active_teammates
+    second_request = provider.requests[1]["messages"]
+    assert any(
+        "Urgent requirement from Lead" in str(message.get("content", ""))
+        for message in second_request
+    )
+
+
+def test_plan_wait_expires_and_resumes_the_teammate(monkeypatch):
+    provider = ScriptedContentBlockProvider()
+    provider.responses = [
+        ProviderResponse(
+            content=[
+                ToolUseBlock(
+                    id="toolu_plan_timeout",
+                    name="submit_plan",
+                    input={"plan": "Wait forever."},
+                )
+            ],
+            stop_reason="tool_use",
+        ),
+        ProviderResponse(
+            content=[TextBlock(text="Stopped safely after approval timeout.")],
+            stop_reason="end_turn",
+        ),
+    ]
+    teams.set_team_provider(provider)
+    monkeypatch.setattr(teams, "IDLE_POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(teams, "IDLE_TIMEOUT", 0.02)
+    monkeypatch.setattr(teams, "PLAN_APPROVAL_TIMEOUT", 0.03)
+
+    assert teams.spawn_teammate_thread(
+        "timeout-alice", "developer", "Submit a plan"
+    ).startswith("Teammate")
+    deadline = time.monotonic() + 2
+    while "timeout-alice" in teams.active_teammates and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert "timeout-alice" not in teams.active_teammates
+    request = next(iter(teams.pending_requests.values()))
+    assert request.status == "expired"
+    assert any(
+        "Plan approval timed out" in str(message.get("content", ""))
+        for message in provider.requests[1]["messages"]
+    )
+
+
+def test_teammate_provider_failure_is_reported_as_error(monkeypatch):
+    class FailingProvider:
+        def create(self, messages, system, tools, max_tokens, model=None):
+            raise ValueError("provider unavailable")
+
+    teams.set_team_provider(FailingProvider())
+    monkeypatch.setattr(teams, "IDLE_POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(teams, "IDLE_TIMEOUT", 0.02)
+
+    assert teams.spawn_teammate_thread(
+        "failure-alice", "developer", "Do the work"
+    ).startswith("Teammate")
+    deadline = time.monotonic() + 2
+    while "failure-alice" in teams.active_teammates and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    messages = teams.consume_lead_inbox()
+    assert [message["type"] for message in messages] == ["error"]
+    assert "provider unavailable" in messages[0]["content"]
+
+
+def test_teammate_context_keeps_tool_pairs_beyond_twenty_messages(
+    tmp_path, monkeypatch
+):
+    class LongToolProvider:
+        def __init__(self):
+            self.calls = 0
+            self.message_counts = []
+
+        def create(self, messages, system, tools, max_tokens, model=None):
+            validate_tool_protocol(messages)
+            self.message_counts.append(len(messages))
+            self.calls += 1
+            if self.calls <= 11:
+                return ProviderResponse(
+                    content=[
+                        ToolUseBlock(
+                            id=f"toolu_read_{self.calls}",
+                            name="read_file",
+                            input={"path": "missing.txt"},
+                        )
+                    ],
+                    stop_reason="tool_use",
+                )
+            return ProviderResponse(
+                content=[TextBlock(text="Long task completed safely.")],
+                stop_reason="end_turn",
+            )
+
+    parent = SessionContextCoordinator(
+        SessionContextConfig.parse("cc"),
+        workspace=tmp_path,
+        transcripts_dir=tmp_path / ".gugugaga" / "transcripts",
+        memory_dir=tmp_path / ".gugugaga" / "memory",
+        tool_results_dir=tmp_path / ".gugugaga" / "tool-results",
+    )
+    provider = LongToolProvider()
+    teams.set_team_provider(
+        provider,
+        context_parent_resolver=lambda: parent,
+        max_rounds_per_burst=20,
+    )
+    monkeypatch.setattr(teams, "IDLE_POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(teams, "IDLE_TIMEOUT", 0.02)
+
+    assert teams.spawn_teammate_thread(
+        "context-alice", "developer", "Read repeatedly"
+    ).startswith("Teammate")
+    deadline = time.monotonic() + 2
+    while "context-alice" in teams.active_teammates and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert "context-alice" not in teams.active_teammates
+    assert max(provider.message_counts) > 20
+    assert teams.consume_lead_inbox()[-1]["type"] == "result"
 
 
 def test_team_tool_definitions_and_handlers_are_bijective_and_prompted():

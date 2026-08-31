@@ -17,6 +17,7 @@
       </a>
       <nav class="main-nav" aria-label="主要导航">
         <button class="nav-item is-active" type="button" data-page="overview" aria-current="page"><span class="nav-icon">▦</span><span>Overview</span></button>
+        <button class="nav-item" type="button" data-page="tasks"><span class="nav-icon">◫</span><span>任务可视化</span></button>
         <button class="nav-item" type="button" data-page="memory"><span class="nav-icon">◎</span><span>Memory</span></button>
         <button class="nav-item" type="button" data-page="database"><span class="nav-icon">▤</span><span>Database</span></button>
       </nav>
@@ -82,6 +83,37 @@
               <article data-stage="consolidation"><span class="pillar-icon blue">C</span><div><strong>Consolidation</strong><small>提炼事实与事件</small></div></article>
             </div>
           </div>
+        </section>
+      </section>
+
+      <section class="page" id="page-tasks" aria-labelledby="tasks-title" aria-hidden="true">
+        <header class="page-header">
+          <div><p class="eyebrow">Task system</p><h1 id="tasks-title">任务可视化</h1><p>集中查看任务状态、依赖关系和定时任务的下一次运行时间。</p></div>
+          <button class="task-refresh" id="task-refresh" type="button"><span>↻</span> 刷新数据</button>
+        </header>
+
+        <div class="task-metric-grid">
+          <article class="task-metric"><span class="task-metric-icon purple">Σ</span><div><small>全部任务</small><strong id="task-count-total">0</strong></div></article>
+          <article class="task-metric"><span class="task-metric-icon blue">▶</span><div><small>进行中</small><strong id="task-count-progress">0</strong></div></article>
+          <article class="task-metric"><span class="task-metric-icon amber">!</span><div><small>被阻塞</small><strong id="task-count-blocked">0</strong></div></article>
+          <article class="task-metric"><span class="task-metric-icon teal">✓</span><div><small>已完成</small><strong id="task-count-completed">0</strong></div></article>
+          <article class="task-metric"><span class="task-metric-icon purple">◷</span><div><small>定时任务</small><strong id="task-count-scheduled">0</strong></div></article>
+        </div>
+
+        <section class="task-board-panel">
+          <div class="panel-heading">
+            <div><h2>任务看板</h2><p id="task-progress-label">整体进度 0%</p></div>
+            <div class="task-progress-track" aria-hidden="true"><span id="task-progress-bar"></span></div>
+          </div>
+          <div class="task-board" id="task-board"></div>
+        </section>
+
+        <section class="scheduled-panel">
+          <div class="panel-heading">
+            <div><h2>定时任务</h2><p>展示 Cron 计划、运行方式与最近一次预计触发时间。</p></div>
+            <span class="event-chip" id="scheduled-count-label">0 schedules</span>
+          </div>
+          <div class="scheduled-list" id="scheduled-list"></div>
         </section>
       </section>
 

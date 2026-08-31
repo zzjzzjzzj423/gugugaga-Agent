@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 import gugugaga.config as config
 import gugugaga.hooks as hooks
 import gugugaga.subagents as subagents
-from gugugaga.provider import ProviderResponse, TextBlock
+from gugugaga.permissions import PermissionPolicy
+from gugugaga.provider import ProviderResponse, TextBlock, ToolUseBlock
 
 
 def test_hooks_run_in_registration_order_and_stop_on_first_result(monkeypatch):
@@ -79,3 +82,72 @@ def test_scripted_one_shot_subagent_returns_final_summary(monkeypatch):
     ]
     assert provider.requests[0]["model"] == "test-model"
     assert provider.requests[0]["tools"] == subagents.SUB_TOOLS
+
+
+def test_subagent_bash_uses_main_permission_policy(tmp_path, monkeypatch):
+    class ScriptedProvider:
+        def __init__(self):
+            self.responses = [
+                ProviderResponse(
+                    content=[
+                        ToolUseBlock(
+                            id="toolu_bash",
+                            name="bash",
+                            input={"command": "echo unsafe> subagent-marker.txt"},
+                        )
+                    ],
+                    stop_reason="tool_use",
+                ),
+                ProviderResponse(
+                    content=[TextBlock("The unsafe command was denied.")],
+                    stop_reason="end_turn",
+                ),
+            ]
+            self.requests = []
+
+        def create(self, messages, system, tools, max_tokens, model=None):
+            self.requests.append([dict(message) for message in messages])
+            return self.responses.pop(0)
+
+    provider = ScriptedProvider()
+    monkeypatch.setattr(config, "WORKDIR", tmp_path)
+    monkeypatch.setattr(subagents, "client", provider)
+    monkeypatch.setattr(subagents, "_permissions", PermissionPolicy())
+    monkeypatch.setattr(subagents, "_approval_callback", None)
+    monkeypatch.setattr(subagents, "_context_parent_resolver", None)
+
+    assert subagents.spawn_subagent("Run the command") == (
+        "The unsafe command was denied."
+    )
+    assert not (tmp_path / "subagent-marker.txt").exists()
+    assert provider.requests[1][-1]["content"] == [
+        {
+            "type": "tool_result",
+            "tool_use_id": "toolu_bash",
+            "content": (
+                "Permission denied for tool 'bash'. Choose a safer approach."
+            ),
+        }
+    ]
+
+
+def test_subagent_round_limit_is_an_explicit_failure(monkeypatch):
+    class ToolLoopProvider:
+        def create(self, messages, system, tools, max_tokens, model=None):
+            return ProviderResponse(
+                content=[
+                    ToolUseBlock(
+                        id=f"toolu_{len(messages)}",
+                        name="read_file",
+                        input={"path": "missing.txt"},
+                    )
+                ],
+                stop_reason="tool_use",
+            )
+
+    monkeypatch.setattr(subagents, "client", ToolLoopProvider())
+    monkeypatch.setattr(subagents, "_context_parent_resolver", None)
+    monkeypatch.setattr(subagents, "_max_rounds", 2)
+
+    with pytest.raises(RuntimeError, match=r"exceeded maximum rounds \(2\)"):
+        subagents.spawn_subagent("Never finish")

@@ -5,20 +5,21 @@ import random
 import re
 import threading
 import time
-import uuid
 from contextvars import copy_context
-from dataclasses import asdict, dataclass, field
-from pathlib import Path
-from typing import Any, Callable
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Callable
 
 from . import config
 from .hooks import trigger_hooks
 from .models import ToolCall
 from .observability import event_scope, notify, record_llm_call
 from .permissions import PermissionPolicy
-from .planning import Task, TaskStore
+from .provider import is_context_length_error
 from .tasks import can_start, claim_task, complete_task, list_tasks
 from .workspace import run_bash, run_read, run_write
+
+if TYPE_CHECKING:
+    from .context_modes import SessionContextCoordinator
 
 
 # S15-S17 source-compatible team communication. Paths are resolved from
@@ -135,19 +136,28 @@ def _create_protocol_request(
         return state
 
 
-def match_response(response_type: str, request_id: str, approve: bool):
+def match_response(
+    response_type: str,
+    request_id: str,
+    approve: bool,
+    *,
+    sender: str = "",
+    target: str = "",
+) -> bool:
     with _protocol_lock:
         state = pending_requests.get(request_id)
-        if not state:
-            return
-        if state.type == "shutdown" and response_type != "shutdown_response":
-            return
-        if (
-            state.type == "plan_approval"
-            and response_type != "plan_approval_response"
-        ):
-            return
+        if not state or state.status != "pending":
+            return False
+        expected_type = {
+            "shutdown": "shutdown_response",
+            "plan_approval": "plan_approval_response",
+        }.get(state.type)
+        if response_type != expected_type:
+            return False
+        if sender != state.target or target != state.sender:
+            return False
         state.status = "approved" if approve else "rejected"
+        return True
 
 
 def consume_lead_inbox(route_protocol: bool = True) -> list[dict]:
@@ -159,13 +169,18 @@ def consume_lead_inbox(route_protocol: bool = True) -> list[dict]:
             msg_type = msg.get("type", "")
             if request_id and msg_type.endswith("_response"):
                 match_response(
-                    msg_type, request_id, meta.get("approve", False)
+                    msg_type,
+                    request_id,
+                    meta.get("approve", False),
+                    sender=msg.get("from", ""),
+                    target=msg.get("to", ""),
                 )
     return msgs
 
 
 IDLE_POLL_INTERVAL = 5
 IDLE_TIMEOUT = 60
+PLAN_APPROVAL_TIMEOUT = 60
 
 
 def scan_unclaimed_tasks() -> list[dict]:
@@ -190,7 +205,8 @@ def idle_poll(
 ) -> str:
     del role
     stop_event = stop_event or threading.Event()
-    for _ in range(IDLE_TIMEOUT // IDLE_POLL_INTERVAL):
+    deadline = time.monotonic() + max(0.0, float(IDLE_TIMEOUT))
+    while time.monotonic() < deadline:
         if stop_event.is_set():
             return "shutdown"
         inbox = BUS.read_inbox(agent_name)
@@ -230,7 +246,8 @@ def idle_poll(
                     }
                 )
                 return "work"
-        if stop_event.wait(IDLE_POLL_INTERVAL):
+        remaining = max(0.0, deadline - time.monotonic())
+        if stop_event.wait(min(float(IDLE_POLL_INTERVAL), remaining)):
             return "shutdown"
     return "timeout"
 
@@ -238,41 +255,60 @@ def idle_poll(
 _team_provider: Any | None = None
 _team_permissions = PermissionPolicy()
 _team_approval_callback: Callable[[ToolCall], bool] | None = None
+_team_context_parent_resolver: Callable[[], SessionContextCoordinator] | None = None
+_team_max_tokens = config.DEFAULT_MAX_TOKENS
+_team_max_rounds_per_burst = 10
 
 
 def set_team_provider(
     provider: Any | None,
     permissions: PermissionPolicy | None = None,
     approval_callback: Callable[[ToolCall], bool] | None = None,
+    *,
+    context_parent_resolver: Callable[[], SessionContextCoordinator] | None = None,
+    max_tokens: int = config.DEFAULT_MAX_TOKENS,
+    max_rounds_per_burst: int = 10,
 ) -> None:
     global _team_provider, _team_permissions, _team_approval_callback
-    global _team_accepting
+    global _team_accepting, _team_context_parent_resolver
+    global _team_max_tokens, _team_max_rounds_per_burst
     _team_provider = provider
     _team_permissions = permissions or PermissionPolicy()
     _team_approval_callback = approval_callback
+    _team_context_parent_resolver = context_parent_resolver
+    _team_max_tokens = max(1, int(max_tokens))
+    _team_max_rounds_per_burst = max(1, int(max_rounds_per_burst))
     with _teammate_lock:
         _team_accepting = provider is not None
         if provider is not None and not _teammate_threads:
             _teammate_stop_event.clear()
 
 
-def _dispatch_teammate_tool(block, handlers: dict[str, Callable]) -> str:
+def _dispatch_teammate_tool(
+    block, handlers: dict[str, Callable]
+) -> tuple[str, str]:
     from .tools import call_tool_handler
 
     blocked = trigger_hooks("PreToolUse", block)
     if blocked:
-        return str(blocked)
+        return str(blocked), "blocked"
     call = ToolCall(block.id, block.name, block.input)
     if not _team_permissions.approve(call, _team_approval_callback):
         return (
             f"Permission denied for tool '{block.name}'. "
             "Choose a safer approach."
-        )
+        ), "denied"
     output = call_tool_handler(
         handlers.get(block.name), block.input, block.name
     )
     trigger_hooks("PostToolUse", block, output)
-    return str(output)
+    rendered = str(output)
+    status = (
+        "error"
+        if rendered.startswith(("Error:", "Unknown:"))
+        else "ok"
+    )
+    return rendered, status
 
 
 def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
@@ -291,7 +327,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
             _teammate_stop_event.clear()
         active_teammates[name] = True
 
-    protocol_ctx = {"waiting_plan": None}
+    protocol_ctx = {"waiting_plan": None, "waiting_since": None}
     system = (
         f"You are '{name}', a {role}. Use tools to complete tasks in the "
         f"shared selected workspace at {config.WORKDIR}."
@@ -312,8 +348,31 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
             return True
         if msg_type == "plan_approval_response":
             approve = meta.get("approve", False)
-            if request_id == protocol_ctx["waiting_plan"]:
-                protocol_ctx["waiting_plan"] = None
+            with _protocol_lock:
+                state = pending_requests.get(request_id)
+                valid = (
+                    request_id == protocol_ctx["waiting_plan"]
+                    and state is not None
+                    and state.type == "plan_approval"
+                    and state.sender == agent_name
+                    and state.target == "lead"
+                    and state.status
+                    == ("approved" if approve else "rejected")
+                    and msg.get("from") == "lead"
+                    and msg.get("to") == agent_name
+                )
+            if not valid:
+                notify(
+                    "teammate_protocol_error",
+                    {
+                        "name": agent_name,
+                        "request_id": request_id,
+                        "message_type": msg_type,
+                    },
+                )
+                return False
+            protocol_ctx["waiting_plan"] = None
+            protocol_ctx["waiting_since"] = None
             messages.append(
                 {
                     "role": "user",
@@ -327,6 +386,13 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
         return False
 
     def run():
+        from .context_modes import (
+            CompressionReason,
+            ContextModeError,
+            RequestContext,
+            create_child_context_coordinator,
+        )
+
         scope = event_scope(agent_type="teammate", agent_id=name)
         scope.__enter__()
         notify(
@@ -443,8 +509,18 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
             "submit_plan": lambda plan: _teammate_submit_plan(name, plan),
         }
 
+        coordinator = None
+        if _team_context_parent_resolver is not None:
+            coordinator = create_child_context_coordinator(
+                _team_context_parent_resolver(),
+                agent_type="teammate",
+                agent_id=name,
+            )
+        request_context = RequestContext(system=system, tools=sub_tools)
+        latest_summary = ""
         try:
             iteration = 0
+            attempted_recovery = False
             while not _teammate_stop_event.is_set():
                 if len(messages) <= 3:
                     messages.insert(
@@ -458,7 +534,9 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                         },
                     )
                 should_shutdown = False
-                for _ in range(10):
+                burst_complete = False
+                rounds_this_burst = 0
+                while rounds_this_burst < _team_max_rounds_per_burst:
                     if _teammate_stop_event.is_set():
                         should_shutdown = True
                         break
@@ -469,74 +547,133 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                             break
                     if should_shutdown:
                         break
+                    non_protocol = [
+                        msg for msg in inbox if msg.get("type") == "message"
+                    ]
+                    if non_protocol:
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "<inbox>"
+                                    + json.dumps(non_protocol)
+                                    + "</inbox>"
+                                ),
+                            }
+                        )
                     if protocol_ctx["waiting_plan"]:
-                        if _teammate_stop_event.wait(IDLE_POLL_INTERVAL):
-                            should_shutdown = True
-                            break
-                        continue
-                    if inbox:
-                        non_protocol = [
-                            msg
-                            for msg in inbox
-                            if msg.get("type") == "message"
-                        ]
-                        if non_protocol:
+                        waited = time.monotonic() - protocol_ctx["waiting_since"]
+                        if waited >= PLAN_APPROVAL_TIMEOUT:
+                            request_id = protocol_ctx["waiting_plan"]
+                            with _protocol_lock:
+                                state = pending_requests.get(request_id)
+                                if state is not None and state.status == "pending":
+                                    state.status = "expired"
+                            protocol_ctx["waiting_plan"] = None
+                            protocol_ctx["waiting_since"] = None
                             messages.append(
                                 {
                                     "role": "user",
                                     "content": (
-                                        "<inbox>"
-                                        + json.dumps(non_protocol)
-                                        + "</inbox>"
+                                        f"[Plan approval timed out: {request_id}] "
+                                        "Revise the plan or stop safely."
                                     ),
                                 }
                             )
+                        else:
+                            if _teammate_stop_event.wait(IDLE_POLL_INTERVAL):
+                                should_shutdown = True
+                                break
+                            continue
+
+                    if coordinator is not None:
+                        try:
+                            provider_messages = coordinator.prepare_request(
+                                messages, request_context
+                            )
+                        except ContextModeError:
+                            if attempted_recovery:
+                                raise
+                            provider_messages = coordinator.reactive_recover(
+                                messages,
+                                request_context,
+                                reason=CompressionReason.STRATEGY_FAILURE_RECOVERY,
+                            )
+                            attempted_recovery = True
+                    else:
+                        provider_messages = messages
+                    iteration += 1
+                    rounds_this_burst += 1
                     try:
-                        iteration += 1
                         response = record_llm_call(
                             _team_provider,
                             model=config.MODEL or None,
                             system=system,
-                            messages=messages[-20:],
+                            messages=provider_messages,
                             tools=sub_tools,
-                            max_tokens=8000,
+                            max_tokens=_team_max_tokens,
                             call_type="teammate",
                         )
-                    except Exception:
-                        break
+                    except Exception as error:
+                        if (
+                            coordinator is not None
+                            and is_context_length_error(error)
+                            and not attempted_recovery
+                        ):
+                            coordinator.reactive_recover(
+                                messages,
+                                request_context,
+                                reason=CompressionReason.PROVIDER_OVERFLOW,
+                            )
+                            attempted_recovery = True
+                            continue
+                        raise RuntimeError(
+                            f"Teammate provider failed: {type(error).__name__}: {error}"
+                        ) from error
                     if _teammate_stop_event.is_set():
                         should_shutdown = True
                         break
+                    if response.stop_reason == "max_tokens":
+                        raise RuntimeError(
+                            "Teammate response reached the output-token limit"
+                        )
                     messages.append(
                         {"role": "assistant", "content": response.content}
                     )
-                    if not any(
-                        getattr(block, "type", None) == "tool_use"
+                    tool_blocks = [
+                        block
                         for block in response.content
-                    ):
+                        if getattr(block, "type", None) == "tool_use"
+                    ]
+                    if not tool_blocks:
+                        latest_summary = "".join(
+                            getattr(block, "text", "")
+                            for block in response.content
+                            if getattr(block, "type", None) == "text"
+                        ).strip()
+                        if not latest_summary:
+                            raise RuntimeError(
+                                "Teammate finished without a text summary"
+                            )
+                        burst_complete = True
                         break
                     results = []
-                    for block in response.content:
-                        if getattr(block, "type", None) != "tool_use":
-                            continue
+                    plan_submitted = False
+                    for block in tool_blocks:
                         if _teammate_stop_event.is_set():
                             should_shutdown = True
                             break
                         tool_started = time.monotonic()
-                        output = _dispatch_teammate_tool(block, sub_handlers)
-                        notify(
-                            "tool",
-                            {
-                                "iteration": iteration,
-                                "tool": block.name,
-                                "args": block.input,
-                                "output": output,
-                                "status": "ok",
-                                "latency_ms": round(
-                                    (time.monotonic() - tool_started) * 1000
-                                ),
-                            },
-                        )
+                        if plan_submitted:
+                            output = (
+                                "Tool not executed because this tool group already "
+                                "submitted a plan for approval."
+                            )
+                            tool_status = "blocked"
+                        else:
+                            output, tool_status = _dispatch_teammate_tool(
+                                block, sub_handlers
+                            )
                         if block.name == "submit_plan" and output.startswith(
                             "Plan submitted ("
                         ):
@@ -544,6 +681,21 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                             protocol_ctx["waiting_plan"] = (
                                 match.group(1) if match else output
                             )
+                            protocol_ctx["waiting_since"] = time.monotonic()
+                            plan_submitted = True
+                        notify(
+                            "tool",
+                            {
+                                "iteration": iteration,
+                                "tool": block.name,
+                                "args": block.input,
+                                "output": output,
+                                "status": tool_status,
+                                "latency_ms": round(
+                                    (time.monotonic() - tool_started) * 1000
+                                ),
+                            },
+                        )
                         results.append(
                             {
                                 "type": "tool_result",
@@ -551,17 +703,21 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                                 "content": str(output),
                             }
                         )
-                        if protocol_ctx["waiting_plan"]:
-                            break
                     if should_shutdown:
                         break
                     messages.append({"role": "user", "content": results})
                     if protocol_ctx["waiting_plan"]:
+                        burst_complete = True
                         break
                 if should_shutdown:
                     break
                 if protocol_ctx["waiting_plan"]:
                     continue
+                if not burst_complete:
+                    raise RuntimeError(
+                        "Teammate exceeded maximum rounds "
+                        f"({_team_max_rounds_per_burst})"
+                    )
                 idle_result = idle_poll(
                     name,
                     messages,
@@ -572,21 +728,29 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                 if idle_result in ("shutdown", "timeout"):
                     break
 
-            summary = "Done."
-            for message in reversed(messages):
-                if message["role"] != "assistant" or not isinstance(
-                    message["content"], list
-                ):
-                    continue
-                for block in message["content"]:
-                    if getattr(block, "type", None) == "text":
-                        summary = block.text
-                        break
-                else:
-                    continue
-                break
-            BUS.send(name, "lead", summary, "result")
+            if latest_summary and not _teammate_stop_event.is_set():
+                BUS.send(name, "lead", latest_summary, "result")
+        except Exception as error:
+            notify(
+                "teammate_error",
+                {
+                    "name": name,
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                },
+            )
+            try:
+                BUS.send(
+                    name,
+                    "lead",
+                    f"Teammate '{name}' failed: {type(error).__name__}: {error}",
+                    "error",
+                )
+            except Exception:
+                pass
         finally:
+            if coordinator is not None:
+                coordinator.close()
             notify("teammate_end", {"name": name})
             scope.__exit__(None, None, None)
             with _teammate_lock:
@@ -678,6 +842,10 @@ def run_review_plan(
         state = pending_requests.get(request_id)
         if not state:
             return f"Request {request_id} not found"
+        if state.type != "plan_approval" or state.target != "lead":
+            return f"Request {request_id} is not a plan approval request"
+        if state.status != "pending":
+            return f"Request {request_id} is already {state.status}"
         state.status = "approved" if approve else "rejected"
     BUS.send(
         "lead",
@@ -719,251 +887,3 @@ def run_check_inbox() -> str:
             f"  [{message['from']}]{tag} {message['content'][:200]}"
         )
     return "\n".join(lines)
-
-
-class Mailbox:
-    def __init__(self, directory: Path):
-        self.directory = Path(directory)
-        self.directory.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.RLock()
-
-    def _path(self, name: str) -> Path:
-        return self.directory / f"{_validate_agent_name(name)}.jsonl"
-
-    def send(
-        self,
-        sender: str,
-        target: str,
-        content: str,
-        message_type: str = "message",
-        metadata: dict[str, Any] | None = None,
-    ) -> None:
-        message = {
-            "from": sender,
-            "to": target,
-            "content": content,
-            "type": message_type,
-            "metadata": metadata or {},
-            "timestamp": time.time(),
-        }
-        with self._lock, self._path(target).open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(message, ensure_ascii=False) + "\n")
-
-    def drain(self, name: str) -> list[dict[str, Any]]:
-        path = self._path(name)
-        with self._lock:
-            if not path.exists():
-                return []
-            items = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
-            path.write_text("", encoding="utf-8")
-            return items
-
-    def peek(self, name: str) -> bool:
-        path = self._path(name)
-        with self._lock:
-            return path.exists() and bool(path.read_text(encoding="utf-8").strip())
-
-
-class ProtocolError(RuntimeError):
-    pass
-
-
-@dataclass
-class ProtocolRequest:
-    id: str
-    type: str
-    sender: str
-    target: str
-    payload: str
-    status: str = "pending"
-    feedback: str = ""
-
-
-class ProtocolStore:
-    RESPONSE_TYPES = {
-        "plan_approval": "plan_approval_response",
-        "shutdown": "shutdown_response",
-        "permission": "permission_response",
-    }
-
-    def __init__(self):
-        self.requests: dict[str, ProtocolRequest] = {}
-        self._lock = threading.Lock()
-
-    def request(self, request_type: str, sender: str, target: str, payload: str) -> ProtocolRequest:
-        if request_type not in self.RESPONSE_TYPES:
-            raise ProtocolError(f"unknown protocol type: {request_type}")
-        item = ProtocolRequest(f"req_{uuid.uuid4().hex[:10]}", request_type, sender, target, payload)
-        with self._lock:
-            self.requests[item.id] = item
-        return item
-
-    def resolve(self, request_id: str, response_type: str, approve: bool, feedback: str = "") -> ProtocolRequest:
-        with self._lock:
-            item = self.requests.get(request_id)
-            if item is None:
-                raise ProtocolError(f"unknown request: {request_id}")
-            expected = self.RESPONSE_TYPES[item.type]
-            if response_type != expected:
-                raise ProtocolError(f"expected {expected}, got {response_type}")
-            item.status = "approved" if approve else "rejected"
-            item.feedback = feedback
-            return item
-
-    def get(self, request_id: str) -> ProtocolRequest:
-        return self.requests[request_id]
-
-
-class TeamManager:
-    def __init__(
-        self,
-        mailbox: Mailbox,
-        tasks: TaskStore,
-        protocols: ProtocolStore,
-        runtime_factory: Callable[[str, str], Any],
-        poll_seconds: float = 1.0,
-        idle_timeout: float = 30.0,
-    ):
-        self.mailbox = mailbox
-        self.tasks = tasks
-        self.protocols = protocols
-        self.runtime_factory = runtime_factory
-        self.poll_seconds = poll_seconds
-        self.idle_timeout = idle_timeout
-        self.members: dict[str, dict[str, Any]] = {}
-        self._lock = threading.RLock()
-
-    def claim_next(self, name: str) -> Task | None:
-        for task in self.tasks.list():
-            if task.status == "pending" and not task.owner and self.tasks.can_start(task):
-                if self.tasks.claim(task.id, name).startswith("Claimed"):
-                    return self.tasks.get(task.id)
-        return None
-
-    def spawn(self, name: str, role: str, prompt: str) -> str:
-        with self._lock:
-            if name in self.members and self.members[name]["status"] != "stopped":
-                return f"Error: teammate '{name}' already exists"
-            self.members[name] = {"role": role, "status": "working", "stop": threading.Event()}
-
-        def run():
-            runtime = self.runtime_factory(name, role)
-            try:
-                result = runtime.run_turn(prompt)
-                self.mailbox.send(name, "lead", result, "result")
-                idle_started = time.time()
-                while not self.members[name]["stop"].is_set() and time.time() - idle_started < self.idle_timeout:
-                    inbox = self.mailbox.drain(name)
-                    if inbox:
-                        idle_started = time.time()
-                    should_stop = False
-                    for message in inbox:
-                        kind = message.get("type", "message")
-                        if kind == "shutdown_request":
-                            request_id = message.get("metadata", {}).get("request_id", "")
-                            self.protocols.resolve(request_id, "shutdown_response", True)
-                            self.mailbox.send(name, "lead", "Shutdown approved", "shutdown_response", {"request_id": request_id, "approve": True})
-                            should_stop = True
-                            break
-                        if kind == "request_plan":
-                            plan = runtime.run_turn(f"Create a concise plan for: {message['content']}")
-                            request = self.protocols.request("plan_approval", name, "lead", plan)
-                            self.mailbox.send(name, "lead", plan, "plan_approval_request", {"request_id": request.id})
-                        elif kind == "permission_response":
-                            continue
-                        else:
-                            answer = runtime.run_turn(message["content"])
-                            self.mailbox.send(name, "lead", answer, "message")
-                    if should_stop:
-                        break
-                    task = self.claim_next(name)
-                    if task:
-                        idle_started = time.time()
-                        answer = runtime.run_turn(f"Complete task {task.id}: {task.subject}\n{task.description}")
-                        self.mailbox.send(name, "lead", answer, "task_result", {"task_id": task.id})
-                    with self._lock:
-                        self.members[name]["status"] = "idle"
-                    time.sleep(self.poll_seconds)
-            finally:
-                with self._lock:
-                    self.members[name]["status"] = "stopped"
-
-        thread = threading.Thread(target=run, name=f"teammate-{name}", daemon=True)
-        self.members[name]["thread"] = thread
-        thread.start()
-        return f"Spawned teammate '{name}' as {role}"
-
-    def send(self, target: str, content: str) -> str:
-        self.mailbox.send("lead", target, content)
-        return f"Sent message to {target}"
-
-    def check_inbox(self) -> list[dict[str, Any]]:
-        return self.mailbox.drain("lead")
-
-    def request_shutdown(self, teammate: str) -> str:
-        request = self.protocols.request("shutdown", "lead", teammate, "Graceful shutdown")
-        self.mailbox.send("lead", teammate, request.payload, "shutdown_request", {"request_id": request.id})
-        return request.id
-
-    def request_plan(self, teammate: str, task: str) -> str:
-        self.mailbox.send("lead", teammate, task, "request_plan")
-        return f"Requested plan from {teammate}"
-
-    def request_permission(self, teammate: str, call: ToolCall) -> str:
-        payload = json.dumps(
-            {"tool": call.name, "arguments": call.arguments}, ensure_ascii=False
-        )
-        request = self.protocols.request("permission", teammate, "lead", payload)
-        self.mailbox.send(
-            teammate,
-            "lead",
-            payload,
-            "permission_request",
-            {"request_id": request.id, "tool_call_id": call.id},
-        )
-        return request.id
-
-    def await_permission(
-        self, teammate: str, call: ToolCall, timeout: float = 60.0
-    ) -> bool:
-        request_id = self.request_permission(teammate, call)
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            status = self.protocols.get(request_id).status
-            if status == "approved":
-                return True
-            if status == "rejected":
-                return False
-            time.sleep(min(self.poll_seconds, 0.1))
-        return False
-
-    def review_permission(
-        self, request_id: str, approve: bool, feedback: str = ""
-    ) -> str:
-        request = self.protocols.resolve(
-            request_id, "permission_response", approve, feedback
-        )
-        self.mailbox.send(
-            "lead",
-            request.sender,
-            feedback or request.status,
-            "permission_response",
-            {"request_id": request.id, "approve": approve},
-        )
-        return f"Permission {request.status}: {request.id}"
-
-    def review_plan(self, request_id: str, approve: bool, feedback: str = "") -> str:
-        request = self.protocols.resolve(request_id, "plan_approval_response", approve, feedback)
-        self.mailbox.send("lead", request.sender, feedback or request.status, "plan_approval_response", {"request_id": request.id, "approve": approve})
-        return f"Plan {request.status}: {request.id}"
-
-    def status(self) -> str:
-        with self._lock:
-            if not self.members:
-                return "No teammates."
-            return "\n".join(f"{name} ({item['role']}): {item['status']}" for name, item in sorted(self.members.items()))
-
-    def stop_all(self) -> None:
-        with self._lock:
-            for item in self.members.values():
-                item["stop"].set()
