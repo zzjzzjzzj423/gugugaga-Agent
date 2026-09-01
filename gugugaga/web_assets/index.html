@@ -215,7 +215,41 @@
       <form id="chat-form" class="composer">
         <label for="chat-input" class="sr-only">发送给 gugugaga</label>
         <textarea id="chat-input" rows="3" placeholder="Message gugugaga…" maxlength="20000"></textarea>
-        <div class="composer-footer"><span>Enter 发送 · Shift+Enter 换行</span><button id="send-button" type="submit" aria-label="发送消息">↑</button></div>
+        <div class="busy-interaction-control" id="busy-interaction-control" hidden>
+          <label for="chat-interaction-action">运行中干预</label>
+          <select id="chat-interaction-action">
+            <option value="steer">Steer · 追加要求</option>
+            <option value="queue">Queue · 后续任务</option>
+            <option value="redirect">Redirect · 修正方向</option>
+          </select>
+        </div>
+        <div class="composer-footer"><span id="composer-hint">Enter 发送 · Shift+Enter 换行</span><button id="send-button" type="submit" aria-label="发送消息">↑</button></div>
+      </form>
+    </aside>
+  </div>
+
+  <div class="team-detail-backdrop" id="team-detail-backdrop" hidden>
+    <aside class="team-detail-drawer" role="dialog" aria-modal="true" aria-labelledby="team-detail-title">
+      <header class="team-detail-heading">
+        <div><p class="eyebrow">Team Agent inspector</p><h2 id="team-detail-title">Team Agent</h2><p id="team-detail-meta">加载中…</p></div>
+        <button id="team-detail-close" type="button" aria-label="关闭 Team Agent 详情">×</button>
+      </header>
+      <div class="team-detail-content">
+        <section class="team-detail-summary">
+          <div><small>当前阶段</small><strong id="team-detail-phase">—</strong></div>
+          <div><small>当前任务</small><strong id="team-detail-task">—</strong></div>
+          <p id="team-detail-disclosure">展示可审计的工作摘要，不展示模型隐藏思维链。</p>
+        </section>
+        <section class="team-detail-section"><h3>工作思路摘要</h3><div id="team-detail-activity" class="team-detail-activity"></div></section>
+        <section class="team-detail-section"><h3>排队任务</h3><div id="team-detail-queue" class="team-detail-list"></div></section>
+        <section class="team-detail-section"><h3>活动时间线</h3><div id="team-detail-timeline" class="team-detail-timeline"></div></section>
+        <section class="team-detail-section"><h3>用户干预</h3><div id="team-detail-interactions" class="team-detail-list"></div></section>
+      </div>
+      <form id="team-interaction-form" class="team-interaction-form">
+        <label for="team-interaction-content">明确选择动作后发送给当前 Team Agent</label>
+        <div><select id="team-interaction-action"><option value="steer">Steer · 追加要求</option><option value="queue">Queue · 新任务</option><option value="redirect">Redirect · 修正方向</option></select><textarea id="team-interaction-content" rows="3" maxlength="20000" placeholder="输入追加要求、独立任务或方向修正…"></textarea></div>
+        <p id="team-interaction-result" aria-live="polite"></p>
+        <footer><button class="danger" id="team-detail-delete" type="button">删除 Agent</button><button id="team-detail-lifecycle" type="button">关闭 Agent</button><button class="primary" id="team-interaction-submit" type="submit">发送干预</button></footer>
       </form>
     </aside>
   </div>

@@ -34,6 +34,7 @@ from .context_modes import (
 from .cron import consume_cron_queue
 from .hooks import HookEvent, HookManager
 from .hooks import trigger_hooks
+from .interactions import AgentInteraction, interaction_broker
 from .models import ChatProvider, ToolCall, ToolSpec
 from .memory import MemoryService
 from .observability import (
@@ -188,7 +189,34 @@ class SourceRuntime:
 
     def run_turn(self, query: str, *, source: str = "cli") -> str:
         with self._lead_turn_lock:
-            return self._run_turn_locked(query, source=source)
+            broker = interaction_broker(self.context_coordinator.workspace)
+            broker.clear_cancel("main")
+            broker.set_phase("main", "llm_running", summary="正在接收并分析用户任务")
+            replies: list[str] = []
+            try:
+                replies.append(self._run_turn_locked(query, source=source))
+                while True:
+                    queued = broker.consume("main", {"queue"})
+                    if not queued:
+                        break
+                    item = queued[0]
+                    try:
+                        value = self._run_turn_locked(
+                            item.content,
+                            source="user_queue",
+                        )
+                    except BaseException as error:
+                        broker.update(
+                            item.id,
+                            "failed",
+                            metadata={"error": f"{type(error).__name__}: {error}"},
+                        )
+                        raise
+                    broker.update(item.id, "completed")
+                    replies.append(value)
+                return "\n\n".join(value for value in replies if value)
+            finally:
+                broker.set_phase("main", "idle", summary="等待用户输入")
 
     def run_pending_lead_inbox(
         self, *, source: str = "team_inbox"
@@ -200,12 +228,17 @@ class SourceRuntime:
         if not self._lead_turn_lock.acquire(blocking=False):
             return None
         try:
+            broker = interaction_broker(self.context_coordinator.workspace)
+            broker.set_phase("main", "llm_running", summary="正在处理 Team Agent 消息")
             batch = claim_lead_inbox(route_protocol=True)
             if not batch.messages:
                 ack_lead_inbox(batch)
                 return None
             return self._run_turn_locked("", source=source, inbox_batch=batch)
         finally:
+            interaction_broker(self.context_coordinator.workspace).set_phase(
+                "main", "idle", summary="等待用户输入"
+            )
             self._lead_turn_lock.release()
 
     def _run_turn_locked(
@@ -234,6 +267,11 @@ class SourceRuntime:
             session_id=self.context_coordinator.session_id,
             user_message=submitted,
             source=source,
+            # The rendered Team inbox is private model context. When a user
+            # message shares this turn, only that message belongs in visible
+            # chat history. Inbox-only rows remain recoverable internally and
+            # are filtered by the dashboard history reader.
+            history_user_message=query or inbox_prompt,
         )
         try:
             with turn:
@@ -404,7 +442,7 @@ def _summary_callback(provider: ChatProvider):
 
 
 def _workspace_handlers(
-    handlers: dict[str, Callable], workspace
+    handlers: dict[str, Callable], workspace, cancel_event: threading.Event | None = None
 ) -> dict[str, Callable]:
     bound = dict(handlers)
     for name in ("bash", "read_file", "write_file", "edit_file", "glob"):
@@ -412,7 +450,9 @@ def _workspace_handlers(
         if handler is None:
             continue
 
-        def run_in_workspace(_handler=handler, **arguments):
+        def run_in_workspace(_handler=handler, _name=name, **arguments):
+            if _name in {"bash", "write_file", "edit_file"}:
+                arguments.setdefault("cancel_event", cancel_event)
             return _handler(cwd=workspace, **arguments)
 
         bound[name] = run_in_workspace
@@ -423,6 +463,40 @@ def _observable_tool_args(name: str, arguments: Any) -> Any:
     if name == "save_note":
         return {"subject": "[REDACTED]", "content": "[REDACTED]"}
     return arguments
+
+
+def _inject_runtime_interactions(
+    messages: list[dict[str, Any]],
+    *,
+    target: str,
+    actions: set[str],
+    broker=None,
+) -> list[AgentInteraction]:
+    broker = broker or interaction_broker()
+    values = broker.consume(target, actions)
+    for item in values:
+        label = "追加要求" if item.action == "steer" else "方向修正"
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    f"<user-{item.action} id=\"{item.id}\">"
+                    f"{label}：{item.content}"
+                    f"</user-{item.action}>"
+                ),
+            }
+        )
+        broker.update(item.id, "injected")
+        notify(
+            "agent_activity",
+            {
+                "target": target,
+                "phase": "interaction",
+                "summary": f"已应用用户 {item.action}：{item.content}",
+                "interaction_id": item.id,
+            },
+        )
+    return values
 
 
 def call_llm(
@@ -491,8 +565,11 @@ def agent_loop(
             transcripts_dir=config.TRANSCRIPT_DIR,
         )
         memory_state["context_coordinator"] = context_coordinator
+    interaction_target = "main"
+    broker = interaction_broker(context_coordinator.workspace)
+    cancel_event = broker.cancel_event(interaction_target)
     handlers = _workspace_handlers(
-        handlers, context_coordinator.workspace
+        handlers, context_coordinator.workspace, cancel_event
     )
     memory_store = (
         MemoryStore(context_coordinator.memory_dir, provider=client)
@@ -502,6 +579,27 @@ def agent_loop(
 
     iteration = 0
     while True:
+        if cancel_event.is_set():
+            for item in broker.consume(interaction_target, {"stop"}):
+                broker.update(item.id, "completed")
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "[STOPPED] 当前任务已被用户强制停止。",
+                        }
+                    ],
+                }
+            )
+            broker.set_phase(
+                interaction_target,
+                "stopped",
+                summary="当前任务已被用户强制停止",
+            )
+            cancel_turn_subagents(turn_id)
+            return
         iteration += 1
         fired = consume_cron_queue()
         for job in fired:
@@ -531,6 +629,13 @@ def agent_loop(
                 }
             )
             rounds_since_todo = 0
+
+        _inject_runtime_interactions(
+            messages,
+            target=interaction_target,
+            actions={"redirect", "steer"},
+            broker=broker,
+        )
 
         context_coordinator.observe_history(messages)
         context = update_context(
@@ -578,6 +683,11 @@ def agent_loop(
                 return
 
         try:
+            broker.set_phase(
+                interaction_target,
+                "llm_running",
+                summary="正在分析上下文并规划下一步",
+            )
             with event_scope(iteration=iteration):
                 response = call_llm(
                     provider_messages,
@@ -635,6 +745,25 @@ def agent_loop(
             )
             cancel_turn_subagents(turn_id)
             return
+
+        if cancel_event.is_set():
+            continue
+        if broker.pending(interaction_target, "redirect"):
+            notify(
+                "agent_activity",
+                {
+                    "target": interaction_target,
+                    "phase": "redirecting",
+                    "summary": "已丢弃过时模型响应，正在应用用户修正",
+                },
+            )
+            _inject_runtime_interactions(
+                messages,
+                target=interaction_target,
+                actions={"redirect"},
+                broker=broker,
+            )
+            continue
 
         if response.stop_reason == "max_tokens":
             if not state.has_escalated:
@@ -722,6 +851,24 @@ def agent_loop(
                 )
                 continue
             messages.append({"role": "assistant", "content": response.content})
+            if broker.pending(interaction_target, "steer", "redirect"):
+                broker.set_phase(
+                    interaction_target,
+                    "finalizing",
+                    summary="已形成阶段性回答，正在接收用户追加要求",
+                )
+                _inject_runtime_interactions(
+                    messages,
+                    target=interaction_target,
+                    actions={"redirect", "steer"},
+                    broker=broker,
+                )
+                continue
+            broker.set_phase(
+                interaction_target,
+                "finalizing",
+                summary="正在整理并返回最终回答",
+            )
             trigger_hooks("Stop", messages)
             if memory_service is None:
                 pending_turns = memory_state.setdefault("pending_turns", [])
@@ -739,9 +886,15 @@ def agent_loop(
 
         messages.append({"role": "assistant", "content": response.content})
         results = []
-        for block in response.content:
-            if block.type != "tool_use":
-                continue
+        tool_blocks = [
+            block for block in response.content if block.type == "tool_use"
+        ]
+        for block_index, block in enumerate(tool_blocks):
+            broker.set_phase(
+                interaction_target,
+                "tool_running",
+                summary=f"正在执行工具 {block.name}",
+            )
             print(f"\033[36m> {block.name}\033[0m")
             tool_started = time.monotonic()
 
@@ -768,6 +921,23 @@ def agent_loop(
                         ),
                     },
                 )
+                if cancel_event.is_set() or broker.pending(
+                    interaction_target, "redirect"
+                ):
+                    reason = (
+                        "the user stopped the active turn"
+                        if cancel_event.is_set()
+                        else "the user redirected the active turn"
+                    )
+                    for skipped in tool_blocks[block_index + 1 :]:
+                        results.append(
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": skipped.id,
+                                "content": f"Tool not executed because {reason}.",
+                            }
+                        )
+                    break
                 continue
 
             call = ToolCall(block.id, block.name, block.input)
@@ -796,6 +966,23 @@ def agent_loop(
                         ),
                     },
                 )
+                if cancel_event.is_set() or broker.pending(
+                    interaction_target, "redirect"
+                ):
+                    reason = (
+                        "the user stopped the active turn"
+                        if cancel_event.is_set()
+                        else "the user redirected the active turn"
+                    )
+                    for skipped in tool_blocks[block_index + 1 :]:
+                        results.append(
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": skipped.id,
+                                "content": f"Tool not executed because {reason}.",
+                            }
+                        )
+                    break
                 continue
 
             if should_run_background(block.name, block.input):
@@ -824,6 +1011,23 @@ def agent_loop(
                         ),
                     },
                 )
+                if cancel_event.is_set() or broker.pending(
+                    interaction_target, "redirect"
+                ):
+                    reason = (
+                        "the user stopped the active turn"
+                        if cancel_event.is_set()
+                        else "the user redirected the active turn"
+                    )
+                    for skipped in tool_blocks[block_index + 1 :]:
+                        results.append(
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": skipped.id,
+                                "content": f"Tool not executed because {reason}.",
+                            }
+                        )
+                    break
                 continue
 
             handler = handlers.get(block.name)
@@ -888,10 +1092,36 @@ def agent_loop(
                     ),
                 },
             )
+            if cancel_event.is_set() or broker.pending(
+                interaction_target, "redirect"
+            ):
+                reason = (
+                    "the user stopped the active turn"
+                    if cancel_event.is_set()
+                    else "the user redirected the active turn"
+                )
+                for skipped in tool_blocks[block_index + 1 :]:
+                    results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": skipped.id,
+                            "content": f"Tool not executed because {reason}.",
+                        }
+                    )
+                break
 
         messages.append(
             {"role": "user", "content": build_user_content(results)}
         )
+        if cancel_event.is_set():
+            continue
+        if broker.pending(interaction_target, "redirect", "steer"):
+            _inject_runtime_interactions(
+                messages,
+                target=interaction_target,
+                actions={"redirect", "steer"},
+                broker=broker,
+            )
 
 
 class AgentRuntime:

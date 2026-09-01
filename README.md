@@ -1,185 +1,257 @@
 # gugugaga
 
-gugugaga 是一个面向单用户、本地工作空间的 Agent Runtime 原型。项目基于 `learn-claude-code` S20 综合示例拆分和扩展，通过 SiliconFlow 的 OpenAI 兼容接口调用模型，并提供 CLI、Web Console、长期记忆、可替换上下文压缩和工具执行能力。
+gugugaga 是一个面向单用户、本地 Workspace 的 Agent Runtime。它将主 Agent、Task System、Team Agent、Subagent、长期记忆、上下文压缩、工具执行和本地 Web Console 放在同一个可观察、可恢复的运行环境中。
 
-项目当前重点不是堆叠更多功能，而是把一个 Agent Turn 中的输入、记忆检索、上下文构建、压缩判断、LLM 推理、工具调用、回复和记忆沉淀完整串联起来，并让整个过程可以观察、持久化和调试。
+当前项目的核心目标不是简单增加工具数量，而是建立一套清晰的协作语义：用户知道谁在工作、任务由谁负责、消息是否送达、运行中如何干预，以及失败后系统如何恢复。
 
 > [!IMPORTANT]
-> gugugaga 目前仍是开发中的实验性项目，不是生产级 Agent 平台。核心 Agent Loop、Web Console、Memory、上下文压缩和基础工具已有测试覆盖；Task System、后台任务、定时任务、Subagent 和 Team Agent 虽然已有实现，但尚未完成系统性的并发、恢复、故障注入和长时间运行测试。
+> 项目仍处于开发阶段，适合本地实验和架构验证，不应直接作为多租户服务或暴露到公网。
 
-## 当前状态
+## 当前能力
 
 | 模块 | 状态 | 说明 |
 |---|---|---|
-| Agent Loop | 可用 | 支持模型调用、工具执行、结果回填和多轮循环 |
-| Web Console | 可用 | 提供 Overview、Memory、Database 和 Chat |
-| 会话系统 | 可用 | 支持新对话、历史记录、查看旧对话和从旧对话继续 |
-| Context Modes | 可用 | 支持 CC、Hermes、Pi，会话开始后锁定模式 |
-| Memory | 可用 | 支持程序性、语义和情景记忆，以及显式保存和隐式整合 |
-| Tavily Web Search | 可用 | 配置 `TAVILY_API_KEY` 后向 Agent 注册 `web_search` |
-| Task System | 实验性 | 已有持久化 Task DAG 和任务认领，需要继续做健壮性测试 |
-| 后台任务 | 实验性 | 已有后台执行与结果收集，需要完善取消、超时和退出恢复 |
-| 定时任务 | 实验性 | 已有 Cron 调度，需要完善时区、去重、错过执行和重启恢复 |
-| Subagent | 实验性 | 已有 Turn 内结构化并发、权限审批、取消、超时和失败传播 |
-| Team Agent | 实验性 | 已有 Teammate、Mailbox 确认消费、协议持久化和原子任务状态，仍需要长时间故障注入 |
-| 钉钉 / 飞书 | 规划中 | 计划通过官方机器人接口接收和回复消息 |
-| 语音 | 规划中 | 计划增加语音输入、转写和语音回复能力 |
-| LLM-as-a-Judge | 规划中 | 计划作为最终质量评测与回归门禁 |
+| 主 Agent | 可用 | 多轮 Tool Calling、权限控制、会话恢复和运行事件记录 |
+| Web Console | 可用 | Overview、任务看板、Memory、Database、历史对话和本地配置 |
+| Task System | 可用 | 持久化任务、依赖、手动分配、自动领取、队列和安全删除 |
+| Team Agent | 可用 | 多成员并行、每个 Agent 同时一个任务、停止、重启、删除和工作详情 |
+| Lead Mailbox | 可用 | claim/ack/nack、遗留 inflight 恢复、dead-letter 和未读唤醒 |
+| Subagent | 可用 | Turn 内并发、权限审批、取消、超时、当前 Turn 事件和历史摘要 |
+| 用户干预 | 可用 | 对主 Agent 和 Team Agent 使用 `steer`、`queue`、`redirect`、`stop` |
+| Context Modes | 可用 | CC、Hermes、Pi；每个会话创建时选择并锁定 |
+| Memory | 可用 | 显式事实、后台整合、语义记忆、情景记忆、审计、更新和遗忘 |
+| Web Search | 可选 | 配置 Tavily 后注册 `web_search` |
 
-## 核心流程
+完整测试基线：`264 passed`。
+
+## 运行模型
 
 ```mermaid
 flowchart LR
-    U[CLI / Web / Future Channels] --> I[Input]
-    I --> R{Retrieval Gate}
-    R --> M[Memory Recall]
+    U[User / Web / CLI] --> L[Lead Agent]
+    L --> R{Retrieval Gate}
+    R --> M[(Long-term Memory)]
     R --> C[Working Context]
     M --> C
-    C --> G{Compression Gate}
-    G -->|Skip| A[LLM Agent]
-    G -->|Commit| X[CC / Hermes / Pi]
-    X --> A
-    A -->|Tool Call| T[Tools]
-    T -->|Tool Result| A
+    C --> X{Compression Gate}
+    X -->|CC / Hermes / Pi| A[LLM Agent Loop]
+    A <--> T[Tools]
     A --> O[Reply]
-    O --> L[(Chat Log)]
-    L --> N[Memory Consolidation]
-    N --> S[(Semantic Memory)]
-    N --> E[(Episodic Memory)]
+    O --> H[(Chat Log)]
+    H --> K[Memory Consolidation]
+
+    L --> TS[(Task System)]
+    TS --> TA[Team Agents]
+    TA --> MB[(Lead Mailbox)]
+    MB --> L
+    L --> SA[Turn-scoped Subagents]
 ```
 
-模型请求统一经过 `SiliconFlowProvider.create()`。主 Agent、上下文摘要、Memory Consolidation、Subagent 和 Team Teammate 使用相同的消息与工具协议边界。
+主 Agent 在 Team System 中同时承担 Lead 角色，协议 ID 固定为 `lead`。`Lead`、`Leader` 和 `main` 都会在通信层规范化为同一个收件人，不会被当成普通 Team Agent。
 
-## 功能概览
+## Web Console
 
-### Web Console
+Web Console 是推荐入口，主要页面包括：
 
-Web Console 是当前推荐的使用入口：
+- **Agent Overview**：只展示主 Agent 当前 Turn 的输入、检索、压缩、LLM、Tools 和回复阶段。Team Agent 和 Subagent 不会点亮主 Agent 流程图。
+- **任务可视化**：展示任务状态、依赖、负责人、Team 自动领取开关、Team Agent 卡片和 Subagent 状态。
+- **Team Agent 详情**：查看当前任务、活动摘要、工具事件、干预队列和历史工作记录。
+- **Memory**：查看 Procedural、Semantic 和 Episodic Memory，并执行搜索、更新和遗忘。
+- **Database**：只读浏览本地 SQLite 表、字段、索引和记录。
+- **Chat**：创建会话、查看历史、恢复旧会话并选择上下文压缩模式。
+- **Settings**：配置主模型、Memory Consolidation 模型、SiliconFlow Key 和 Tavily Key。
 
-- **Overview**：实时显示一次 Turn 的输入、检索、上下文、压缩、LLM、Tools、回复和 Memory Consolidation。
-- **Memory**：查看 Procedural、Semantic 和 Episodic 三类记忆。
-- **Database**：只读浏览 `.gugugaga/state.db` 的表、字段、记录和索引。
-- **Chat**：与同进程 Agent 对话，创建新会话、查看历史会话并从旧会话恢复。
-- **Settings**：在前端配置主模型、Memory Consolidation 小模型、SiliconFlow API Key 和 Tavily API Key。
+Web Console 使用本地 HTTP Server，不依赖前端构建步骤。
 
-桌面端采用全屏三栏布局，左侧为导航，中间为运行状态或数据页面，右侧为固定聊天区域。每个区域独立滚动，页面切换保留各自位置。
+### 界面导览
 
-### Context Modes
+以下截图来自本地 Web Console。任务、成员、模型名称和统计数字只是示例，实际内容来自启动时指定的 Workspace。
 
-每个新会话可以选择一种上下文压缩方式：
+#### 1. Agent Overview：观察主 Agent 的一次 Turn
 
-- `cc`：分层处理大型工具结果、旧工具结果和消息中段，必要时生成摘要。
-- `hermes`：保留会话开头和近期尾部，对中间历史进行递进摘要。
-- `pi`：按近期 Token 预算寻找工具协议安全的切点，并追加 `CompactionEntry`。
+![Agent Overview](docs/images/agent-overview.png)
 
-压缩方式只能在空白对话开始前选择。首条消息进入后，该会话的模式会被锁定。
+Agent Overview 用于观察主 Agent，而不是整个 Agent Team 的混合状态：
 
-### Memory
+- 顶部指标显示当前 Turn、最近响应耗时、记忆命中数和上下文占用比例；
+- Runtime Graph 按顺序展示输入、Retrieval Gate、记忆注入、Working Context、Compression Gate、LLM、Tools 和回复；
+- 当前执行阶段使用高亮显示，跳过压缩等分支会保留明确状态；
+- 下方区分 Procedural、Semantic、Episodic 和 Consolidation，展示记忆检索与后台沉淀过程；
+- Team Agent 和 Subagent 有独立的可视化区域，不会点亮这里的主 Agent 流程图。
 
-gugugaga 将长期记忆分成三类：
+#### 2. Task System：创建、分配和跟踪工作
 
-- **Procedural Memory**：Skills、行为规则和 Agent 的“做事方式”。
-- **Semantic Memory**：长期有效的用户事实、偏好和稳定知识。
-- **Episodic Memory**：已经完成的重要事件、决定和里程碑摘要。
+![Task System](docs/images/task-system.png)
 
-记忆有两条写入通道：
+任务页面将对话和工作调度放在同一个界面中：
 
-1. 用户明确要求“记住”时，Agent 可以调用 `save_note` 立即保存语义事实。
-2. 完整 Exchange 写入 `chat_log` 后，系统默认每累计 6 个待处理 Exchange 触发一次后台 Memory Consolidation。
+- 顶部统计全部、进行中、被阻塞、已完成和定时任务；
+- Workspace 的“Team 自动领取”开关决定由空闲成员自动领取，还是由用户手动分配；
+- 看板按待处理、进行中和已完成分栏，任务卡片展示描述、依赖、负责人和更新时间；
+- 手动模式下，用户在待处理卡片中选择在线且空闲的 Team Agent，再点击“指派”；
+- 运行中的任务禁止删除，被其他任务依赖的任务也不能删除；
+- 右侧 Chat 可以让 Lead 创建任务、解释依赖和汇总结果，但不会绕过用户选择的分配模式。
 
-Memory Consolidation 不保证每次都会生成记忆。临时问题、普通问答、调试状态、低重要度信息和进行中的计划应被过滤，不进入 Semantic 或 Episodic Memory。
+#### 3. Team Agent、Subagent 与定时任务
 
-### Tools
+![Team Agent、Subagent 与定时任务](docs/images/team-subagents-cron.png)
 
-当前主 Agent 可以使用的工具包括：
+任务页下半部分展示三种不同生命周期的执行单元：
 
-- `bash`
-- `read_file`
-- `write_file`
-- `edit_file`
-- `glob`
-- `todo_write`
-- `spawn_subagent`
-- `check_subagent`
-- `wait_subagents`
-- `cancel_subagent`
-- `review_subagent_permission`
-- `load_skill`
-- `compact`
-- `web_search`
-- Task、Cron 和 Team 相关工具
+- **Team Agents**：长期在线成员。卡片展示名称、角色、运行状态和当前任务；用户可以关闭、重启或删除符合条件的成员；
+- 点击 Team Agent 卡片可以打开工作详情，查看当前任务、活动摘要、工具事件、历史记录和用户干预；
+- **Subagents**：只属于主 Agent 当前 Turn。当前 Turn 展示完整活动事件，历史 Turn 只保留摘要；
+- **定时任务**：展示 Cron 计划、运行方式和预计触发时间，与普通 Task 状态分开管理；
+- 在线人数只统计正在运行的 Team Agent，stopped 成员仍保留角色和 Prompt，可由用户重新启动。
 
-文件工具限制在选定的 workspace 内，并统一使用 UTF-8。`bash` 能力更强，需要由权限 Hook 和运行环境共同约束。
+## Task System 与 Team Agent
 
-Subagent 在主 Agent 当前 Turn 内异步运行，默认最多同时执行 4 个。主 Agent
-可以继续处理独立工作或等待结果，但所有 Subagent 进入 `completed`、`failed`、
-`cancelled` 或 `timed_out` 前，本 Turn 不能结束。Subagent 可直接读取、搜索和分析；
-`bash`、写入和编辑会进入 `waiting_permission`，由主 Agent 针对准确的请求 ID、
-工具及参数审批。终态结果被主 Agent 消费后，Subagent Job 会从活动表自动移除。
+### Task 分配
 
-主 Agent、Subagent、Team Agent 和后台任务共享 workspace 写协调器。`write_file`
-和 `edit_file` 按规范化文件路径加锁；不同文件可以并行，同一文件串行。Bash 应通过
-`write_paths` 声明修改目标，无法精确声明时使用 workspace 全局写锁。Subagent 和
-Team Agent 修改已有文件前必须读取 SHA-256，并通过 `expected_sha256` 做乐观冲突
-检查；提交采用同目录临时文件加原子替换。Subagent 的 300 秒预算在等待锁时继续
-计算，若超时时正在写入，只获得一次 30 秒收尾窗口。
+Workspace 具有一个 Team 自动领取总开关：
 
-Web 运行时的 Bash 风险操作使用本地审批弹窗，只支持“允许一次”或拒绝，默认
-120 秒后拒绝。Subagent 的 Bash 请求先由主 Agent 审核，再冒泡到同一个人工审批
-通道；审批 ID 单次消费，取消、超时或关闭都会默认拒绝。
+- **关闭**：任务只能由用户在任务看板中手动分配给在线且空闲的 Team Agent。
+- **开启**：空闲 Team Agent 可以自动领取满足依赖条件的待处理任务。
+
+每个 Team Agent 同时最多执行一个任务。Team Agent 总数没有硬编码上限，但实际并发受本机线程、内存和模型 API 限制。
+
+Task System 是工作分配的唯一权威来源。创建 Team Agent 只代表该成员上线，不代表它已经获得任务。
+
+### 生命周期
+
+用户可以从 Web Console 主动：
+
+- 停止运行中的 Team Agent；
+- 重启 stopped Team Agent；
+- 删除 stopped 且没有未完成任务的 Team Agent；
+- 删除 pending/completed 且没有被其他任务依赖的 Task。
+
+运行中或 stopping 的 Team Agent 不能删除；`in_progress` Task 不能删除。删除 Agent 配置不会抹除历史审计、消息和已完成任务记录。
+
+### Lead Mailbox
+
+Team Agent 使用持久化邮箱向 Lead 汇报结果：
+
+```text
+mailbox.jsonl
+    │ claim（原子改名）
+    ▼
+.inflight.jsonl
+    ├── 成功 → ack  → 删除 inflight
+    └── 失败 → nack → 放回 mailbox
+```
+
+该机制提供“至少一次处理”基础：
+
+- `result`、`error` 和 `plan_approval_request` 会产生未读事件；
+- Lead 空闲时，未读事件可以触发新的处理循环；
+- Web 和 CLI 使用同一套 Lead inbox 注入逻辑；
+- 成功处理后才 ACK；
+- 无法解析的行进入 dead-letter；
+- 启动时可以恢复遗留 inflight 和旧的 `Leader/main` 别名邮箱；
+- 原始 `<team-inbox>` JSON 只作为内部上下文，不显示为聊天气泡。
+
+## Subagent
+
+Subagent 是主 Agent 当前 Turn 内的结构化子工作，不是长期在线成员：
+
+- 默认最多同时运行 4 个；
+- 可以并行读取、搜索和分析；
+- Bash、写入和编辑需要审批；
+- 主 Turn 结束前，所有 Subagent 必须进入终态；
+- 当前 Turn 展示完整活动事件，历史 Turn 只保留摘要；
+- Subagent 不直接拥有 Task System 中的任务。
+
+Team Agent 适合持续在线、由任务看板调度的成员；Subagent 适合当前 Turn 内临时拆分的并行工作。
+
+## 运行中干预
+
+用户必须明确选择干预语义，系统不会猜测新消息与当前任务的关系：
+
+| 动作 | 语义 |
+|---|---|
+| `steer` | 将补充要求注入当前执行；暂时无法注入时转为 pending message |
+| `queue` | 当前任务结束后，在新 Turn 执行独立任务；Team Agent queue 会创建可见 Task |
+| `redirect` | 修正当前方向；LLM 阶段可取消并重发，工具阶段等待工具结束后注入 |
+| `stop` | 强制停止当前目标；用于必须终止正在运行工具的情况 |
+
+CLI 示例：
+
+```text
+/steer main 补充输出风险清单
+/queue main 完成后再生成部署文档
+/redirect team:Alice 不要使用 React，改成原生 HTML
+/stop team:Alice
+```
+
+## Context Modes
+
+每个新会话可以选择一种上下文处理方式：
+
+- `cc`：分层处理大型工具结果、旧工具结果和历史中段，必要时生成摘要。
+- `hermes`：保留会话开头和近期尾部，对中间历史持续合并摘要。
+- `pi`：根据 Token 预算寻找工具协议安全切点，并生成 Compaction Entry。
+
+模式只能在空白会话开始前选择，首条消息发出后锁定。
+
+## 当前 Memory 实现
+
+长期记忆分为：
+
+- **Procedural Memory**：Skills 和行为规则；
+- **Semantic Memory**：稳定的用户事实、偏好、长期目标和约束；
+- **Episodic Memory**：已经完成的重要事件、决定和里程碑。
+
+写入通道：
+
+1. 用户明确要求“记住”时，主 Agent 调用 `save_note`；
+2. 完整 Exchange 进入 `chat_log` 后，后台按批次执行 Memory Consolidation。
+
+当前实现具备凭据遮蔽、严格 JSON 校验、重要度阈值、重复检测、更新/替代、遗忘、租约、失败重试和审计记录。召回目前主要依据中文字符与英文 Token 的词面重合，并受 Token 预算限制。
 
 ## 快速开始
 
-### 1. 环境要求
+### 环境要求
 
-- Python 3.11 或更高版本
-- 可调用 Function Calling / Tool Calling 的 SiliconFlow 模型
-- 可选：Tavily API Key，用于 Web Search
+- Python 3.11+
+- 支持 Tool Calling 的 SiliconFlow 模型
+- 可选 Tavily API Key
 
-### 2. 安装
+### 安装
 
 ```powershell
-cd E:\AgentLearnProject\gugugaga
+$projectDir = "C:\path\to\gugugaga"
+Set-Location $projectDir
 
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-
-python -m pip install -r requirements.txt
-python -m pip install -e ".[test]"
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install -e ".[test]"
 ```
 
-### 3. 启动 Web Console
-
-Web Console 可以在尚未配置模型时启动：
+### 在指定 Workspace 启动 Web
 
 ```powershell
-python -m gugugaga.web --workspace . --port 8765
+$projectDir = "C:\path\to\gugugaga"
+$workspaceDir = "C:\path\to\your-workspace"
+Set-Location $projectDir
+
+.\.venv\Scripts\python.exe -m gugugaga.web `
+  --workspace $workspaceDir `
+  --host 127.0.0.1 `
+  --port 8765
 ```
 
-浏览器打开：
+打开：<http://127.0.0.1:8765>
 
-```text
-http://127.0.0.1:8765
-```
+Web 可以在未配置模型时启动。点击左下角配置按钮填写主模型、SiliconFlow API Key、可选的 Consolidation 模型和 Tavily Key。
 
-点击左下角“配置”，填写：
-
-- 主模型
-- Memory Consolidation 小模型，可留空并复用主模型
-- SiliconFlow API Key
-- Tavily API Key，可选
-
-Web 配置保存在：
+配置保存在目标 Workspace 的：
 
 ```text
 .gugugaga/web_config.json
 ```
 
-该文件已被 `.gitignore` 排除。前端不会回显完整 Key，留空密码字段会保留已有值。
-
-### 4. 使用 PowerShell 环境变量
-
-也可以在启动进程中直接设置：
+### 使用环境变量
 
 ```powershell
 $env:SILICONFLOW_API_KEY = "your-key"
@@ -187,23 +259,22 @@ $env:SILICONFLOW_MODEL = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
 $env:GUGUGAGA_MEMORY_CONSOLIDATION_MODEL = "Qwen/Qwen3-8B"
 $env:TAVILY_API_KEY = "tvly-your-key"
 
-python -m gugugaga.web --workspace . --port 8765
+$workspaceDir = "C:\path\to\your-workspace"
+.\.venv\Scripts\python.exe -m gugugaga.web --workspace $workspaceDir
 ```
 
-程序不会自动读取仓库中的 `.env`。CLI 模式必须在当前进程中提供 `SILICONFLOW_API_KEY` 和 `SILICONFLOW_MODEL`。
-
-### 5. 启动 CLI
+### 启动 CLI
 
 ```powershell
-python -m gugugaga --workspace .
+$workspaceDir = "C:\path\to\your-workspace"
+.\.venv\Scripts\python.exe -m gugugaga --workspace $workspaceDir
 ```
 
-指定上下文模式：
+指定 Context Mode：
 
 ```powershell
-python -m gugugaga --workspace . --context-mode cc
-python -m gugugaga --workspace . --context-mode hermes --context-window-tokens 131072
-python -m gugugaga --workspace . --context-mode pi --context-window-tokens 131072
+.\.venv\Scripts\python.exe -m gugugaga --workspace $workspaceDir --context-mode hermes
+.\.venv\Scripts\python.exe -m gugugaga --workspace $workspaceDir --context-mode pi
 ```
 
 常用 CLI 命令：
@@ -229,158 +300,143 @@ python -m gugugaga --workspace . --context-mode pi --context-window-tokens 13107
 
 | 环境变量 | 必需 | 默认值 | 说明 |
 |---|---:|---|---|
-| `SILICONFLOW_API_KEY` | 是 | — | SiliconFlow API Key |
-| `SILICONFLOW_MODEL` | 是 | — | 主模型 |
-| `SILICONFLOW_BASE_URL` | 否 | `https://api.siliconflow.cn/v1` | OpenAI 兼容接口地址 |
+| `SILICONFLOW_API_KEY` | CLI 必需 | — | SiliconFlow API Key |
+| `SILICONFLOW_MODEL` | CLI 必需 | — | 主模型 |
+| `SILICONFLOW_BASE_URL` | 否 | `https://api.siliconflow.cn/v1` | OpenAI 兼容地址 |
 | `SILICONFLOW_FALLBACK_MODEL` | 否 | — | Provider 失败时的候选模型 |
-| `TAVILY_API_KEY` | 否 | — | 启用 `web_search` |
+| `TAVILY_API_KEY` | 否 | — | 配置后启用 `web_search` |
 
 ### Runtime
 
 | 环境变量 | 默认值 | 说明 |
 |---|---:|---|
-| `GUGUGAGA_MAX_ROUNDS` | `40` | 单次 Turn 最大 Agent Loop 轮数 |
+| `GUGUGAGA_MAX_ROUNDS` | `40` | 单 Turn 最大 Agent Loop 轮数 |
 | `GUGUGAGA_MAX_TOKENS` | `8192` | 单次模型输出上限 |
-| `GUGUGAGA_IDLE_POLL` | `1` | 空闲轮询间隔 |
-| `GUGUGAGA_IDLE_TIMEOUT` | `30` | 空闲等待超时 |
+| `GUGUGAGA_IDLE_POLL` | `1` | CLI 空闲轮询间隔（秒） |
+| `GUGUGAGA_IDLE_TIMEOUT` | `30` | CLI 空闲等待超时（秒） |
 
 ### Memory
 
 | 环境变量 | 默认值 | 说明 |
 |---|---:|---|
-| `GUGUGAGA_MEMORY_ENABLED` | `true` | 总记忆开关 |
+| `GUGUGAGA_MEMORY_ENABLED` | `true` | Memory 总开关 |
 | `GUGUGAGA_MEMORY_EXPLICIT_ENABLED` | `true` | 显式记忆开关 |
-| `GUGUGAGA_MEMORY_CONSOLIDATION_ENABLED` | `true` | 隐式整合开关 |
-| `GUGUGAGA_MEMORY_CONSOLIDATION_EXCHANGES` | `6` | 每批待整合 Exchange 数量 |
-| `GUGUGAGA_MEMORY_CONSOLIDATION_MODEL` | 主模型 | 整理记忆使用的小模型 |
-| `GUGUGAGA_MEMORY_CONSOLIDATION_TIMEOUT` | `30` | 整合请求超时，单位秒 |
-| `GUGUGAGA_MEMORY_CONSOLIDATION_LEASE` | `600` | 整合任务租约，单位秒 |
-| `GUGUGAGA_MEMORY_CONSOLIDATION_MAX_FACTS` | `10` | 单批最多候选事实数 |
+| `GUGUGAGA_MEMORY_CONSOLIDATION_ENABLED` | `true` | 后台整合开关 |
+| `GUGUGAGA_MEMORY_CONSOLIDATION_EXCHANGES` | `6` | 每批 Exchange 数量 |
+| `GUGUGAGA_MEMORY_CONSOLIDATION_MODEL` | 主模型 | 整理记忆使用的模型 |
+| `GUGUGAGA_MEMORY_CONSOLIDATION_TIMEOUT` | `30` | 单次整合超时（秒） |
+| `GUGUGAGA_MEMORY_CONSOLIDATION_LEASE` | `600` | 整合租约（秒） |
+| `GUGUGAGA_MEMORY_CONSOLIDATION_MAX_FACTS` | `10` | 单批最大事实候选数 |
 | `GUGUGAGA_MEMORY_CONSOLIDATION_MIN_IMPORTANCE` | `0.8` | 长期记忆最低重要度 |
-| `GUGUGAGA_MEMORY_RECALL_TOKENS` | `2000` | 单次记忆召回预算 |
+| `GUGUGAGA_MEMORY_RECALL_TOKENS` | `2000` | 单次召回 Token 预算 |
 
 ## 本地数据
 
-运行数据默认位于当前 workspace 的 `.gugugaga/`：
+所有运行状态都位于用户选择的 Workspace：
 
 ```text
-.gugugaga/
-├── state.db                 # 会话、事实、情景记忆、整合批次和审计记录
-├── web_config.json          # Web 配置与本地密钥
-├── traces/YYYY-MM-DD.jsonl  # Turn、LLM、Tool、Memory 和 Agent 事件
-├── usage.jsonl              # Provider、Model 和 Token 使用记录
-├── tasks/                   # Task System 状态
-├── memory/                  # 兼容记忆文件
-├── mailboxes/               # Team Agent 邮箱
-├── transcripts/             # 会话记录
-├── outputs/                 # 大型工具输出
-└── skills/                  # Workspace Skills
+<workspace>/
+├── .gugugaga/
+│   ├── state.db                 # Chat、Facts、Episodes、Consolidation、Audit
+│   ├── web_config.json          # Web 本地配置和密钥
+│   ├── traces/YYYY-MM-DD.jsonl  # 结构化运行事件
+│   ├── usage.jsonl              # 模型和 Token 使用记录
+│   ├── team-agents.json         # Team Agent 持久化配置
+│   ├── team-settings.json       # Workspace Team 自动领取设置
+│   └── agent-interactions.json  # steer/queue/redirect/stop 状态
+├── .tasks/                      # Task System JSON 状态
+├── .mailboxes/                  # Team Agent 与 Lead 邮箱
+├── .transcripts/                # 上下文模式会话记录
+├── .memory/                     # 兼容 Memory 文件
+├── .task_outputs/               # 大型工具结果
+├── .scheduled_tasks.json        # Cron 持久化状态
+└── skills/                      # Workspace Skills
 ```
-
-Trace 会对常见的密码、API Key、Token 和 Authorization 字段进行遮蔽，但项目仍然是本地开发原型，不应直接暴露到公网。
 
 ## 测试
 
-现有测试主要使用 Fake Provider 和确定性输入，不需要真实 API Key，也不会访问真实模型：
+测试使用 Fake Provider 和确定性输入，不需要真实 API Key：
 
 ```powershell
-python -m pytest -q
-python -m compileall -q gugugaga
-python -m gugugaga --help
-python -m gugugaga.web --help
+.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe -m compileall -q gugugaga
+.\.venv\Scripts\python.exe -m gugugaga --help
+.\.venv\Scripts\python.exe -m gugugaga.web --help
 ```
 
-当前测试能够验证核心协议、上下文模式、Memory、Web API、文件边界和部分 Agent 协作行为，但尚不能证明系统已经达到生产可靠性。以下测试仍是后续重点：
+## 下一阶段：加强 Agent Memory
 
-- 并发竞争和锁顺序
-- 重启恢复与幂等执行
-- Provider 超时、限流和不合法输出
-- 工具取消、进程泄漏和资源回收
-- SQLite 锁竞争、事务回滚和数据迁移
-- 长时间运行与内存增长
-- 多 Agent 消息乱序和任务重复认领
-- Cron 错过执行、重复执行和时区边界
-- 外部消息平台的重投递、签名校验和去重
+下一阶段优先增强记忆系统。目标不是“记得更多”，而是做到：**召回更准、来源可追踪、冲突可处理、用户可纠正、效果可评测**。
 
-## 路线图
+### P0：召回质量与可解释性
 
-### Phase 1：Task、后台任务和定时任务健壮化
+- 建立独立的 Memory Recall 评测集，覆盖中文同义表达、跨会话偏好、长期目标、无关记忆和冲突事实。
+- 移除“完全无匹配时返回最近三条”的默认行为，避免无关记忆污染回答。
+- 引入混合召回：词面/FTS 检索、可选向量检索、时间衰减、重要度和重复出现次数共同排序。
+- 为中文查询增加更合理的分词或 n-gram 策略，不再只依赖单字重合。
+- 每条注入记忆携带 `memory_id`、来源 Turn、写入方式、更新时间和召回分数。
+- 在 Web 中显示“为什么召回这条记忆”，便于定位错误召回。
 
-- 完善 Task DAG 的依赖校验、并发认领、租约、重试和失败状态。
-- 为后台任务增加取消确认、超时、结果持久化和进程退出恢复。
-- 为 Cron 增加明确时区、misfire 策略、幂等键、重复执行保护和重启补偿。
-- 增加压力测试、故障注入、资源泄漏检查和长时间运行测试。
+### P1：生命周期与冲突处理
 
-### Phase 2：Subagent 和 Team Agent
+- 增加 `confidence`、`valid_from`、`valid_until`、`last_accessed_at` 和 `access_count`。
+- 对相同 subject 的矛盾事实建立明确状态机：active、conflicted、superseded、forgotten。
+- 区分“用户明确修正”“模型推断变化”和“事实自然过期”，避免新事实静默覆盖旧事实。
+- 对重复事实进行聚类合并，同时保留 provenance 和 seen count。
+- 让 `forget` 在下一次召回立即生效，并验证缓存、摘要和历史恢复不会重新注入已遗忘内容。
 
-- 为 Subagent 增加独立预算、超时、取消和最小权限工具集。
-- 明确父子 Agent 的上下文传递、结果协议和失败传播。
-- 完善 Team Agent 的 Mailbox、任务认领、消息顺序、成员生命周期和优雅关闭。
-- 增加多 Agent 并发、死锁、重复任务和部分成员失败测试。
+### P2：整合可靠性与用户控制
 
-### Phase 3：钉钉和飞书
+- Consolidation 使用稳定的幂等键，补充崩溃恢复、Provider 超时和重复提交测试。
+- 将“事实提取”和“是否值得长期保存”拆成两个可测阶段。
+- Web Memory 页面增加固定、编辑、确认冲突、批量遗忘、导出和审计时间线。
+- 增加 Workspace Memory 导入/导出格式，并对敏感字段执行统一遮蔽。
 
-- 抽象统一的 Channel Adapter，不让渠道逻辑进入核心 Agent Loop。
-- 优先接入钉钉应用机器人 Stream 模式和飞书机器人长连接/事件订阅。
-- 建立渠道用户与 gugugaga `session_id` 的映射。
-- 支持“新对话”“查看状态”“恢复会话”等渠道命令。
-- 增加消息验签、访问白名单、消息去重、异步队列和失败重试。
+### 验收标准
 
-### Phase 4：语音能力
+- 无相关记忆时不注入任何长期记忆。
+- 每条召回结果都能追踪到来源和排名原因。
+- 用户修正事实后，新事实生效且旧事实不再作为 active 召回。
+- 用户遗忘后，下一个 Turn 不再注入该记忆。
+- Consolidation 重试不会产生重复事实或重复情景。
+- Recall 和 Consolidation 都有确定性测试、质量评测和可观察指标。
 
-- 接收语音消息并下载原始媒体。
-- 接入 Speech-to-Text，将转写文本送入现有 Agent Loop。
-- 可选接入 Text-to-Speech，把 Agent 回复转换为语音。
-- 保存文本会话作为主记录，媒体文件采用独立的生命周期和清理策略。
-- 增加长音频、噪声、空转写、重复上传和超时测试。
+## 已知限制
 
-### Phase 5：LLM-as-a-Judge
-
-- 建立覆盖工具调用、记忆、压缩、Task、多 Agent、渠道和语音的评测集。
-- 将确定性测试与 LLM Judge 分离：能用代码断言的行为不交给 Judge。
-- 为事实正确性、任务完成度、工具选择、记忆质量、安全性和回答质量定义 Rubric。
-- 保存输入、轨迹、工具结果、最终回答、Judge 评分和失败原因。
-- 使用固定 Judge 模型、版本化 Prompt、人工校准样本和回归阈值。
-- 将 Judge 结果接入持续回归，但不把单次主观评分当作唯一发布依据。
-
-## 当前非目标
-
-- 暂不作为多租户 SaaS 使用。
-- 暂不直接暴露 Web Console 到公网。
-- 暂不承诺 Task、后台任务、Cron、Subagent 和 Team Agent 的生产级可靠性。
-- 暂未实现 S18 Worktree Isolation 和 S19 MCP Plugin。
-- 暂未接入钉钉、飞书和语音渠道。
-- 暂未建立完整的 LLM-as-a-Judge 发布门禁。
+- 仍是单用户、本地运行模型，不支持多租户隔离。
+- Team Agent 数量没有资源配额，需要由使用者控制并发规模。
+- Mailbox 提供至少一次处理，不保证 exactly-once；消费者必须依赖消息 ID 处理重复投递。
+- Bash 权限较大，生产化前仍需要更严格的进程和文件系统沙箱。
+- Context 压缩和 Memory Consolidation 会调用远程模型，应根据数据隐私要求决定是否启用。
+- 尚未完成长时间运行、进程崩溃、磁盘写满和高并发故障注入。
 
 ## 项目结构
 
 ```text
 gugugaga/
-├── __main__.py          # CLI、Runtime 构建与命令处理
-├── agent.py             # Agent Loop
-├── provider.py          # SiliconFlow Provider 边界
-├── tools.py             # 工具定义和注册
-├── context.py           # Context 与历史处理
+├── __main__.py          # CLI、Runtime 构建、Lead inbox 循环
+├── agent.py             # 主 Agent Loop 与 Turn 处理
+├── provider.py          # SiliconFlow Provider
+├── tools.py             # 主 Agent 工具定义和注册
+├── context.py           # Working Context
 ├── context_modes.py     # CC、Hermes、Pi
-├── memory/              # Memory Repository、Service 和 Validation
+├── memory/              # Repository、Service、Validation
 ├── tasks.py             # Task System
-├── background.py        # 后台任务
-├── cron.py              # 定时任务
-├── subagents.py         # Turn 内结构化异步 Subagent
-├── teams.py             # Team Agent 与 Mailbox
-├── observability.py     # Observer、Trace 和 Usage
-├── mutations.py         # workspace 并发写协调与分层锁
-├── stateio.py           # 原子状态写入与跨进程文件锁
-├── web.py               # 本地 Web Server 与 API
-├── web_search.py        # Tavily Search
+├── interactions.py      # steer、queue、redirect、stop
+├── subagents.py         # Turn 内 Subagent
+├── teams.py             # Team Agent、Lead identity、Mailbox
+├── permissions.py       # 权限策略和审批
+├── mutations.py         # Workspace 写协调
+├── stateio.py           # 原子写入和跨进程锁
+├── observability.py     # Observer、Trace、Usage、Chat Log
+├── web.py               # 本地 Web Server 和 API
 ├── web_config.py        # Web 配置持久化
-└── web_assets/          # Overview、Memory、Database、Chat UI
+└── web_assets/          # Web Console
 ```
 
 ## 安全说明
 
-- 不要提交 `.env`、`.gugugaga/web_config.json` 或其他真实密钥文件。
-- Web 配置修改默认只接受本机回环地址请求。
-- `bash` 可以执行工作空间内外的系统命令，生产化之前需要更严格的沙箱和审批机制。
-- Memory Consolidation 会把部分对话发送给远程模型，使用前应确认数据处理和隐私要求。
-- 钉钉、飞书和语音接入后，需要单独设计用户身份、权限、媒体留存和审计策略。
+- 不要提交真实 API Key、`.gugugaga/web_config.json` 或 Workspace 私有数据。
+- Web 写接口默认只允许回环地址调用，不要直接绑定公网地址。
+- Trace 会遮蔽常见 Key、Token、Authorization 和密码字段，但不代表完整的数据防泄漏方案。
+- Memory 和远程模型调用可能包含用户对话内容，使用前应确认数据处理与留存要求。

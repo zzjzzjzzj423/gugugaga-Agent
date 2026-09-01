@@ -81,7 +81,10 @@ def test_runtime_records_trace_usage_chat_log_and_live_events(tmp_path, monkeypa
         unsubscribe()
         app.close()
 
-    assert [event["type"] for event in live_events] == [
+    legacy_types = {"turn_start", "context", "llm", "tool", "turn_end"}
+    assert [
+        event["type"] for event in live_events if event["type"] in legacy_types
+    ] == [
         "turn_start",
         "context",
         "llm",
@@ -90,11 +93,12 @@ def test_runtime_records_trace_usage_chat_log_and_live_events(tmp_path, monkeypa
         "llm",
         "turn_end",
     ]
+    assert any(event["type"] == "agent_phase" for event in live_events)
     assert all("system" not in event for event in live_events)
 
     trace_files = list((tmp_path / ".gugugaga" / "traces").glob("*.jsonl"))
     trace = [json.loads(line) for line in trace_files[0].read_text(encoding="utf-8").splitlines()]
-    assert [event["type"] for event in trace] == [
+    assert [event["type"] for event in trace if event["type"] in legacy_types] == [
         "turn_start",
         "context",
         "llm",
@@ -103,6 +107,7 @@ def test_runtime_records_trace_usage_chat_log_and_live_events(tmp_path, monkeypa
         "llm",
         "turn_end",
     ]
+    assert any(event["type"] == "agent_phase" for event in trace)
 
     usage = [
         json.loads(line)
@@ -214,6 +219,11 @@ def test_source_runtime_injects_lead_inbox_before_user_turn_and_acks(tmp_path, m
             "role": "user",
             "content": "What is the status?",
         }
+        with sqlite3.connect(tmp_path / ".gugugaga" / "state.db") as connection:
+            stored_user = connection.execute(
+                "SELECT content FROM chat_log WHERE role='user' ORDER BY id DESC LIMIT 1"
+            ).fetchone()[0]
+        assert stored_user == "What is the status?"
         assert not (tmp_path / ".mailboxes" / "lead.jsonl").exists()
         assert not list((tmp_path / ".mailboxes").glob(".lead.*.inflight.jsonl"))
     finally:

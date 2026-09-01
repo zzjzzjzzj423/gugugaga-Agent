@@ -22,18 +22,21 @@ from . import config
 from .__main__ import GugugagaApp, build_runtime
 from .config import Settings
 from .context_modes import ContextModeError
+from .interactions import interaction_broker
 from .memory import memory_hit_kinds
 from .memory.repository import MemoryRepository
 from .observability import sanitize
 from .permissions import PermissionBroker
 from .subagents import snapshot_subagents
-from .tasks import load_task, release_task, unassign_task
+from .tasks import delete_task, load_task, release_task, unassign_task
 from .teams import (
     assign_task_to_teammate,
+    delete_teammate,
     get_team_settings,
     list_teammate_states,
     restart_teammate,
     stop_teammate,
+    submit_team_interaction,
     update_team_settings,
 )
 from .web_config import WebConfiguration
@@ -198,8 +201,18 @@ class DashboardStore:
         }
 
     @staticmethod
+    def _strip_team_inbox(value: Any) -> str:
+        return re.sub(
+            r"<team-inbox>.*?</team-inbox>",
+            "",
+            str(value or ""),
+            flags=re.DOTALL | re.IGNORECASE,
+        ).strip()
+
+    @staticmethod
     def _excerpt(value: Any, limit: int) -> str:
-        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        visible = DashboardStore._strip_team_inbox(value)
+        text = re.sub(r"\s+", " ", visible).strip()
         return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
     def sessions(self, limit: int = 50) -> list[dict[str, Any]]:
@@ -270,7 +283,15 @@ class DashboardStore:
                 "WHERE session_id=? ORDER BY id DESC LIMIT ?",
                 (session_id, limit),
             ).fetchall()
-        return [dict(row) for row in reversed(rows)]
+        items: list[dict[str, Any]] = []
+        for row in reversed(rows):
+            item = dict(row)
+            if item["role"] == "user":
+                item["content"] = self._strip_team_inbox(item["content"])
+                if not item["content"]:
+                    continue
+            items.append(item)
+        return items
 
     def runtime_history(self, session_id: str) -> list[dict[str, Any]]:
         with self._connect() as connection:
@@ -588,6 +609,10 @@ class DashboardStore:
                     "status": status_by_id[task_id],
                     "owner": raw.get("owner"),
                     "assignee": raw.get("assignee"),
+                    "queue_position": raw.get("queue_position"),
+                    "dispatch_type": raw.get("dispatch_type"),
+                    "interrupted_by_user": bool(raw.get("interrupted_by_user")),
+                    "interventions": raw.get("interventions") or [],
                     "blocked_by": dependencies,
                     "dependencies": dependency_details,
                     "blocked": blocked and status_by_id[task_id] == "pending",
@@ -732,6 +757,92 @@ class DashboardStore:
         )[:100]
         return {"items": items}
 
+    def _teammate_trace_events(
+        self,
+        name: str,
+        *,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        directory = self.state_dir / "traces"
+        if not directory.exists():
+            return []
+        target = f"team:{name}"
+        events: list[dict[str, Any]] = []
+        for path in sorted(directory.glob("*.jsonl"), reverse=True)[:14]:
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
+            for line in reversed(lines):
+                try:
+                    event = json.loads(line)
+                except (TypeError, ValueError):
+                    continue
+                belongs = (
+                    event.get("agent_type") == "teammate"
+                    and event.get("agent_id") == name
+                ) or event.get("target") == target
+                if not belongs:
+                    continue
+                if event.get("type") not in {
+                    "teammate_start",
+                    "teammate_activity",
+                    "teammate_error",
+                    "teammate_end",
+                    "agent_phase",
+                    "agent_interaction",
+                    "llm",
+                    "tool",
+                }:
+                    continue
+                events.append(event)
+                if len(events) >= limit:
+                    return list(reversed(events))
+        return list(reversed(events))
+
+    def team_agent_detail(self, name: str) -> dict[str, Any]:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", name):
+            raise ValueError("invalid teammate name")
+        state = next(
+            (item for item in list_teammate_states() if item.get("name") == name),
+            None,
+        )
+        if state is None:
+            raise KeyError("teammate not found")
+        tasks_payload = self.task_system()["tasks"]
+        current_task_id = state.get("current_task_id")
+        current_task = next(
+            (
+                item
+                for item in tasks_payload
+                if item["id"] == current_task_id
+                and item.get("status") == "in_progress"
+            ),
+            None,
+        )
+        queued_tasks = sorted(
+            (
+                item
+                for item in tasks_payload
+                if item.get("assignee") == name
+                and item.get("dispatch_type") == "queued"
+                and item.get("status") == "pending"
+            ),
+            key=lambda item: (item.get("queue_position") or 0, item["id"]),
+        )
+        broker = interaction_broker(self.workspace)
+        phase = broker.phase(f"team:{name}")
+        return {
+            "agent": {**state, "interaction_phase": phase},
+            "current_task": current_task,
+            "queued_tasks": queued_tasks,
+            "interactions": broker.list(f"team:{name}", limit=200),
+            "events": self._teammate_trace_events(name, limit=500),
+            "disclosure": (
+                "展示可审计的工作摘要、工具和结果；不展示模型隐藏思维链。"
+            ),
+        }
+
 
 @dataclass
 class ChatResult:
@@ -795,13 +906,18 @@ class DashboardApplication:
 
     def _forward_runtime_event(self, event: dict[str, Any]) -> None:
         """Translate context decisions into explicit dashboard graph transitions."""
-        if event.get("type") == "turn_start":
+        # Agent Overview represents the Lead runtime only. Teammate and
+        # subagent events still flow through the EventHub for their dedicated
+        # panels, but must not synthesize transitions in the Lead graph.
+        is_main_event = str(event.get("agent_type") or "main") == "main"
+        if is_main_event and event.get("type") == "turn_start":
             self._active_turn_id = str(event.get("turn_id") or "") or None
-        elif event.get("type") in {"turn_end", "turn_error"}:
+        elif is_main_event and event.get("type") in {"turn_end", "turn_error"}:
             if event.get("turn_id") == self._active_turn_id:
                 self._active_turn_id = None
         if (
-            event.get("type") == "tool"
+            is_main_event
+            and event.get("type") == "tool"
             and event.get("tool") == "load_skill"
             and event.get("status") == "ok"
         ):
@@ -813,12 +929,16 @@ class DashboardApplication:
                     "kinds": ["procedural"],
                 }
             )
-        if event.get("type") == "context":
+        if is_main_event and event.get("type") == "context":
             self.events.publish(
                 {"type": "runtime", "stage": "compression_gate", "status": "active"}
             )
         self.events.publish(event)
-        if event.get("type") == "context" and event.get("status") != "failed":
+        if (
+            is_main_event
+            and event.get("type") == "context"
+            and event.get("status") != "failed"
+        ):
             self.events.publish(
                 {"type": "runtime", "stage": "agent", "status": "active"}
             )
@@ -854,6 +974,7 @@ class DashboardApplication:
             "session_id": getattr(coordinator, "session_id", None),
             "context_mode": context_status.get("mode") if context_status else None,
             "context_mode_locked": bool(context_status and context_status.get("locked")),
+            "main_interaction_phase": interaction_broker(self.workspace).phase("main"),
         }
 
     def configuration_status(self) -> dict[str, Any]:
@@ -1067,6 +1188,41 @@ class DashboardApplication:
     def team_agents(self) -> dict[str, Any]:
         return {"items": list_teammate_states()}
 
+    def team_agent_detail(self, name: str) -> dict[str, Any]:
+        return self.store.team_agent_detail(name)
+
+    def submit_interaction(
+        self,
+        target: str,
+        action: str,
+        content: str = "",
+    ) -> dict[str, Any]:
+        target = str(target or "").strip()
+        action = str(action or "").strip().lower()
+        content = str(content or "")
+        if target == "main":
+            broker = interaction_broker(self.workspace)
+            phase = broker.phase("main").get("phase", "idle")
+            if action == "queue" and phase in {"idle", "stopped", "error"}:
+                raise ValueError("cannot queue main while it is not running")
+            item = broker.submit("main", action, content)
+            result = asdict(item)
+        elif target.startswith("team:"):
+            result = submit_team_interaction(target.removeprefix("team:"), action, content)
+        else:
+            raise ValueError("target must be main or team:<name>")
+        self.events.publish(
+            {
+                "type": "agent_interaction",
+                "target": target,
+                "action": action,
+                "status": result.get("status"),
+                "interaction_id": result.get("id"),
+                "task_id": result.get("task_id"),
+            }
+        )
+        return result
+
     def stop_team_agent(self, name: str) -> dict[str, Any]:
         result = stop_teammate(name)
         if result.startswith("Error:"):
@@ -1088,6 +1244,13 @@ class DashboardApplication:
             {"type": "team_agent", "action": "restarted", "name": name}
         )
         return {"name": name, "status": "running", "message": result}
+
+    def delete_team_agent(self, name: str) -> dict[str, Any]:
+        result = delete_teammate(name)
+        self.events.publish(
+            {"type": "team_agent", "action": "deleted", "name": name}
+        )
+        return result
 
     def assign_task(self, task_id: str, teammate: str) -> dict[str, Any]:
         value = assign_task_to_teammate(task_id, teammate)
@@ -1137,6 +1300,32 @@ class DashboardApplication:
             }
         )
         return value
+
+    def delete_task(self, task_id: str) -> dict[str, Any]:
+        task = delete_task(task_id)
+        broker = interaction_broker(self.workspace)
+        for intervention in task.interventions:
+            interaction_id = intervention.get("id")
+            if intervention.get("action") != "queue" or not interaction_id:
+                continue
+            try:
+                broker.update(
+                    str(interaction_id),
+                    "cancelled",
+                    task_id=task.id,
+                    metadata={"task_deleted": True},
+                )
+            except KeyError:
+                pass
+        self.events.publish(
+            {
+                "type": "task",
+                "action": "deleted",
+                "task_id": task.id,
+                "subject": task.subject,
+            }
+        )
+        return {**asdict(task), "deleted": True}
 
     def subagent_current(self, turn_id: str | None = None) -> dict[str, Any]:
         return self.store.subagent_current(turn_id or self._active_turn_id)
@@ -1272,6 +1461,11 @@ def _handler_factory(application: DashboardApplication):
                     self._json(application.team_settings())
                 elif parsed.path == "/api/team/agents":
                     self._json(application.team_agents())
+                elif match := re.fullmatch(
+                    r"/api/team/agents/([A-Za-z0-9][A-Za-z0-9_-]{0,63})",
+                    parsed.path,
+                ):
+                    self._json(application.team_agent_detail(match.group(1)))
                 elif parsed.path == "/api/subagents":
                     turn_id = query.get("turn_id", [None])[0]
                     self._json(application.subagent_current(turn_id))
@@ -1324,12 +1518,17 @@ def _handler_factory(application: DashboardApplication):
                 "/api/session/resume",
                 "/api/session/mode",
                 "/api/permissions/review",
+                "/api/interactions",
             } and task_action is None and agent_action is None:
                 self._error(HTTPStatus.NOT_FOUND, "not found")
                 return
             try:
                 if (
-                    parsed.path in {"/api/config", "/api/permissions/review"}
+                    parsed.path in {
+                        "/api/config",
+                        "/api/permissions/review",
+                        "/api/interactions",
+                    }
                     or task_action
                     or agent_action
                 ):
@@ -1413,6 +1612,16 @@ def _handler_factory(application: DashboardApplication):
                         )
                     )
                     return
+                if parsed.path == "/api/interactions":
+                    self._json(
+                        application.submit_interaction(
+                            str(payload.get("target", "")),
+                            str(payload.get("action", "")),
+                            str(payload.get("content", "")),
+                        ),
+                        HTTPStatus.ACCEPTED,
+                    )
+                    return
                 if parsed.path == "/api/session/resume":
                     session_id, message_count = application.resume_session(
                         str(payload.get("session_id", ""))
@@ -1458,6 +1667,37 @@ def _handler_factory(application: DashboardApplication):
             except Exception as error:
                 status = HTTPStatus.SERVICE_UNAVAILABLE if "SILICONFLOW" in str(error) else HTTPStatus.INTERNAL_SERVER_ERROR
                 self._error(status, str(error))
+
+        def do_DELETE(self) -> None:
+            parsed = urlparse(self.path)
+            task_match = re.fullmatch(
+                r"/api/tasks/(task_[0-9]+_[0-9]{4})",
+                parsed.path,
+            )
+            agent_match = re.fullmatch(
+                r"/api/team/agents/([A-Za-z0-9][A-Za-z0-9_-]{0,63})",
+                parsed.path,
+            )
+            if task_match is None and agent_match is None:
+                self._error(HTTPStatus.NOT_FOUND, "not found")
+                return
+            if not self._is_loopback():
+                self._error(
+                    HTTPStatus.FORBIDDEN,
+                    "deletion requires a local connection",
+                )
+                return
+            try:
+                if task_match is not None:
+                    self._json(application.delete_task(task_match.group(1)))
+                else:
+                    self._json(application.delete_team_agent(agent_match.group(1)))
+            except FileNotFoundError:
+                self._error(HTTPStatus.NOT_FOUND, "not found")
+            except ValueError as error:
+                self._error(HTTPStatus.CONFLICT, str(error))
+            except Exception as error:
+                self._error(HTTPStatus.INTERNAL_SERVER_ERROR, str(error))
 
         def do_PUT(self) -> None:
             parsed = urlparse(self.path)

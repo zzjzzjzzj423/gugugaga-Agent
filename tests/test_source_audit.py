@@ -35,6 +35,7 @@ TARGET_MODULES = (
     "gugugaga.context_modes",
     "gugugaga.cron",
     "gugugaga.hooks",
+    "gugugaga.interactions",
     "gugugaga.models",
     "gugugaga.mutations",
     "gugugaga.observability",

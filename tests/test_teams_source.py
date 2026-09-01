@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
 from collections import deque
@@ -127,6 +128,48 @@ def test_message_bus_accepts_only_simple_identifier_mailbox_names():
     bus.send("lead", "alice-1_test", "safe")
 
     assert bus.read_inbox("alice-1_test")[0]["content"] == "safe"
+
+
+@pytest.mark.parametrize("alias", ["lead", "Lead", "LEAD", "leader", "Leader", "main"])
+def test_message_bus_normalizes_lead_aliases(alias):
+    bus = teams.MessageBus()
+
+    bus.send("alice", alias, "status", "result")
+    batch = bus.claim_inbox("lead")
+
+    assert batch.agent == "lead"
+    assert batch.messages[0]["to"] == "lead"
+    assert batch.messages[0]["content"] == "status"
+    bus.ack_inbox(batch)
+
+
+def test_lead_claim_recovers_legacy_leader_mailbox():
+    bus = teams.MessageBus()
+    config.MAILBOX_DIR.mkdir(parents=True, exist_ok=True)
+    legacy = config.MAILBOX_DIR / "Leader.jsonl"
+    legacy.write_text(
+        json.dumps(
+            {
+                "id": "msg_legacy_leader",
+                "from": "alice",
+                "to": "Leader",
+                "content": "recover result",
+                "type": "result",
+                "ts": time.time(),
+                "metadata": {},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert teams.signal_pending_lead_inbox() is True
+    batch = bus.claim_inbox("lead")
+
+    assert batch.messages[0]["to"] == "lead"
+    assert batch.messages[0]["content"] == "recover result"
+    assert not legacy.exists()
+    bus.ack_inbox(batch)
 
 
 def test_protocol_response_rejects_wrong_type_and_request_id():
@@ -290,19 +333,21 @@ def test_shutdown_request_is_acknowledged_and_routed_to_its_request(monkeypatch)
     assert teams.pending_requests[request_id].status == "approved"
 
 
-def test_reserved_lead_name_cannot_be_spawned_or_targeted():
+@pytest.mark.parametrize("alias", ["lead", "Leader", "main"])
+def test_reserved_lead_name_cannot_be_spawned_or_targeted(alias):
     class UnusedProvider:
         pass
 
     teams.set_team_provider(UnusedProvider())
 
-    assert teams.spawn_teammate_thread("lead", "developer", "steal inbox") == (
-        "Error: reserved teammate name: lead"
+    assert teams.spawn_teammate_thread(alias, "developer", "steal inbox") == (
+        f"Error: reserved teammate name: {alias}"
     )
-    assert teams.run_send_message("lead", "orphan") == (
-        "Error: reserved teammate name: lead"
+    assert teams.run_send_message(alias, "orphan") == (
+        "Error: you are the Lead Agent; send_message cannot be used "
+        "to send a message to yourself"
     )
-    assert "lead" not in teams.active_teammates
+    assert alias not in teams.active_teammates
 
 
 def test_check_inbox_returns_complete_content_before_acknowledging():
@@ -765,6 +810,46 @@ class ScriptedContentBlockProvider:
             )
             assert self.responses, "unexpected provider call"
             return self.responses.pop(0)
+
+
+def test_teammate_sending_to_leader_alias_reaches_canonical_lead_inbox(monkeypatch):
+    provider = ScriptedContentBlockProvider()
+    provider.responses = [
+        ProviderResponse(
+            content=[
+                ToolUseBlock(
+                    id="toolu_message_leader",
+                    name="send_message",
+                    input={"to": "Leader", "content": "Bob completed the task."},
+                )
+            ],
+            stop_reason="tool_use",
+        ),
+        ProviderResponse(
+            content=[TextBlock(text="Message delivered to Lead.")],
+            stop_reason="end_turn",
+        ),
+    ]
+    teams.set_team_provider(provider)
+    monkeypatch.setattr(teams, "IDLE_POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(teams, "IDLE_TIMEOUT", 0.02)
+
+    assert teams.spawn_teammate_thread("Bob", "developer", "Report to Leader").startswith(
+        "Teammate"
+    )
+    deadline = time.monotonic() + 2
+    while "Bob" in teams.active_teammates and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    messages = teams.consume_lead_inbox()
+    direct = next(message for message in messages if message["type"] == "message")
+    assert direct["from"] == "Bob"
+    assert direct["to"] == "lead"
+    assert direct["content"] == "Bob completed the task."
+    send_definition = next(
+        tool for tool in provider.requests[0]["tools"] if tool["name"] == "send_message"
+    )
+    assert "set to='lead'" in send_definition["description"]
 
 
 def test_teammate_uses_content_block_provider_in_selected_shared_workspace(

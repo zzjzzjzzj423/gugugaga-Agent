@@ -341,10 +341,14 @@ class TurnRecording:
         session_id: str,
         user_message: str,
         source: str,
+        history_user_message: str | None = None,
     ):
         self.system = system
         self.session_id = session_id
         self.user_message = user_message
+        self.history_user_message = (
+            user_message if history_user_message is None else history_user_message
+        )
         self.source = source
         self.turn_id = f"turn_{uuid.uuid4().hex}"
         self.capture = TurnCapture(self.turn_id)
@@ -367,7 +371,7 @@ class TurnRecording:
             session_id=self.session_id,
             turn_id=self.turn_id,
             role="user",
-            content=self.user_message,
+            content=self.history_user_message,
             source=self.source,
         )
         notify("turn_start", {"user_message": self.user_message})
@@ -434,12 +438,20 @@ class RecordingSystem:
         except Exception:
             pass
 
-    def start_turn(self, *, session_id: str, user_message: str, source: str) -> TurnRecording:
+    def start_turn(
+        self,
+        *,
+        session_id: str,
+        user_message: str,
+        source: str,
+        history_user_message: str | None = None,
+    ) -> TurnRecording:
         return TurnRecording(
             self,
             session_id=session_id,
             user_message=user_message,
             source=source,
+            history_user_message=history_user_message,
         )
 
     def _safe_chat_append(self, **values: Any) -> None:

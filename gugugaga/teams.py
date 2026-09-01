@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from . import config
 from .hooks import trigger_hooks
+from .interactions import AgentInteraction, interaction_broker
 from .models import ToolCall
 from .observability import (
     current_event_context,
@@ -27,11 +28,14 @@ from .mutations import mutation_actor_scope
 from .provider import is_context_length_error
 from .stateio import atomic_write_text, interprocess_lock
 from .tasks import (
+    append_task_intervention,
     assign_task,
     can_start,
     claim_task,
     complete_task,
+    create_queued_task,
     get_task_json,
+    interrupt_task,
     list_tasks,
     load_task,
 )
@@ -45,7 +49,9 @@ if TYPE_CHECKING:
 # config at call time so every teammate sees the selected shared workspace.
 _mailbox_lock = threading.RLock()
 _AGENT_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
-_RESERVED_TEAMMATE_NAMES = frozenset({"lead"})
+_LEAD_AGENT_NAME = "lead"
+_LEAD_AGENT_ALIASES = frozenset({"lead", "leader", "main"})
+_RESERVED_TEAMMATE_NAMES = _LEAD_AGENT_ALIASES
 _lead_inbox_event = threading.Event()
 _LEAD_WAKE_MESSAGE_TYPES = frozenset(
     {"result", "error", "plan_approval_request"}
@@ -56,6 +62,13 @@ def _validate_agent_name(name: str) -> str:
     if not isinstance(name, str) or not _AGENT_NAME_PATTERN.fullmatch(name):
         raise ValueError(f"invalid agent name: {name}")
     return name
+
+
+def _canonical_agent_name(name: str) -> str:
+    value = _validate_agent_name(name)
+    if value.casefold() in _LEAD_AGENT_ALIASES:
+        return _LEAD_AGENT_NAME
+    return value
 
 
 def _validate_teammate_name(name: str) -> str:
@@ -79,7 +92,44 @@ class MessageBus:
 
     @staticmethod
     def _lock_path(agent: str) -> Path:
+        agent = _canonical_agent_name(agent)
         return config.MAILBOX_DIR / f".{agent}.lock"
+
+    def _recover_lead_alias_mailboxes_locked(self) -> None:
+        """Move mail addressed to Lead aliases into the canonical mailbox."""
+
+        canonical = config.MAILBOX_DIR / f"{_LEAD_AGENT_NAME}.jsonl"
+        recovered: list[str] = []
+        claimed = set(self._claimed.values())
+        for path in sorted(config.MAILBOX_DIR.iterdir()):
+            if not path.is_file() or path in claimed:
+                continue
+            alias: str | None = None
+            if path.suffix == ".jsonl" and not path.name.startswith("."):
+                alias = path.stem
+            else:
+                match = re.fullmatch(
+                    r"\.([A-Za-z0-9_-]+)\.batch_[A-Za-z0-9]+\.inflight\.jsonl",
+                    path.name,
+                )
+                if match:
+                    alias = match.group(1)
+            if alias is None or alias.casefold() not in _LEAD_AGENT_ALIASES:
+                continue
+            if canonical.exists():
+                try:
+                    if path.samefile(canonical):
+                        continue
+                except OSError:
+                    pass
+            try:
+                recovered.append(path.read_text(encoding="utf-8"))
+                path.unlink()
+            except FileNotFoundError:
+                continue
+        if recovered:
+            existing = canonical.read_text(encoding="utf-8") if canonical.exists() else ""
+            atomic_write_text(canonical, existing + "".join(recovered))
 
     def send(
         self,
@@ -89,8 +139,8 @@ class MessageBus:
         msg_type: str = "message",
         metadata: dict | None = None,
     ) -> str:
-        _validate_agent_name(from_agent)
-        _validate_agent_name(to_agent)
+        from_agent = _canonical_agent_name(from_agent)
+        to_agent = _canonical_agent_name(to_agent)
         msg = {
             "id": f"msg_{uuid.uuid4().hex}",
             "from": from_agent,
@@ -108,7 +158,7 @@ class MessageBus:
             handle.write(json.dumps(msg, ensure_ascii=False) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
-        if to_agent.casefold() == "lead" and msg_type in _LEAD_WAKE_MESSAGE_TYPES:
+        if to_agent == _LEAD_AGENT_NAME and msg_type in _LEAD_WAKE_MESSAGE_TYPES:
             _lead_inbox_event.set()
             notify(
                 "team_inbox_unread",
@@ -123,9 +173,11 @@ class MessageBus:
         return msg["id"]
 
     def claim_inbox(self, agent: str) -> InboxBatch:
-        _validate_agent_name(agent)
+        agent = _canonical_agent_name(agent)
         config.MAILBOX_DIR.mkdir(parents=True, exist_ok=True)
         with _mailbox_lock, interprocess_lock(self._lock_path(agent)):
+            if agent == _LEAD_AGENT_NAME:
+                self._recover_lead_alias_mailboxes_locked()
             claimed_paths = set(self._claimed.values())
             recoverable = [
                 path
@@ -152,6 +204,13 @@ class MessageBus:
                     value = json.loads(line)
                     if not isinstance(value, dict):
                         raise ValueError("mailbox entry is not an object")
+                    for field_name in ("from", "to"):
+                        field_value = value.get(field_name)
+                        if (
+                            isinstance(field_value, str)
+                            and field_value.casefold() in _LEAD_AGENT_ALIASES
+                        ):
+                            value[field_name] = _LEAD_AGENT_NAME
                     messages.append(value)
                 except (json.JSONDecodeError, ValueError):
                     malformed.append(line)
@@ -217,6 +276,7 @@ _teammate_lock = threading.RLock()
 _teammate_threads: dict[str, threading.Thread] = {}
 _teammate_stop_events: dict[str, threading.Event] = {}
 _teammate_states: dict[str, dict[str, Any]] = {}
+_teammate_lifecycle_lock = threading.RLock()
 _teammate_stop_event = threading.Event()
 _team_accepting = False
 
@@ -296,6 +356,30 @@ def _persist_teammate_profile(name: str, role: str, prompt: str) -> None:
         )
 
 
+def _delete_teammate_profile(name: str) -> bool:
+    path = _team_profiles_path()
+    with interprocess_lock(path.with_suffix(".lock")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        agents = payload.get("agents")
+        if not isinstance(agents, dict) or name not in agents:
+            return False
+        agents.pop(name, None)
+        atomic_write_text(
+            path,
+            json.dumps(
+                {"version": 1, "agents": agents},
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+        return True
+
+
 def get_team_settings() -> dict[str, Any]:
     path = _team_settings_path()
     with interprocess_lock(path.with_suffix(".lock")):
@@ -340,11 +424,17 @@ def list_teammate_states() -> list[dict[str, Any]]:
         for task in tasks
         if task.status == "in_progress" and task.owner
     }
-    reserved_by_assignee = {
-        task.assignee: task.id
-        for task in tasks
-        if task.status == "pending" and task.assignee
-    }
+    reserved_by_assignee: dict[str, str] = {}
+    for task in sorted(
+        tasks,
+        key=lambda value: (
+            value.queue_position is None,
+            value.queue_position or 0,
+            value.id,
+        ),
+    ):
+        if task.status == "pending" and task.assignee:
+            reserved_by_assignee.setdefault(task.assignee, task.id)
     profiles = _load_teammate_profiles()
     with _teammate_lock:
         values = []
@@ -401,6 +491,86 @@ def assign_task_to_teammate(task_id: str, teammate: str) -> dict[str, Any]:
             raise
         _set_teammate_state(teammate, current_task_id=task.id)
     return asdict(task)
+
+
+def _submit_team_interaction_unlocked(
+    name: str,
+    action: str,
+    content: str = "",
+) -> dict[str, Any]:
+    """Apply one explicit user interaction to a selected Team Agent."""
+
+    _validate_teammate_name(name)
+    action = str(action or "").strip().lower()
+    profiles = _load_teammate_profiles()
+    with _teammate_lock:
+        state = dict(_teammate_states.get(name) or {})
+        active = name in active_teammates
+    if name not in profiles and not state:
+        raise ValueError(f"teammate '{name}' was not found")
+    broker = interaction_broker()
+    target = f"team:{name}"
+    current_task_id = state.get("current_task_id")
+    if action in {"steer", "redirect", "stop"} and not active:
+        raise ValueError(f"teammate '{name}' is not active")
+    if action == "queue":
+        item = broker.submit(target, action, content)
+        title = next(
+            (line.strip() for line in content.splitlines() if line.strip()),
+            "Queued Team Agent task",
+        )[:80]
+        try:
+            task = create_queued_task(
+                title,
+                content,
+                name,
+                interaction_id=item.id,
+            )
+            broker.update(item.id, "task_created", task_id=task.id)
+            if active and state.get("status") == "idle":
+                BUS.send(
+                    "lead",
+                    name,
+                    f"Queued task {task.id} is ready.",
+                    "task_assignment",
+                    {"task_id": task.id, "interaction_id": item.id},
+                )
+            return {**asdict(item), "status": "task_created", "task_id": task.id}
+        except Exception as error:
+            broker.update(item.id, "failed", metadata={"error": str(error)})
+            raise
+    item = broker.submit(
+        target,
+        action,
+        content,
+        task_id=current_task_id,
+    )
+    if current_task_id and action in {"steer", "redirect"}:
+        try:
+            append_task_intervention(
+                current_task_id,
+                interaction_id=item.id,
+                action=action,
+                content=content,
+                status="pending",
+            )
+        except (FileNotFoundError, ValueError):
+            pass
+    if action == "stop":
+        result = stop_teammate(name)
+        if result.startswith("Error:"):
+            broker.update(item.id, "failed", metadata={"error": result})
+            raise ValueError(result.removeprefix("Error:").strip())
+    return asdict(item)
+
+
+def submit_team_interaction(
+    name: str,
+    action: str,
+    content: str = "",
+) -> dict[str, Any]:
+    with _teammate_lifecycle_lock:
+        return _submit_team_interaction_unlocked(name, action, content)
 
 
 @dataclass(frozen=True)
@@ -568,10 +738,21 @@ def _lead_inbox_has_pending() -> bool:
     if (config.MAILBOX_DIR / "lead.jsonl").exists():
         return True
     claimed = set(getattr(BUS, "_claimed", {}).values())
-    return any(
-        path not in claimed
-        for path in config.MAILBOX_DIR.glob(".lead.*.inflight.jsonl")
-    )
+    if not config.MAILBOX_DIR.exists():
+        return False
+    for path in config.MAILBOX_DIR.iterdir():
+        if path in claimed or not path.is_file():
+            continue
+        if path.name.startswith("."):
+            match = re.fullmatch(
+                r"\.([A-Za-z0-9_-]+)\.batch_[A-Za-z0-9]+\.inflight\.jsonl",
+                path.name,
+            )
+            if match and match.group(1).casefold() in _LEAD_AGENT_ALIASES:
+                return True
+        elif path.suffix == ".jsonl" and path.stem.casefold() in _LEAD_AGENT_ALIASES:
+            return True
+    return False
 
 
 def signal_pending_lead_inbox() -> bool:
@@ -664,7 +845,10 @@ def render_lead_inbox(batch: InboxBatch) -> str:
     ]
     return (
         "<team-inbox>\n"
-        "These are collaboration messages delivered to Lead. Review result "
+        "You are the Lead Agent (protocol id: lead), and these collaboration "
+        "messages were delivered directly to you. Lead, Leader, and main all "
+        "refer to you, not to a teammate. Do not forward these messages or use "
+        "send_message to look for a teammate named Leader. Review result "
         "and error messages, respond to plan approval requests, and update "
         "task coordination when needed. Message ids support at-least-once "
         "deduplication.\n"
@@ -692,7 +876,7 @@ PLAN_APPROVAL_TIMEOUT = 60
 
 
 def scan_unclaimed_tasks(agent_name: str | None = None) -> list[dict]:
-    return [
+    values = [
         asdict(task)
         for task in list_tasks()
         if task.status == "pending"
@@ -700,6 +884,15 @@ def scan_unclaimed_tasks(agent_name: str | None = None) -> list[dict]:
         and (not task.assignee or task.assignee == agent_name)
         and can_start(task.id)
     ]
+    return sorted(
+        values,
+        key=lambda item: (
+            item.get("assignee") != agent_name,
+            item.get("queue_position") is None,
+            item.get("queue_position") or 0,
+            item["id"],
+        ),
+    )
 
 
 def idle_poll(
@@ -787,6 +980,36 @@ def idle_poll(
                     work_state is not None and work_state.get("task_id")
                 ):
                     return "work"
+        # Explicitly queued work is user-owned dispatch and must remain usable
+        # even while autonomous claiming is disabled.
+        assigned = [
+            item
+            for item in scan_unclaimed_tasks(agent_name)
+            if item.get("assignee") == agent_name
+        ]
+        if assigned:
+            task_data = assigned[0]
+            result = claim_task(task_data["id"], agent_name)
+            if result.startswith("Claimed"):
+                claimed = load_task(task_data["id"])
+                if work_state is not None:
+                    work_state["task_id"] = claimed.id
+                _set_teammate_state(
+                    agent_name,
+                    status="running",
+                    current_task_id=claimed.id,
+                )
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "<queued-task>"
+                            + json.dumps(asdict(claimed), ensure_ascii=False)
+                            + "</queued-task>"
+                        ),
+                    }
+                )
+                return "work"
         if not get_team_settings()["auto_claim_enabled"]:
             wait_seconds = float(IDLE_POLL_INTERVAL)
             if deadline is not None:
@@ -892,7 +1115,7 @@ def _dispatch_teammate_tool(
     return rendered, status
 
 
-def spawn_teammate_thread(
+def _spawn_teammate_thread_unlocked(
     name: str,
     role: str,
     prompt: str,
@@ -1060,7 +1283,11 @@ def spawn_teammate_thread(
             },
             {
                 "name": "send_message",
-                "description": "Send message to another agent.",
+                "description": (
+                    "Send a message to another agent. To report to the workspace "
+                    "Lead, set to='lead'; Lead, Leader, and main are normalized "
+                    "to the same reserved recipient."
+                ),
                 "input_schema": {
                     "type": "object",
                     "properties": {
@@ -1124,16 +1351,15 @@ def spawn_teammate_thread(
 
         def send_message(to: str, content: str) -> str:
             try:
-                if to.casefold() != "lead":
-                    _validate_teammate_name(to)
+                canonical_to = _canonical_agent_name(to)
+                if canonical_to != _LEAD_AGENT_NAME:
+                    _validate_teammate_name(canonical_to)
                     with _teammate_lock:
-                        if to not in active_teammates:
-                            return f"Error: teammate '{to}' is not active"
-                else:
-                    _validate_agent_name(to)
+                        if canonical_to not in active_teammates:
+                            return f"Error: teammate '{canonical_to}' is not active"
             except (AttributeError, ValueError) as error:
                 return f"Error: {error}"
-            BUS.send(name, to, content)
+            BUS.send(name, canonical_to, content)
             return "Sent"
 
         def list_task_lines() -> str:
@@ -1183,11 +1409,24 @@ def spawn_teammate_thread(
                         "Error: no active assigned task; workspace mutations "
                         "require a Task System assignment"
                     )
+            if handler in {run_bash, run_write}:
+                arguments.setdefault("cancel_event", stop_event)
             return handler(**arguments)
 
         def complete_owned_task(task_id: str) -> str:
             result = complete_task(task_id, owner=name)
             if result.startswith("Completed"):
+                try:
+                    completed = load_task(task_id)
+                    for intervention in completed.interventions:
+                        if intervention.get("action") == "queue" and intervention.get("id"):
+                            broker.update(
+                                str(intervention["id"]),
+                                "completed",
+                                task_id=task_id,
+                            )
+                except (FileNotFoundError, KeyError, ValueError):
+                    pass
                 work_state["report_task_id"] = task_id
                 if work_state["task_id"] == task_id:
                     work_state["task_id"] = None
@@ -1218,10 +1457,78 @@ def spawn_teammate_thread(
             )
         request_context = RequestContext(system=system, tools=sub_tools)
         latest_summary = ""
+        failed = False
+        broker = interaction_broker()
+        interaction_target = f"team:{name}"
+
+        def set_activity(phase: str, summary: str) -> None:
+            task_id = work_state.get("task_id")
+            _set_teammate_state(
+                name,
+                activity_phase=phase,
+                activity_summary=summary,
+            )
+            broker.set_phase(
+                interaction_target,
+                phase,
+                task_id=task_id,
+                summary=summary,
+            )
+            notify(
+                "teammate_activity",
+                {
+                    "name": name,
+                    "phase": phase,
+                    "summary": summary,
+                    "task_id": task_id,
+                },
+            )
+
+        def inject_interactions(actions: set[str]) -> list[AgentInteraction]:
+            values = broker.consume(interaction_target, actions)
+            for item in values:
+                label = "追加要求" if item.action == "steer" else "方向修正"
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            f"<user-{item.action} id=\"{item.id}\">"
+                            f"{label}：{item.content}"
+                            f"</user-{item.action}>"
+                        ),
+                    }
+                )
+                task_id = work_state.get("task_id")
+                if task_id:
+                    try:
+                        append_task_intervention(
+                            task_id,
+                            interaction_id=item.id,
+                            action=item.action,
+                            content=item.content,
+                            status="injected",
+                        )
+                    except (FileNotFoundError, ValueError):
+                        pass
+                broker.update(item.id, "injected", task_id=task_id)
+                notify(
+                    "teammate_activity",
+                    {
+                        "name": name,
+                        "phase": "interaction",
+                        "summary": f"已应用用户 {item.action}：{item.content}",
+                        "interaction_id": item.id,
+                        "task_id": task_id,
+                    },
+                )
+            return values
+
         try:
             iteration = 0
             attempted_recovery = False
+            broker.clear_cancel(interaction_target)
             if await_assignment:
+                set_activity("idle", "等待用户分配或队列任务")
                 initial_dispatch = idle_poll(
                     name,
                     messages,
@@ -1300,6 +1607,8 @@ def spawn_teammate_thread(
                                 break
                             continue
 
+                    inject_interactions({"redirect", "steer"})
+
                     if coordinator is not None:
                         try:
                             provider_messages = coordinator.prepare_request(
@@ -1318,6 +1627,7 @@ def spawn_teammate_thread(
                         provider_messages = messages
                     iteration += 1
                     rounds_this_burst += 1
+                    set_activity("llm_running", "正在分析当前任务并规划下一步")
                     try:
                         response = record_llm_call(
                             _team_provider,
@@ -1347,6 +1657,18 @@ def spawn_teammate_thread(
                     if stop_event.is_set():
                         should_shutdown = True
                         break
+                    if broker.pending(interaction_target, "redirect"):
+                        notify(
+                            "teammate_activity",
+                            {
+                                "name": name,
+                                "phase": "redirecting",
+                                "summary": "已丢弃过时模型响应，正在应用用户修正",
+                                "task_id": work_state.get("task_id"),
+                            },
+                        )
+                        inject_interactions({"redirect"})
+                        continue
                     if response.stop_reason == "max_tokens":
                         raise RuntimeError(
                             "Teammate response reached the output-token limit"
@@ -1369,6 +1691,17 @@ def spawn_teammate_thread(
                             raise RuntimeError(
                                 "Teammate finished without a text summary"
                             )
+                        if broker.pending(interaction_target, "steer", "redirect"):
+                            set_activity(
+                                "finalizing",
+                                "已形成阶段性结论，正在接收用户追加要求",
+                            )
+                            inject_interactions({"redirect", "steer"})
+                            continue
+                        set_activity(
+                            "finalizing",
+                            f"形成任务结论：{latest_summary[:500]}",
+                        )
                         result_metadata = {}
                         report_task_id = (
                             work_state["report_task_id"] or work_state["task_id"]
@@ -1387,10 +1720,14 @@ def spawn_teammate_thread(
                         break
                     results = []
                     plan_submitted = False
-                    for block in tool_blocks:
+                    for block_index, block in enumerate(tool_blocks):
                         if stop_event.is_set():
                             should_shutdown = True
                             break
+                        set_activity(
+                            "tool_running",
+                            f"正在执行工具 {block.name}",
+                        )
                         tool_started = time.monotonic()
                         if plan_submitted:
                             output = (
@@ -1432,9 +1769,24 @@ def spawn_teammate_thread(
                                 "content": str(output),
                             }
                         )
+                        if broker.pending(interaction_target, "redirect"):
+                            for skipped in tool_blocks[block_index + 1 :]:
+                                results.append(
+                                    {
+                                        "type": "tool_result",
+                                        "tool_use_id": skipped.id,
+                                        "content": (
+                                            "Tool not executed because the user "
+                                            "redirected the active task."
+                                        ),
+                                    }
+                                )
+                            break
                     if should_shutdown:
                         break
                     messages.append({"role": "user", "content": results})
+                    if broker.pending(interaction_target, "redirect", "steer"):
+                        inject_interactions({"redirect", "steer"})
                     if protocol_ctx["waiting_plan"]:
                         burst_complete = True
                         break
@@ -1447,6 +1799,7 @@ def spawn_teammate_thread(
                         "Teammate exceeded maximum rounds "
                         f"({_team_max_rounds_per_burst})"
                     )
+                set_activity("idle", "任务阶段结束，等待下一项队列任务")
                 idle_result = idle_poll(
                     name,
                     messages,
@@ -1460,6 +1813,8 @@ def spawn_teammate_thread(
                     break
 
         except Exception as error:
+            failed = True
+            set_activity("error", f"执行失败：{type(error).__name__}: {error}")
             notify(
                 "teammate_error",
                 {
@@ -1478,6 +1833,26 @@ def spawn_teammate_thread(
             except Exception:
                 pass
         finally:
+            task_id = work_state.get("task_id")
+            if task_id:
+                try:
+                    interrupt_task(task_id, name)
+                except (FileNotFoundError, ValueError):
+                    pass
+            for item in broker.consume(interaction_target, {"stop"}):
+                try:
+                    broker.update(
+                        item.id,
+                        "completed",
+                        task_id=task_id,
+                        metadata={"agent_stopped": True},
+                    )
+                except KeyError:
+                    pass
+            set_activity(
+                "error" if failed else "stopped",
+                "执行失败，等待用户处理" if failed else "Agent 已停止",
+            )
             if coordinator is not None:
                 coordinator.close()
             notify("teammate_end", {"name": name})
@@ -1490,7 +1865,7 @@ def spawn_teammate_thread(
                 if state is not None:
                     state.update(
                         {
-                            "status": "stopped",
+                            "status": "error" if failed else "stopped",
                             "online": False,
                             "current_task_id": None,
                             "last_active_at": time.time(),
@@ -1507,6 +1882,24 @@ def spawn_teammate_thread(
         _teammate_threads[name] = thread
     thread.start()
     return f"Teammate '{name}' spawned as {role}"
+
+
+def spawn_teammate_thread(
+    name: str,
+    role: str,
+    prompt: str,
+    *,
+    await_assignment: bool = False,
+    persist_profile: bool = True,
+) -> str:
+    with _teammate_lifecycle_lock:
+        return _spawn_teammate_thread_unlocked(
+            name,
+            role,
+            prompt,
+            await_assignment=await_assignment,
+            persist_profile=persist_profile,
+        )
 
 
 def stop_teammate(name: str) -> str:
@@ -1533,23 +1926,68 @@ def stop_teammate(name: str) -> str:
 def restart_teammate(name: str) -> str:
     """Restart one stopped teammate from its persisted workspace profile."""
 
-    try:
+    with _teammate_lifecycle_lock:
+        try:
+            _validate_teammate_name(name)
+        except ValueError as error:
+            return f"Error: {error}"
+        with _teammate_lock:
+            if name in active_teammates:
+                return f"Error: teammate '{name}' is already active"
+        profile = _load_teammate_profiles().get(name)
+        if profile is None:
+            return f"Error: persisted profile for teammate '{name}' was not found"
+        return _spawn_teammate_thread_unlocked(
+            name,
+            profile["role"],
+            profile["prompt"],
+            await_assignment=True,
+            persist_profile=False,
+        )
+
+
+def delete_teammate(name: str) -> dict[str, Any]:
+    """Delete one stopped teammate profile while preserving audit history."""
+
+    with _teammate_lifecycle_lock:
         _validate_teammate_name(name)
-    except ValueError as error:
-        return f"Error: {error}"
-    with _teammate_lock:
-        if name in active_teammates:
-            return f"Error: teammate '{name}' is already active"
-    profile = _load_teammate_profiles().get(name)
-    if profile is None:
-        return f"Error: persisted profile for teammate '{name}' was not found"
-    return spawn_teammate_thread(
-        name,
-        profile["role"],
-        profile["prompt"],
-        await_assignment=True,
-        persist_profile=False,
-    )
+        profiles = _load_teammate_profiles()
+        with _teammate_lock:
+            state = dict(_teammate_states.get(name) or {})
+            thread = _teammate_threads.get(name)
+            running = (
+                name in active_teammates
+                or bool(thread and thread.is_alive())
+                or bool(state.get("online"))
+                or state.get("status") in {"running", "stopping"}
+            )
+        if name not in profiles and not state:
+            raise ValueError(f"teammate '{name}' was not found")
+        if running:
+            raise ValueError(f"teammate '{name}' is running and cannot be deleted")
+        bound_tasks = [
+            task.id
+            for task in list_tasks()
+            if task.status in {"pending", "in_progress"}
+            and (task.assignee == name or task.owner == name)
+        ]
+        if bound_tasks:
+            raise ValueError(
+                f"teammate '{name}' still has unfinished tasks: "
+                + ", ".join(bound_tasks)
+            )
+        profile_deleted = _delete_teammate_profile(name)
+        with _teammate_lock:
+            _teammate_states.pop(name, None)
+            _teammate_threads.pop(name, None)
+            _teammate_stop_events.pop(name, None)
+            active_teammates.pop(name, None)
+        return {
+            "name": name,
+            "deleted": True,
+            "profile_deleted": profile_deleted,
+            "audit_preserved": True,
+        }
 
 
 def stop_all_teammates(timeout: float = 5.0) -> TeammateShutdownOutcome:
@@ -1721,14 +2159,20 @@ def run_restart_teammate(teammate: str) -> str:
 
 def run_send_message(to: str, content: str) -> str:
     try:
-        _validate_teammate_name(to)
+        canonical_to = _canonical_agent_name(to)
+        if canonical_to == _LEAD_AGENT_NAME:
+            return (
+                "Error: you are the Lead Agent; send_message cannot be used "
+                "to send a message to yourself"
+            )
+        _validate_teammate_name(canonical_to)
     except ValueError as error:
         return f"Error: {error}"
     with _teammate_lock:
-        if to not in active_teammates:
-            return f"Error: teammate '{to}' is not active"
-    BUS.send("lead", to, content)
-    return f"Sent to {to}"
+        if canonical_to not in active_teammates:
+            return f"Error: teammate '{canonical_to}' is not active"
+    BUS.send(_LEAD_AGENT_NAME, canonical_to, content)
+    return f"Sent to {canonical_to}"
 
 
 def run_check_inbox() -> str:

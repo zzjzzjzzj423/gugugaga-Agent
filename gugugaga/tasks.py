@@ -6,7 +6,7 @@ import random
 import re
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from . import config
@@ -27,6 +27,10 @@ class Task:
     owner: str | None
     blockedBy: list[str]
     assignee: str | None = None
+    queue_position: int | None = None
+    dispatch_type: str | None = None
+    interventions: list[dict] = field(default_factory=list)
+    interrupted_by_user: bool = False
 
 
 def _task_path(task_id: str) -> Path:
@@ -55,6 +59,94 @@ def create_task(
             owner=None,
             blockedBy=list(blockedBy or []),
         )
+        _save_task_unlocked(task)
+        return task
+
+
+def create_queued_task(
+    subject: str,
+    description: str,
+    assignee: str,
+    *,
+    interaction_id: str,
+) -> Task:
+    """Create one visible FIFO task reserved for a specific Team Agent."""
+
+    value = str(assignee or "").strip()
+    if not value:
+        raise ValueError("assignee is required")
+    title = str(subject or "").strip()[:120]
+    if not title:
+        raise ValueError("subject is required")
+    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
+        positions = [
+            task.queue_position or 0
+            for task in _list_tasks_unlocked()
+            if task.assignee == value
+            and task.dispatch_type == "queued"
+            and task.status in {"pending", "in_progress"}
+        ]
+        while True:
+            task_id = f"task_{int(time.time())}_{random.randint(0, 9999):04d}"
+            if not _task_path(task_id).exists():
+                break
+        now = time.time()
+        task = Task(
+            id=task_id,
+            subject=title,
+            description=str(description or "").strip(),
+            status="pending",
+            owner=None,
+            blockedBy=[],
+            assignee=value,
+            queue_position=max(positions, default=0) + 1,
+            dispatch_type="queued",
+            interventions=[
+                {
+                    "id": interaction_id,
+                    "action": "queue",
+                    "content": str(description or "").strip(),
+                    "status": "task_created",
+                    "created_at": now,
+                }
+            ],
+        )
+        _save_task_unlocked(task)
+        return task
+
+
+def append_task_intervention(
+    task_id: str,
+    *,
+    interaction_id: str,
+    action: str,
+    content: str,
+    status: str,
+) -> Task:
+    _task_path(task_id)
+    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
+        task = _load_task_unlocked(task_id)
+        existing = next(
+            (
+                item
+                for item in task.interventions
+                if item.get("id") == interaction_id
+            ),
+            None,
+        )
+        if existing is None:
+            task.interventions.append(
+                {
+                    "id": interaction_id,
+                    "action": action,
+                    "content": content,
+                    "status": status,
+                    "created_at": time.time(),
+                }
+            )
+        else:
+            existing["status"] = status
+            existing["updated_at"] = time.time()
         _save_task_unlocked(task)
         return task
 
@@ -159,6 +251,7 @@ def _claim_task_unlocked(task_id: str, owner: str = "agent") -> str:
     task.owner = owner
     task.assignee = owner
     task.status = "in_progress"
+    task.interrupted_by_user = False
     _save_task_unlocked(task)
     print(f"  \033[36m[claim] {task.subject} → in_progress\033[0m")
     return f"Claimed {task.id} ({task.subject})"
@@ -235,6 +328,62 @@ def release_task(task_id: str) -> Task:
         task.owner = None
         task.assignee = None
         _save_task_unlocked(task)
+        return task
+
+
+def interrupt_task(task_id: str, owner: str) -> Task:
+    """Release interrupted work while preserving its Team Agent reservation."""
+
+    _task_path(task_id)
+    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
+        task = _load_task_unlocked(task_id)
+        if task.status != "in_progress" or task.owner != owner:
+            raise ValueError(f"task {task_id} is not owned by {owner}")
+        task.status = "pending"
+        task.owner = None
+        task.assignee = owner
+        task.interrupted_by_user = True
+        _save_task_unlocked(task)
+        return task
+
+
+def delete_task(task_id: str) -> Task:
+    """Delete a non-running, unreferenced task and return its final record."""
+
+    path = _task_path(task_id)
+    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
+        task = _load_task_unlocked(task_id)
+        if task.status == "in_progress":
+            raise ValueError(f"task {task_id} is running and cannot be deleted")
+        dependents = [
+            candidate.id
+            for candidate in _list_tasks_unlocked()
+            if candidate.id != task_id and task_id in candidate.blockedBy
+        ]
+        if dependents:
+            raise ValueError(
+                f"task {task_id} is still required by: {', '.join(dependents)}"
+            )
+        path.unlink()
+        if task.dispatch_type == "queued" and task.assignee:
+            queued = sorted(
+                (
+                    candidate
+                    for candidate in _list_tasks_unlocked()
+                    if candidate.assignee == task.assignee
+                    and candidate.dispatch_type == "queued"
+                    and candidate.status in {"pending", "in_progress"}
+                ),
+                key=lambda candidate: (
+                    candidate.queue_position is None,
+                    candidate.queue_position or 0,
+                    candidate.id,
+                ),
+            )
+            for position, candidate in enumerate(queued, start=1):
+                if candidate.queue_position != position:
+                    candidate.queue_position = position
+                    _save_task_unlocked(candidate)
         return task
 
 

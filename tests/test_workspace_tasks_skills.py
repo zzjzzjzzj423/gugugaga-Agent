@@ -107,6 +107,28 @@ def test_claimed_task_can_be_released_for_manual_reassignment(
         tasks.release_task(task.id)
 
 
+def test_task_delete_rejects_running_and_referenced_tasks(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "TASKS_DIR", tmp_path / ".tasks")
+    dependency = tasks.create_task("dependency")
+    dependent = tasks.create_task("dependent", blockedBy=[dependency.id])
+
+    with pytest.raises(ValueError, match="still required by"):
+        tasks.delete_task(dependency.id)
+
+    deleted_dependent = tasks.delete_task(dependent.id)
+    assert deleted_dependent.id == dependent.id
+    with pytest.raises(FileNotFoundError):
+        tasks.load_task(dependent.id)
+
+    assert tasks.claim_task(dependency.id, "alice").startswith("Claimed")
+    with pytest.raises(ValueError, match="running and cannot be deleted"):
+        tasks.delete_task(dependency.id)
+
+    tasks.release_task(dependency.id)
+    assert tasks.delete_task(dependency.id).id == dependency.id
+    assert tasks.list_tasks() == []
+
+
 def test_lead_tool_handlers_cannot_claim_or_complete_team_tasks(
     tmp_path, monkeypatch
 ):
@@ -317,6 +339,9 @@ def test_system_prompt_rebuilds_from_live_workspace_skills_and_memory(
     assert "compact" in second
     assert "schedule_cron" not in second
     assert "spawn_teammate" in second
+    assert "you are the Lead Agent" in second
+    assert "fixed protocol id is 'lead'" in second
+    assert "message yourself" in second
     assert "create_worktree" not in second
     assert "connect_mcp" not in second
 

@@ -390,7 +390,10 @@ TOOL_DEFINITIONS: list[dict] = [
     },
     {
         "name": "send_message",
-        "description": "Send message to a teammate.",
+        "description": (
+            "Send a message from Lead to an active teammate. Lead is the current "
+            "main Agent and cannot message itself with this tool."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {

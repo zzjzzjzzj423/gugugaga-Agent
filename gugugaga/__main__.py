@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import queue
 import shlex
 import sys
 import threading
@@ -31,6 +32,7 @@ from .cron import (
     shutdown_cron,
 )
 from .hooks import trigger_hooks
+from .interactions import interaction_broker
 from .models import ChatProvider, ToolCall
 from .memory import MemoryService
 from .observability import RecordingSystem, set_default_observer
@@ -41,6 +43,7 @@ from .teams import (
     set_team_provider,
     signal_pending_lead_inbox,
     stop_all_teammates,
+    submit_team_interaction,
     wait_for_lead_inbox,
 )
 from .tasks import run_list_tasks
@@ -57,6 +60,9 @@ except ImportError:
 
 PROMPT = "\033[36mgugugaga >> \033[0m"
 CLI_ACTIVE = False
+CLI_INPUT_QUEUE: queue.Queue[str | None] | None = None
+CLI_TURN_RUNNING = threading.Event()
+CLI_APPROVAL_WAITING = threading.Event()
 
 
 @dataclass(frozen=True)
@@ -348,6 +354,10 @@ def handle_command(command: str, app: GugugagaApp) -> tuple[bool, str]:
     if command == "/help":
         return True, (
             "/help /status /tasks /team /memory /exit\n"
+            "/steer <main|agent> <text>\n"
+            "/queue <main|agent> <text>\n"
+            "/redirect <main|agent> <text>\n"
+            "/stop <main|agent>\n"
             "/memory [list|status|search <text>|show <id>|update <fact_id> <text>|"
             "forget <id>|retry]"
         )
@@ -375,6 +385,31 @@ def handle_command(command: str, app: GugugagaApp) -> tuple[bool, str]:
             ", ".join(sorted(active_teammates))
             or "No active teammates."
         )
+    interaction_match = __import__("re").fullmatch(
+        r"/(steer|queue|redirect|stop)(?:\s+(\S+))?(?:\s+([\s\S]+))?",
+        command,
+    )
+    if interaction_match:
+        action, raw_target, content = interaction_match.groups()
+        if not raw_target:
+            suffix = " <text>" if action != "stop" else ""
+            return True, f"usage: /{action} <main|agent>{suffix}"
+        if action != "stop" and not str(content or "").strip():
+            return True, f"usage: /{action} <main|agent> <text>"
+        try:
+            if raw_target == "main":
+                broker = interaction_broker(app.settings.workspace)
+                phase = broker.phase("main").get("phase", "idle")
+                if action == "queue" and phase in {"idle", "stopped", "error"}:
+                    raise ValueError("cannot queue main while it is not running")
+                item = broker.submit("main", action, content or "")
+                return True, f"{action} submitted to main ({item.id})"
+            name = raw_target.removeprefix("team:")
+            result = submit_team_interaction(name, action, content or "")
+            suffix = f"; task={result['task_id']}" if result.get("task_id") else ""
+            return True, f"{action} submitted to {name}{suffix}"
+        except (KeyError, ValueError) as error:
+            return True, f"interaction error: {error}"
     if command == "/memory" or command.startswith("/memory "):
         try:
             parts = shlex.split(command)
@@ -416,6 +451,19 @@ def handle_command(command: str, app: GugugagaApp) -> tuple[bool, str]:
 
 
 def _approval_prompt(call: ToolCall) -> bool:
+    global CLI_INPUT_QUEUE
+    if CLI_ACTIVE and CLI_INPUT_QUEUE is not None:
+        print(
+            f"\nPermission required: {call.name} "
+            f"{json.dumps(call.arguments, ensure_ascii=False)}"
+        )
+        terminal_print("Allow? Enter y/yes to approve; anything else denies.")
+        CLI_APPROVAL_WAITING.set()
+        try:
+            answer = CLI_INPUT_QUEUE.get()
+        finally:
+            CLI_APPROVAL_WAITING.clear()
+        return str(answer or "").strip().lower() in {"y", "yes"}
     if threading.current_thread() is not threading.main_thread():
         print(
             "\n[permission deferred] Run this request in the foreground to "
@@ -492,7 +540,7 @@ def cron_autorun_loop(
 
 
 def main(argv: list[str] | None = None) -> int:
-    global CLI_ACTIVE
+    global CLI_ACTIVE, CLI_INPUT_QUEUE
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
     args = create_parser().parse_args(raw_argv)
     try:
@@ -555,12 +603,58 @@ def main(argv: list[str] | None = None) -> int:
     lead_inbox_starter = getattr(app, "start_lead_inbox_loop", None)
     if callable(lead_inbox_starter):
         lead_inbox_starter(terminal_print)
+    CLI_INPUT_QUEUE = queue.Queue()
+
+    def read_cli_input() -> None:
+        while not app.stop_event.is_set():
+            try:
+                value = input(PROMPT)
+            except (EOFError, KeyboardInterrupt, StopIteration):
+                CLI_INPUT_QUEUE.put(None)
+                return
+            stripped = value.strip()
+            is_interaction = stripped.startswith(
+                ("/steer ", "/queue ", "/redirect ", "/stop ")
+            )
+            if (
+                CLI_TURN_RUNNING.is_set()
+                and is_interaction
+                and not CLI_APPROVAL_WAITING.is_set()
+            ):
+                handled, output = handle_command(value, app)
+                if handled and output:
+                    terminal_print(output)
+                continue
+            if CLI_TURN_RUNNING.is_set() and not CLI_APPROVAL_WAITING.is_set():
+                terminal_print(
+                    "Agent 正在运行；请显式使用 /steer、/queue、/redirect 或 /stop，"
+                    "并指定 main/Team Agent。"
+                )
+                continue
+            CLI_INPUT_QUEUE.put(value)
+
+    input_thread = threading.Thread(
+        target=read_cli_input,
+        name="gugugaga-cli-input",
+        daemon=True,
+    )
+    input_thread.start()
+    asynchronous_input = hasattr(input_thread, "is_alive")
+    if not asynchronous_input:
+        # Lightweight test/application thread adapters may intentionally not
+        # run a background target. Preserve the traditional blocking path.
+        CLI_INPUT_QUEUE = None
     try:
         while True:
-            try:
-                query = input(PROMPT)
-            except (EOFError, KeyboardInterrupt):
-                break
+            if asynchronous_input:
+                query = CLI_INPUT_QUEUE.get()
+                if query is None:
+                    break
+            else:
+                try:
+                    query = input(PROMPT)
+                except (EOFError, KeyboardInterrupt, StopIteration):
+                    break
             if query.strip().lower() in {"q", "exit", "/exit", "/quit", ""}:
                 break
             handled, output = handle_command(query, app)
@@ -569,14 +663,19 @@ def main(argv: list[str] | None = None) -> int:
                     break
                 print(output)
                 continue
-            reply = app.runtime.run_turn(query, source="cli")
-            context = app.runtime.context
-            if reply:
-                terminal_print(reply)
-            print()
+            CLI_TURN_RUNNING.set()
+            try:
+                reply = app.runtime.run_turn(query, source="cli")
+                context = app.runtime.context
+                if reply:
+                    terminal_print(reply)
+                print()
+            finally:
+                CLI_TURN_RUNNING.clear()
     finally:
         app.close()
         CLI_ACTIVE = False
+        CLI_INPUT_QUEUE = None
     return 0
 
 

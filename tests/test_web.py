@@ -237,6 +237,41 @@ def test_store_exposes_real_memory_and_sqlite_views():
         gc.collect()
 
 
+def test_chat_history_hides_internal_team_inbox_payloads():
+    with TemporaryDirectory(prefix=".web-inbox-visibility-", dir=Path.cwd()) as directory:
+        store = DashboardStore(directory)
+        raw_inbox = (
+            '<team-inbox>\n[{"from":"Alice","type":"result",'
+            '"content":"finished"}]\n</team-inbox>'
+        )
+        store.repository.record_exchange(
+            session_id="session_inbox_only",
+            turn_id="turn_inbox_only",
+            user_content=raw_inbox,
+            assistant_content="Alice 已完成任务。",
+            source="team_inbox",
+        )
+        store.repository.record_exchange(
+            session_id="session_mixed",
+            turn_id="turn_mixed",
+            user_content=f"{raw_inbox}\n\n请继续下一步。",
+            assistant_content="正在继续。",
+            source="web",
+        )
+
+        inbox_history = store.chat_history("session_inbox_only")
+        mixed_history = store.chat_history("session_mixed")
+        sessions = {item["session_id"]: item for item in store.sessions()}
+
+        assert [item["role"] for item in inbox_history] == ["assistant"]
+        assert inbox_history[0]["content"] == "Alice 已完成任务。"
+        assert mixed_history[0]["content"] == "请继续下一步。"
+        assert "team-inbox" not in sessions["session_inbox_only"]["title"]
+        assert sessions["session_mixed"]["title"] == "请继续下一步。"
+        del store
+        gc.collect()
+
+
 def test_chat_publishes_runtime_and_observer_events():
     with TemporaryDirectory(prefix=".web-test-", dir=Path.cwd()) as directory:
         fake_app = FakeApp()
@@ -525,11 +560,47 @@ def test_task_page_contains_team_and_subagent_controls():
     assert 'id="team-auto-claim"' in html
     assert 'id="team-agent-list"' in html
     assert 'id="subagent-current"' in html
+    assert 'id="team-detail-delete"' in html
     assert "/api/team/settings" in script
     assert "/api/team/agents" in script
+    assert "method: 'DELETE'" in script
+    assert "运行中不可删除" in script
     assert "loadTeamAgents" not in script
     assert "/api/subagents/history" in script
+    assert "event.agent_type !== 'main'" in script
     assert ".innerHTML" not in script
+
+
+def test_agent_overview_only_synthesizes_main_agent_runtime_events():
+    with TemporaryDirectory(prefix=".web-overview-source-", dir=Path.cwd()) as directory:
+        application = DashboardApplication(directory, runtime_factory=FakeApp)
+
+        application._forward_runtime_event(
+            {
+                "type": "context",
+                "status": "success",
+                "agent_type": "teammate",
+                "agent_id": "alice",
+            }
+        )
+        teammate_events = application.events.wait_after(0, timeout=0)
+
+        assert [event["type"] for event in teammate_events] == ["context"]
+        assert teammate_events[0]["agent_type"] == "teammate"
+
+        last_event_id = teammate_events[-1]["event_id"]
+        application._forward_runtime_event(
+            {"type": "context", "status": "success", "agent_type": "main"}
+        )
+        main_events = application.events.wait_after(last_event_id, timeout=0)
+
+        assert [event.get("stage") for event in main_events] == [
+            "compression_gate",
+            None,
+            "agent",
+        ]
+        del application
+        gc.collect()
 
 
 def test_http_server_serves_console_and_api():
@@ -562,6 +633,20 @@ def test_http_server_serves_console_and_api():
                 payload = json.loads(response.read())
                 assert payload["counts"]["total"] == 0
                 assert payload["scheduled_tasks"] == []
+            deletable = tasks.create_task("delete through API")
+            request = Request(
+                f"{base}/api/tasks/{deletable.id}",
+                method="DELETE",
+            )
+            with urlopen(request, timeout=3) as response:
+                payload = json.loads(response.read())
+                assert payload["id"] == deletable.id
+                assert payload["deleted"] is True
+            try:
+                tasks.load_task(deletable.id)
+                raise AssertionError("deleted task must not remain on disk")
+            except FileNotFoundError:
+                pass
             with urlopen(f"{base}/api/team/settings", timeout=3) as response:
                 assert json.loads(response.read())["auto_claim_enabled"] is False
             request = Request(

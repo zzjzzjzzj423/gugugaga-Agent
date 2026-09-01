@@ -17,6 +17,8 @@
     turnRunning: false,
     permission: null,
     teamAgents: [],
+    teamDetailName: null,
+    teamDetail: null,
     pageScroll: { overview: 0, tasks: 0, memory: 0, database: 0 },
   };
 
@@ -231,8 +233,23 @@
         controls.append(release); card.append(controls);
       }
     }
+    const deleteControls = document.createElement('div'); deleteControls.className = 'task-delete-controls';
+    const deleteButton = document.createElement('button'); deleteButton.type = 'button';
+    const taskRunning = task.status === 'in_progress';
+    deleteButton.textContent = taskRunning ? '运行中不可删除' : '删除任务';
+    deleteButton.disabled = taskRunning;
+    deleteButton.addEventListener('click', async () => {
+      if (!window.confirm(`确认永久删除任务「${task.subject}」吗？历史审计事件仍会保留。`)) return;
+      deleteButton.disabled = true;
+      try {
+        await api(`/api/tasks/${encodeURIComponent(task.id)}`, { method: 'DELETE' });
+        await loadTasks();
+      } catch (error) { window.alert(error.message); }
+      finally { deleteButton.disabled = taskRunning; }
+    });
+    deleteControls.append(deleteButton); card.append(deleteControls);
     const footer = document.createElement('footer');
-    const owner = document.createElement('span'); owner.textContent = task.owner ? `负责人 · ${task.owner}` : '尚未分配';
+    const owner = document.createElement('span'); owner.textContent = task.owner ? `负责人 · ${task.owner}` : (task.assignee ? `预留给 · ${task.assignee}` : '尚未分配');
     const updated = document.createElement('time'); updated.textContent = `更新于 ${formatDate(task.updated_at)}`;
     footer.append(owner, updated); card.append(footer);
     return card;
@@ -248,17 +265,22 @@
     }
     state.teamAgents.forEach((agent) => {
       const card = document.createElement('article'); card.className = `team-agent-item is-${agent.status || 'idle'}`;
+      card.tabIndex = 0;
+      card.setAttribute('role', 'button');
+      card.setAttribute('aria-label', `查看 Team Agent ${agent.name} 的工作详情`);
       const dot = document.createElement('span'); dot.className = `team-status-dot${agent.online ? ' is-online' : ''}`;
       const body = document.createElement('div');
       const name = document.createElement('strong'); name.textContent = agent.name;
       const role = document.createElement('small'); role.textContent = `${agent.role || 'teammate'} · ${agent.status || 'unknown'}`;
       body.append(name, role);
       const task = document.createElement('code'); task.textContent = agent.current_task_id || 'idle';
+      const actions = document.createElement('div'); actions.className = 'team-agent-actions';
       const action = document.createElement('button'); action.type = 'button'; action.className = 'team-agent-action';
       const canStop = Boolean(agent.online) && agent.status !== 'stopping';
       action.textContent = canStop ? '关闭' : (agent.status === 'stopping' ? '关闭中' : '重新启动');
       action.disabled = agent.status === 'stopping';
-      action.addEventListener('click', async () => {
+      action.addEventListener('click', async (event) => {
+        event.stopPropagation();
         const operation = canStop ? 'stop' : 'restart';
         const verb = canStop ? '关闭' : '重新启动';
         if (!window.confirm(`确认${verb} Team Agent「${agent.name}」吗？`)) return;
@@ -269,8 +291,131 @@
         } catch (error) { window.alert(error.message); }
         finally { action.disabled = false; }
       });
-      card.append(dot, body, task, action); list.append(card);
+      const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'team-agent-action danger'; remove.textContent = '删除';
+      remove.disabled = Boolean(agent.online) || agent.status === 'stopping';
+      remove.title = remove.disabled ? '运行中的 Team Agent 不能删除' : '删除 Team Agent';
+      remove.addEventListener('click', async (event) => {
+        event.stopPropagation();
+        if (!window.confirm(`确认永久删除 Team Agent「${agent.name}」吗？运行轨迹和审计记录会保留。`)) return;
+        remove.disabled = true;
+        try {
+          await api(`/api/team/agents/${encodeURIComponent(agent.name)}`, { method: 'DELETE' });
+          if (state.teamDetailName === agent.name) closeTeamAgentDetail();
+          await loadTasks();
+        } catch (error) { window.alert(error.message); }
+        finally { remove.disabled = Boolean(agent.online) || agent.status === 'stopping'; }
+      });
+      card.addEventListener('click', () => openTeamAgentDetail(agent.name));
+      card.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault(); openTeamAgentDetail(agent.name);
+        }
+      });
+      actions.append(action, remove);
+      card.append(dot, body, task, actions); list.append(card);
     });
+  }
+
+  function appendTeamEmpty(container, text) {
+    const empty = document.createElement('div'); empty.className = 'team-detail-empty'; empty.textContent = text; container.append(empty);
+  }
+
+  function teamEventSummary(event) {
+    if (event.type === 'teammate_activity' || event.type === 'agent_phase') return event.summary || event.phase || event.status || event.type;
+    if (event.type === 'tool') return `${event.tool || 'tool'} · ${event.status || '完成'}`;
+    if (event.type === 'llm') return `模型请求 · ${event.status || '完成'}`;
+    if (event.type === 'agent_interaction') return `${event.action || 'interaction'} · ${event.status || 'pending'}`;
+    if (event.type === 'teammate_error') return event.error || 'Team Agent 执行失败';
+    return event.summary || event.status || event.type;
+  }
+
+  function renderTeamAgentDetail(payload) {
+    state.teamDetail = payload;
+    const agent = payload.agent || {};
+    const phase = agent.interaction_phase || {};
+    $('#team-detail-title').textContent = agent.name || state.teamDetailName || 'Team Agent';
+    $('#team-detail-meta').textContent = `${agent.role || 'teammate'} · ${agent.status || 'unknown'} · ${agent.online ? 'online' : 'offline'}`;
+    $('#team-detail-phase').textContent = phase.phase || agent.activity_phase || agent.status || '—';
+    $('#team-detail-task').textContent = payload.current_task ? `${payload.current_task.id} · ${payload.current_task.subject}` : '当前无执行任务';
+    $('#team-detail-disclosure').textContent = payload.disclosure || '展示可审计的工作摘要，不展示模型隐藏思维链。';
+
+    const activity = $('#team-detail-activity'); activity.replaceChildren();
+    const activityText = phase.summary || agent.activity_summary;
+    if (activityText) {
+      const paragraph = document.createElement('p'); paragraph.textContent = activityText; activity.append(paragraph);
+    } else appendTeamEmpty(activity, '尚无工作摘要');
+
+    const queue = $('#team-detail-queue'); queue.replaceChildren();
+    const queuedTasks = payload.queued_tasks || [];
+    if (!queuedTasks.length) appendTeamEmpty(queue, '没有排队任务');
+    queuedTasks.forEach((task) => {
+      const item = document.createElement('article');
+      const title = document.createElement('strong'); title.textContent = `${task.queue_position || '—'} · ${task.subject}`;
+      const meta = document.createElement('small'); meta.textContent = `${task.id} · ${task.status}`;
+      const description = document.createElement('p'); description.textContent = task.description || '无任务描述';
+      item.append(title, meta, description); queue.append(item);
+    });
+
+    const interactions = $('#team-detail-interactions'); interactions.replaceChildren();
+    const interactionItems = payload.interactions || [];
+    if (!interactionItems.length) appendTeamEmpty(interactions, '尚无用户干预');
+    interactionItems.forEach((item) => {
+      const row = document.createElement('article');
+      const title = document.createElement('strong'); title.textContent = `${item.action} · ${item.status}`;
+      const meta = document.createElement('small'); meta.textContent = `${item.task_id || '未绑定任务'} · ${formatDate(item.created_at ? item.created_at * 1000 : null)}`;
+      const content = document.createElement('p'); content.textContent = item.content || '停止当前 Agent';
+      row.append(title, meta, content); interactions.append(row);
+    });
+
+    const timeline = $('#team-detail-timeline'); timeline.replaceChildren();
+    const events = payload.events || [];
+    if (!events.length) appendTeamEmpty(timeline, '尚无活动事件');
+    events.slice().reverse().forEach((event) => {
+      const row = document.createElement('details');
+      const summary = document.createElement('summary'); summary.textContent = `${formatDate(event.timestamp)} · ${event.type} · ${teamEventSummary(event)}`;
+      const content = document.createElement('pre'); content.textContent = JSON.stringify(event, null, 2);
+      row.append(summary, content); timeline.append(row);
+    });
+
+    const lifecycle = $('#team-detail-lifecycle');
+    lifecycle.textContent = agent.online ? '关闭 Agent' : '重新启动';
+    lifecycle.dataset.operation = agent.online ? 'stop' : 'restart';
+    lifecycle.disabled = agent.status === 'stopping';
+    const remove = $('#team-detail-delete');
+    remove.disabled = Boolean(agent.online) || agent.status === 'stopping';
+    remove.title = remove.disabled ? '运行中的 Team Agent 不能删除' : '删除 Team Agent';
+    const action = $('#team-interaction-action');
+    [...action.options].forEach((option) => {
+      option.disabled = !agent.online && option.value !== 'queue';
+    });
+    if (action.selectedOptions[0]?.disabled) action.value = 'queue';
+  }
+
+  async function loadTeamAgentDetail() {
+    if (!state.teamDetailName || $('#team-detail-backdrop').hidden) return;
+    try {
+      const payload = await api(`/api/team/agents/${encodeURIComponent(state.teamDetailName)}`);
+      renderTeamAgentDetail(payload);
+    } catch (error) {
+      $('#team-interaction-result').textContent = error.message;
+    }
+  }
+
+  async function openTeamAgentDetail(name) {
+    state.teamDetailName = name;
+    state.teamDetail = null;
+    $('#team-detail-title').textContent = name;
+    $('#team-detail-backdrop').hidden = false;
+    document.body.classList.add('has-modal');
+    $('#team-interaction-result').textContent = '';
+    await loadTeamAgentDetail();
+  }
+
+  function closeTeamAgentDetail() {
+    $('#team-detail-backdrop').hidden = true;
+    document.body.classList.remove('has-modal');
+    state.teamDetailName = null;
+    state.teamDetail = null;
   }
 
   function renderSubagents(current, history) {
@@ -567,6 +712,9 @@
   }
 
   function normalizeEvent(event) {
+    // Agent Overview visualizes the Lead only. Child-agent events remain
+    // available to their task/detail panels but never drive this graph.
+    if (event.agent_type && event.agent_type !== 'main') return null;
     let stage = event.stage;
     if (!stage) {
       if (event.type === 'turn_start') return null;
@@ -1048,8 +1196,10 @@
     const selected = selectedSession();
     $('#history-mode-banner').hidden = !historical;
     $('#chat-input').disabled = historical;
-    $('#send-button').disabled = historical || state.turnRunning;
-    $('#chat-input').placeholder = historical ? '历史对话为只读，返回当前对话后可继续聊天' : 'Message gugugaga…';
+    $('#send-button').disabled = historical;
+    $('#busy-interaction-control').hidden = !state.turnRunning || historical;
+    $('#composer-hint').textContent = state.turnRunning ? '明确选择 Steer / Queue / Redirect 后发送' : 'Enter 发送 · Shift+Enter 换行';
+    $('#chat-input').placeholder = historical ? '历史对话为只读，返回当前对话后可继续聊天' : (state.turnRunning ? '输入对当前运行的干预…' : 'Message gugugaga…');
     if (historical) $('#chat-session-label').textContent = `历史对话 · ${selected?.turn_count || 0} Turns`;
     else if (state.currentSessionId) $('#chat-session-label').textContent = `当前对话 · ${selected?.turn_count || 0} Turns`;
     else $('#chat-session-label').textContent = '当前对话 · 尚未开始';
@@ -1211,7 +1361,7 @@
 
   async function sendMessage(message) {
     if (isViewingHistory()) return;
-    state.turnRunning = true; state.contextModeLocked = true; updateContextModeControl(); $('#send-button').disabled = true; $('#new-chat-button').disabled = true; $('#settings-button').disabled = true; $('#typing-state').hidden = false; addMessage('user', message);
+    state.turnRunning = true; state.contextModeLocked = true; updateConversationMode(); $('#new-chat-button').disabled = true; $('#settings-button').disabled = true; $('#typing-state').hidden = false; addMessage('user', message);
     try {
       const data = await api('/api/chat', { method: 'POST', body: JSON.stringify({ message }) });
       if (data.session_id) {
@@ -1233,9 +1383,21 @@
   }
 
   $('#chat-form').addEventListener('submit', (event) => {
-    event.preventDefault(); if (state.turnRunning || isViewingHistory()) return;
+    event.preventDefault(); if (isViewingHistory()) return;
     const input = $('#chat-input'); const message = input.value.trim(); if (!message) return;
-    input.value = ''; sendMessage(message);
+    input.value = '';
+    if (state.turnRunning) {
+      const action = $('#chat-interaction-action').value;
+      api('/api/interactions', {
+        method: 'POST', body: JSON.stringify({ target: 'main', action, content: message }),
+      }).then(() => {
+        addMessage('user', `[${action}] ${message}`);
+      }).catch((error) => {
+        addMessage('assistant', `无法提交 ${action}：${error.message}`);
+      });
+      return;
+    }
+    sendMessage(message);
   });
 
   $('#chat-input').addEventListener('keydown', (event) => {
@@ -1243,6 +1405,62 @@
   });
   $('#permission-allow').addEventListener('click', () => reviewPermission(true));
   $('#permission-deny').addEventListener('click', () => reviewPermission(false));
+  $('#team-detail-close').addEventListener('click', closeTeamAgentDetail);
+  $('#team-detail-backdrop').addEventListener('click', (event) => {
+    if (event.target === $('#team-detail-backdrop')) closeTeamAgentDetail();
+  });
+  $('#team-interaction-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (!state.teamDetailName) return;
+    const action = $('#team-interaction-action').value;
+    const content = $('#team-interaction-content').value.trim();
+    if (!content) return;
+    const submit = $('#team-interaction-submit'); submit.disabled = true;
+    $('#team-interaction-result').textContent = '正在提交…';
+    try {
+      const result = await api('/api/interactions', {
+        method: 'POST',
+        body: JSON.stringify({ target: `team:${state.teamDetailName}`, action, content }),
+      });
+      $('#team-interaction-content').value = '';
+      $('#team-interaction-result').textContent = action === 'queue' ? `已创建可见任务 ${result.task_id}` : `已提交 ${action}`;
+      await Promise.all([loadTeamAgentDetail(), loadTasks()]);
+    } catch (error) {
+      $('#team-interaction-result').textContent = error.message;
+    } finally { submit.disabled = false; }
+  });
+  $('#team-detail-lifecycle').addEventListener('click', async () => {
+    if (!state.teamDetailName) return;
+    const button = $('#team-detail-lifecycle');
+    const operation = button.dataset.operation;
+    const verb = operation === 'stop' ? '关闭' : '重新启动';
+    if (!window.confirm(`确认${verb} Team Agent「${state.teamDetailName}」吗？`)) return;
+    button.disabled = true;
+    try {
+      if (operation === 'stop') {
+        await api('/api/interactions', { method: 'POST', body: JSON.stringify({ target: `team:${state.teamDetailName}`, action: 'stop', content: '' }) });
+      } else {
+        await api(`/api/team/agents/${encodeURIComponent(state.teamDetailName)}/restart`, { method: 'POST', body: '{}' });
+      }
+      await Promise.all([loadTeamAgentDetail(), loadTasks()]);
+    } catch (error) { $('#team-interaction-result').textContent = error.message; }
+    finally { button.disabled = false; }
+  });
+  $('#team-detail-delete').addEventListener('click', async () => {
+    if (!state.teamDetailName || !state.teamDetail) return;
+    const agent = state.teamDetail.agent || {};
+    if (agent.online || agent.status === 'stopping') return;
+    if (!window.confirm(`确认永久删除 Team Agent「${state.teamDetailName}」吗？运行轨迹和审计记录会保留。`)) return;
+    const button = $('#team-detail-delete'); button.disabled = true;
+    try {
+      await api(`/api/team/agents/${encodeURIComponent(state.teamDetailName)}`, { method: 'DELETE' });
+      closeTeamAgentDetail();
+      await loadTasks();
+    } catch (error) {
+      $('#team-interaction-result').textContent = error.message;
+      button.disabled = false;
+    }
+  });
 
   async function init() {
     await loadStatus();
@@ -1258,6 +1476,7 @@
     }, 1000);
     setInterval(() => { if (!state.turnRunning) loadOverview(); }, 5000);
     setInterval(() => { if (!state.turnRunning && state.page === 'tasks') loadTasks(); }, 15000);
+    setInterval(loadTeamAgentDetail, 2500);
   }
 
   init();
