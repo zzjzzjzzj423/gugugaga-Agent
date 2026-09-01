@@ -6,10 +6,9 @@ from typing import Any, Callable
 
 from .cron import run_cancel_cron, run_list_crons, run_schedule_cron
 from .models import ToolSpec
+from .observability import current_event_context
 from .skills import load_skill
 from .tasks import (
-    run_claim_task,
-    run_complete_task,
     run_create_task,
     run_get_task,
     run_list_tasks,
@@ -22,6 +21,8 @@ from .teams import (
     run_review_plan,
     run_send_message,
     run_spawn_teammate,
+    run_restart_teammate,
+    run_stop_teammate,
 )
 from .workspace import run_bash, run_edit, run_glob, run_read, run_write
 from .web_search import run_web_search
@@ -41,6 +42,36 @@ def run_compact(focus: str = "") -> str:
     return "[Compaction requested.]"
 
 
+def run_lead_create_task(
+    subject: str,
+    description: str = "",
+    blockedBy: list[str] | None = None,
+) -> str:
+    context = current_event_context()
+    if context.get("source") == "team_inbox":
+        return (
+            "Error: an automatic Lead inbox Turn cannot create tasks; "
+            "wait for an explicit user Turn"
+        )
+    return run_create_task(subject, description, blockedBy)
+
+
+def run_lead_claim_task(task_id: str) -> str:
+    del task_id
+    return (
+        "Error: Lead cannot claim Task System work. Assign the task to an "
+        "online idle Team Agent from the Task UI."
+    )
+
+
+def run_lead_complete_task(task_id: str) -> str:
+    del task_id
+    return (
+        "Error: Lead cannot complete Task System work. Only the Team Agent "
+        "that owns the task may complete it."
+    )
+
+
 TOOL_DEFINITIONS: list[dict] = [
     {
         "name": "bash",
@@ -50,6 +81,10 @@ TOOL_DEFINITIONS: list[dict] = [
             "properties": {
                 "command": {"type": "string"},
                 "run_in_background": {"type": "boolean"},
+                "write_paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
             },
             "required": ["command"],
         },
@@ -63,6 +98,7 @@ TOOL_DEFINITIONS: list[dict] = [
                 "path": {"type": "string"},
                 "limit": {"type": "integer"},
                 "offset": {"type": "integer"},
+                "include_hash": {"type": "boolean"},
             },
             "required": ["path"],
         },
@@ -75,6 +111,7 @@ TOOL_DEFINITIONS: list[dict] = [
             "properties": {
                 "path": {"type": "string"},
                 "content": {"type": "string"},
+                "expected_sha256": {"type": "string"},
             },
             "required": ["path", "content"],
         },
@@ -88,6 +125,7 @@ TOOL_DEFINITIONS: list[dict] = [
                 "path": {"type": "string"},
                 "old_text": {"type": "string"},
                 "new_text": {"type": "string"},
+                "expected_sha256": {"type": "string"},
             },
             "required": ["path", "old_text", "new_text"],
         },
@@ -130,12 +168,77 @@ TOOL_DEFINITIONS: list[dict] = [
         },
     },
     {
-        "name": "task",
-        "description": "Launch a focused subagent. Returns only its final summary.",
+        "name": "spawn_subagent",
+        "description": (
+            "Start a focused Subagent asynchronously inside the current Turn. "
+            "Returns its subagent_id immediately. The Turn cannot finish until "
+            "every started Subagent reaches a terminal state."
+        ),
         "input_schema": {
             "type": "object",
-            "properties": {"description": {"type": "string"}},
+            "properties": {
+                "description": {"type": "string"},
+                "task_id": {"type": "string"},
+            },
             "required": ["description"],
+        },
+    },
+    {
+        "name": "check_subagent",
+        "description": "Read one Subagent's current status or consume its result.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"subagent_id": {"type": "string"}},
+            "required": ["subagent_id"],
+        },
+    },
+    {
+        "name": "wait_subagents",
+        "description": (
+            "Wait up to 30 seconds for any listed Subagent to finish or request "
+            "permission, then return current structured states."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "subagent_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                },
+                "timeout_seconds": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 30,
+                },
+            },
+            "required": ["subagent_ids"],
+        },
+    },
+    {
+        "name": "cancel_subagent",
+        "description": "Cooperatively cancel one active Subagent.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"subagent_id": {"type": "string"}},
+            "required": ["subagent_id"],
+        },
+    },
+    {
+        "name": "review_subagent_permission",
+        "description": (
+            "Approve or reject the exact pending privileged tool request from a "
+            "Subagent. Validate its tool and arguments before approving."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "subagent_id": {"type": "string"},
+                "request_id": {"type": "string"},
+                "approve": {"type": "boolean"},
+                "feedback": {"type": "string"},
+            },
+            "required": ["subagent_id", "request_id", "approve"],
         },
     },
     {
@@ -214,7 +317,10 @@ TOOL_DEFINITIONS: list[dict] = [
     },
     {
         "name": "claim_task",
-        "description": "Claim a pending task.",
+        "description": (
+            "Task ownership is reserved for Team Agents. Lead cannot claim "
+            "tasks; use the Task UI to assign one to an online idle teammate."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {"task_id": {"type": "string"}},
@@ -223,7 +329,10 @@ TOOL_DEFINITIONS: list[dict] = [
     },
     {
         "name": "complete_task",
-        "description": "Complete an in-progress task.",
+        "description": (
+            "Task completion is reserved for the owning Team Agent. Lead "
+            "cannot complete Task System work."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {"task_id": {"type": "string"}},
@@ -264,7 +373,11 @@ TOOL_DEFINITIONS: list[dict] = [
     },
     {
         "name": "spawn_teammate",
-        "description": "Spawn an autonomous teammate.",
+        "description": (
+            "Register an autonomous teammate and leave it idle. Work begins only "
+            "after a Task System assignment, or an auto-claim when workspace "
+            "Team auto-claim is enabled."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
@@ -285,6 +398,26 @@ TOOL_DEFINITIONS: list[dict] = [
                 "content": {"type": "string"},
             },
             "required": ["to", "content"],
+        },
+    },
+    {
+        "name": "stop_teammate",
+        "description": "Stop one active Team Agent at the user's request.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"teammate": {"type": "string"}},
+            "required": ["teammate"],
+        },
+    },
+    {
+        "name": "restart_teammate",
+        "description": (
+            "Restart one stopped Team Agent from its persisted workspace profile."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"teammate": {"type": "string"}},
+            "required": ["teammate"],
         },
     },
     {
@@ -333,7 +466,13 @@ TOOL_DEFINITIONS: list[dict] = [
 ]
 
 
-from .subagents import spawn_subagent
+from .subagents import (
+    run_cancel_subagent,
+    run_check_subagent,
+    run_review_subagent_permission,
+    run_spawn_subagent,
+    run_wait_subagents,
+)
 
 
 TOOL_HANDLERS: dict[str, Callable] = {
@@ -344,19 +483,25 @@ TOOL_HANDLERS: dict[str, Callable] = {
     "glob": run_glob,
     "web_search": run_web_search,
     "todo_write": run_todo_write,
-    "task": spawn_subagent,
+    "spawn_subagent": run_spawn_subagent,
+    "check_subagent": run_check_subagent,
+    "wait_subagents": run_wait_subagents,
+    "cancel_subagent": run_cancel_subagent,
+    "review_subagent_permission": run_review_subagent_permission,
     "load_skill": load_skill,
     "compact": run_compact,
-    "create_task": run_create_task,
+    "create_task": run_lead_create_task,
     "list_tasks": run_list_tasks,
     "get_task": run_get_task,
-    "claim_task": run_claim_task,
-    "complete_task": run_complete_task,
+    "claim_task": run_lead_claim_task,
+    "complete_task": run_lead_complete_task,
     "schedule_cron": run_schedule_cron,
     "list_crons": run_list_crons,
     "cancel_cron": run_cancel_cron,
     "spawn_teammate": run_spawn_teammate,
     "send_message": run_send_message,
+    "stop_teammate": run_stop_teammate,
+    "restart_teammate": run_restart_teammate,
     "check_inbox": run_check_inbox,
     "request_shutdown": run_request_shutdown,
     "request_plan": run_request_plan,

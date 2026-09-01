@@ -8,6 +8,7 @@ import threading
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Callable
 
 from . import agent as agent_module
 from . import config
@@ -37,9 +38,10 @@ from .permissions import PermissionPolicy
 from .provider import SiliconFlowProvider
 from .teams import (
     active_teammates,
-    consume_lead_inbox,
     set_team_provider,
+    signal_pending_lead_inbox,
     stop_all_teammates,
+    wait_for_lead_inbox,
 )
 from .tasks import run_list_tasks
 
@@ -83,11 +85,68 @@ class GugugagaApp:
     runtime: SourceRuntime
     stop_event: threading.Event = field(default_factory=threading.Event)
     autorun_thread: threading.Thread | None = None
+    lead_inbox_thread: threading.Thread | None = None
+    lead_inbox_callback: Callable[[str], None] | None = field(
+        default=None, repr=False
+    )
     _closed: bool = False
     _close_outcome: ApplicationCloseOutcome | None = None
     _close_lock: threading.Lock = field(
         default_factory=threading.Lock, repr=False
     )
+
+    def start_lead_inbox_loop(self, callback=None) -> None:
+        """Wake an idle Lead when durable Team messages arrive."""
+
+        if callback is not None:
+            self.lead_inbox_callback = callback
+        with self._close_lock:
+            if self._closed:
+                raise RuntimeError("application is closed")
+            if self.lead_inbox_thread is not None and self.lead_inbox_thread.is_alive():
+                return
+
+            def run() -> None:
+                signal_pending_lead_inbox()
+                failure_delay = 1.0
+                while not self.stop_event.is_set():
+                    if not wait_for_lead_inbox(self.stop_event, timeout=0.25):
+                        continue
+                    try:
+                        reply = self.runtime.run_pending_lead_inbox(
+                            source="team_inbox"
+                        )
+                    except Exception as error:
+                        terminal_print(
+                            "Lead inbox processing failed; messages were requeued: "
+                            f"{type(error).__name__}: {error}"
+                        )
+                        self.stop_event.wait(failure_delay)
+                        failure_delay = min(30.0, failure_delay * 2)
+                        continue
+                    if reply is None:
+                        self.stop_event.wait(0.05)
+                        continue
+                    if not getattr(
+                        self.runtime, "last_lead_inbox_succeeded", True
+                    ):
+                        self.stop_event.wait(failure_delay)
+                        failure_delay = min(30.0, failure_delay * 2)
+                        continue
+                    failure_delay = 1.0
+                    callback_value = self.lead_inbox_callback
+                    if callback_value is not None and reply:
+                        try:
+                            callback_value(reply)
+                        except Exception:
+                            pass
+
+            self.lead_inbox_thread = threading.Thread(
+                target=run,
+                name="gugugaga-lead-inbox",
+                daemon=True,
+            )
+            self.lead_inbox_thread.start()
 
     def close(self, timeout: float = 5.0) -> ApplicationCloseOutcome:
         with self._close_lock:
@@ -100,12 +159,20 @@ class GugugagaApp:
                 return max(0.0, deadline - time.monotonic())
 
             self.stop_event.set()
+            if (
+                self.lead_inbox_thread is not None
+                and self.lead_inbox_thread is not threading.current_thread()
+                and self.lead_inbox_thread.is_alive()
+            ):
+                self.lead_inbox_thread.join(timeout=remaining())
             self.runtime.memory_service.close(remaining())
+            subagent_outcome = subagents.shutdown_subagents(remaining())
             self.runtime.context_coordinator.close()
             background_outcome = shutdown_background_tasks(remaining())
             teammate_outcome = stop_all_teammates(remaining())
             set_team_provider(None)
-            subagents.reset_subagent_runtime()
+            if subagent_outcome.stopped:
+                subagents.reset_subagent_runtime()
             cron_stopped = shutdown_cron(remaining())
             if (
                 self.autorun_thread is not None
@@ -116,11 +183,17 @@ class GugugagaApp:
             live = [
                 *(f"background:{job_id}" for job_id in background_outcome.live_job_ids),
                 *(f"teammate:{name}" for name in teammate_outcome.live_names),
+                *(
+                    f"subagent:{subagent_id}"
+                    for subagent_id in subagent_outcome.live_subagent_ids
+                ),
             ]
             if not cron_stopped:
                 live.append("gugugaga-cron-scheduler")
             if self.autorun_thread is not None and self.autorun_thread.is_alive():
                 live.append(self.autorun_thread.name)
+            if self.lead_inbox_thread is not None and self.lead_inbox_thread.is_alive():
+                live.append(self.lead_inbox_thread.name)
             self._close_outcome = ApplicationCloseOutcome(not live, tuple(live))
             return self._close_outcome
 
@@ -479,6 +552,9 @@ def main(argv: list[str] | None = None) -> int:
         daemon=True,
     )
     app.autorun_thread.start()
+    lead_inbox_starter = getattr(app, "start_lead_inbox_loop", None)
+    if callable(lead_inbox_starter):
+        lead_inbox_starter(terminal_print)
     try:
         while True:
             try:
@@ -497,24 +573,6 @@ def main(argv: list[str] | None = None) -> int:
             context = app.runtime.context
             if reply:
                 terminal_print(reply)
-
-            inbox = consume_lead_inbox(route_protocol=True)
-            if inbox:
-                def inbox_label(message):
-                    request_id = message.get("metadata", {}).get(
-                        "request_id", ""
-                    )
-                    suffix = f" req:{request_id}" if request_id else ""
-                    return f"{message.get('type', 'message')}{suffix}"
-
-                inbox_text = "\n".join(
-                    f"From {message['from']} [{inbox_label(message)}]: "
-                    f"{message['content'][:200]}"
-                    for message in inbox
-                )
-                history.append(
-                    {"role": "user", "content": f"[Inbox]\n{inbox_text}"}
-                )
             print()
     finally:
         app.close()

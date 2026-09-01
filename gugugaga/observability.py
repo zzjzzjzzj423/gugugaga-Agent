@@ -114,6 +114,12 @@ def get_observer() -> Observer:
     return _current_observer.get() or _default_observer
 
 
+def current_event_context() -> dict[str, Any]:
+    """Return a copy of the active trace context for structured child work."""
+
+    return dict(_current_event_context.get())
+
+
 def notify(event_type: str, event: Mapping[str, Any] | None = None) -> Event:
     return get_observer().notify(event_type, event)
 

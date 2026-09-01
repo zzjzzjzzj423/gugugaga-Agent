@@ -1,3 +1,8 @@
 openai>=1.0
 python-dotenv>=1.0
 pyyaml>=6.0
+flask>=2.0
+flask-cors>=4.0
+sqlalchemy>=2.0
+pymysql>=1.0
+cryptography>=41.0

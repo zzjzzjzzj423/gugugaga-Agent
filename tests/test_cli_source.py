@@ -50,6 +50,8 @@ class FakeApp:
         self.autorun_thread = None
         self.run_count = 0
         self.close_count = 0
+        self.lead_inbox_start_count = 0
+        self.lead_inbox_callback = None
 
     def run_turn(self, query):
         self.run_count += 1
@@ -57,6 +59,10 @@ class FakeApp:
 
     def close(self):
         self.close_count += 1
+
+    def start_lead_inbox_loop(self, callback=None):
+        self.lead_inbox_start_count += 1
+        self.lead_inbox_callback = callback
 
 
 class ContentBlockProvider:
@@ -214,6 +220,8 @@ def test_main_selects_default_or_explicit_workspace_and_accepts_exit_aliases(
     assert captured["settings"].workspace == expected.resolve()
     assert config.WORKDIR == expected.resolve()
     assert app.run_count == 0
+    assert app.lead_inbox_start_count == 1
+    assert app.lead_inbox_callback is cli.terminal_print
     assert app.close_count == 1
 
 

@@ -115,6 +115,48 @@ def test_agent_loop_writes_file_then_returns_exact_tool_result_order(
     ]
 
 
+def test_final_answer_is_discarded_until_subagent_barrier_settles(
+    source_loop, monkeypatch
+):
+    provider = ScriptedProvider(
+        [
+            ProviderResponse(
+                content=[TextBlock(text="premature final")],
+                stop_reason="end_turn",
+            ),
+            ProviderResponse(
+                content=[TextBlock(text="final with child evidence")],
+                stop_reason="end_turn",
+            ),
+        ]
+    )
+    install(provider, monkeypatch)
+    monkeypatch.setattr(agent, "collect_subagent_updates", lambda turn_id: [])
+    barrier_calls = []
+
+    def barrier(turn_id):
+        barrier_calls.append(turn_id)
+        if len(barrier_calls) == 1:
+            return ["<subagent_result>child evidence</subagent_result>"], False
+        return [], True
+
+    monkeypatch.setattr(agent, "wait_for_subagent_barrier", barrier)
+    messages = [{"role": "user", "content": "Delegate an inspection"}]
+
+    agent.agent_loop(messages, {}, turn_id="turn_structured")
+
+    assistant_text = [
+        block.text
+        for message in messages
+        if message["role"] == "assistant"
+        for block in message["content"]
+        if getattr(block, "type", None) == "text"
+    ]
+    assert assistant_text == ["final with child evidence"]
+    assert "child evidence" in messages[-2]["content"][0]["text"]
+    assert barrier_calls == ["turn_structured", "turn_structured"]
+
+
 def test_completed_turn_extracts_memory_from_pre_compaction_snapshot(
     source_loop, monkeypatch
 ):

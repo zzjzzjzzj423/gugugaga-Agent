@@ -89,7 +89,10 @@
       <section class="page" id="page-tasks" aria-labelledby="tasks-title" aria-hidden="true">
         <header class="page-header">
           <div><p class="eyebrow">Task system</p><h1 id="tasks-title">任务可视化</h1><p>集中查看任务状态、依赖关系和定时任务的下一次运行时间。</p></div>
-          <button class="task-refresh" id="task-refresh" type="button"><span>↻</span> 刷新数据</button>
+          <div class="task-header-actions">
+            <label class="team-auto-toggle" for="team-auto-claim"><span><strong>Team 自动领取</strong><small id="team-auto-state">已关闭</small></span><input id="team-auto-claim" type="checkbox" role="switch"><i aria-hidden="true"></i></label>
+            <button class="task-refresh" id="task-refresh" type="button"><span>↻</span> 刷新数据</button>
+          </div>
         </header>
 
         <div class="task-metric-grid">
@@ -106,6 +109,25 @@
             <div class="task-progress-track" aria-hidden="true"><span id="task-progress-bar"></span></div>
           </div>
           <div class="task-board" id="task-board"></div>
+        </section>
+
+        <section class="team-panel">
+          <div class="panel-heading">
+            <div><h2>Team Agents</h2><p>仅在线且空闲的 Agent 可以接收人工指派；每个 Agent 同时最多一个任务。</p></div>
+            <span class="event-chip" id="team-agent-count">0 online</span>
+          </div>
+          <div class="team-agent-list" id="team-agent-list"></div>
+        </section>
+
+        <section class="subagent-panel">
+          <div class="panel-heading">
+            <div><h2>Subagents</h2><p>当前 Turn 展示完整事件；历史 Turn 只展示运行摘要。</p></div>
+            <span class="event-chip" id="subagent-current-turn">no active turn</span>
+          </div>
+          <div class="subagent-layout">
+            <div><h3>当前 Turn</h3><div class="subagent-current" id="subagent-current"></div></div>
+            <div><h3>历史摘要</h3><div class="subagent-history" id="subagent-history"></div></div>
+          </div>
         </section>
 
         <section class="scheduled-panel">
@@ -196,6 +218,18 @@
         <div class="composer-footer"><span>Enter 发送 · Shift+Enter 换行</span><button id="send-button" type="submit" aria-label="发送消息">↑</button></div>
       </form>
     </aside>
+  </div>
+
+  <div class="permission-backdrop" id="permission-backdrop" hidden>
+    <section class="permission-dialog" role="dialog" aria-modal="true" aria-labelledby="permission-title">
+      <header><div><p class="eyebrow">Permission request</p><h2 id="permission-title">风险操作需要允许</h2></div><span id="permission-countdown"></span></header>
+      <div class="permission-source" id="permission-source"></div>
+      <strong class="permission-tool" id="permission-tool"></strong>
+      <pre id="permission-arguments"></pre>
+      <label><span>反馈（可选）</span><textarea id="permission-feedback" rows="2" maxlength="1000"></textarea></label>
+      <p class="permission-error" id="permission-error" aria-live="polite"></p>
+      <footer><button id="permission-deny" type="button">拒绝</button><button id="permission-allow" class="primary" type="button">允许一次</button></footer>
+    </section>
   </div>
 
   <div class="settings-backdrop" id="settings-backdrop" hidden>

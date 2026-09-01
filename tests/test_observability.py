@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
+
+import pytest
 
 from gugugaga.__main__ import build_runtime
 from gugugaga.config import Settings
 from gugugaga.observability import Observer, RecordingSystem, event_scope
 from gugugaga.provider import ProviderResponse, TextBlock, ToolUseBlock
-from gugugaga import subagents
+from gugugaga import agent, subagents, teams
 from tests.fakes import ScriptedProvider
 
 
@@ -184,3 +187,96 @@ def test_subagent_events_keep_parent_turn_context(tmp_path, monkeypatch):
         (tmp_path / ".gugugaga" / "usage.jsonl").read_text(encoding="utf-8").strip()
     )
     assert usage["call_type"] == "subagent"
+
+
+def test_source_runtime_injects_lead_inbox_before_user_turn_and_acks(tmp_path, monkeypatch):
+    monkeypatch.setattr(teams, "BUS", teams.MessageBus())
+    teams._lead_inbox_event.clear()
+    provider = ScriptedProvider(
+        [ProviderResponse(content=[TextBlock(text="Handled both.")], stop_reason="end_turn")]
+    )
+    app = build_runtime(make_settings(tmp_path, monkeypatch), provider=provider)
+    try:
+        teams.BUS.send(
+            "Alice",
+            "lead",
+            "Task completed successfully.",
+            "result",
+            {"task_id": "task_1780000000_0001"},
+        )
+
+        assert app.runtime.run_turn("What is the status?", source="web") == "Handled both."
+
+        request_messages = provider.requests[0]["messages"]
+        assert "<team-inbox>" in request_messages[0]["content"]
+        assert "Task completed successfully." in request_messages[0]["content"]
+        assert request_messages[1] == {
+            "role": "user",
+            "content": "What is the status?",
+        }
+        assert not (tmp_path / ".mailboxes" / "lead.jsonl").exists()
+        assert not list((tmp_path / ".mailboxes").glob(".lead.*.inflight.jsonl"))
+    finally:
+        app.close()
+
+
+def test_lead_inbox_is_nacked_when_turn_processing_raises(tmp_path, monkeypatch):
+    monkeypatch.setattr(teams, "BUS", teams.MessageBus())
+    teams._lead_inbox_event.clear()
+    provider = ScriptedProvider([])
+    app = build_runtime(make_settings(tmp_path, monkeypatch), provider=provider)
+    teams.BUS.send("Alice", "lead", "must retry", "result")
+    monkeypatch.setattr(
+        agent,
+        "agent_loop",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    try:
+        with pytest.raises(RuntimeError, match="boom"):
+            app.runtime.run_turn("process", source="web")
+        mailbox = tmp_path / ".mailboxes" / "lead.jsonl"
+        assert mailbox.exists()
+        assert "must retry" in mailbox.read_text(encoding="utf-8")
+        assert teams._lead_inbox_event.is_set()
+    finally:
+        app.close()
+
+
+def test_provider_failure_text_does_not_ack_lead_inbox(tmp_path, monkeypatch):
+    monkeypatch.setattr(teams, "BUS", teams.MessageBus())
+    teams._lead_inbox_event.clear()
+    provider = ScriptedProvider([RuntimeError("provider unavailable")])
+    app = build_runtime(make_settings(tmp_path, monkeypatch), provider=provider)
+    teams.BUS.send("Alice", "lead", "keep until processed", "result")
+    try:
+        reply = app.runtime.run_turn("process", source="web")
+
+        assert "[PROVIDER_FAILED]" in reply
+        mailbox = tmp_path / ".mailboxes" / "lead.jsonl"
+        assert mailbox.exists()
+        assert "keep until processed" in mailbox.read_text(encoding="utf-8")
+        assert app.runtime.last_lead_inbox_succeeded is False
+    finally:
+        app.close()
+
+
+def test_idle_lead_is_woken_by_team_result(tmp_path, monkeypatch):
+    monkeypatch.setattr(teams, "BUS", teams.MessageBus())
+    teams._lead_inbox_event.clear()
+    provider = ScriptedProvider(
+        [ProviderResponse(content=[TextBlock(text="Result received.")], stop_reason="end_turn")]
+    )
+    app = build_runtime(make_settings(tmp_path, monkeypatch), provider=provider)
+    replies = []
+    try:
+        app.start_lead_inbox_loop(replies.append)
+        teams.BUS.send("Alice", "lead", "finished autonomously", "result")
+        deadline = time.monotonic() + 3
+        while not replies and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        assert replies == ["Result received."]
+        assert "finished autonomously" in provider.requests[0]["messages"][0]["content"]
+        assert not (tmp_path / ".mailboxes" / "lead.jsonl").exists()
+    finally:
+        app.close()

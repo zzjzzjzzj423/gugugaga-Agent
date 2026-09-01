@@ -45,15 +45,21 @@ def isolated_team_state(tmp_path, monkeypatch):
     config.configure_workspace(tmp_path)
     if hasattr(teams, "active_teammates"):
         teams.active_teammates.clear()
+        teams._teammate_states.clear()
+        teams._teammate_stop_events.clear()
     if hasattr(teams, "pending_requests"):
         teams.pending_requests.clear()
     if hasattr(teams, "MessageBus"):
         monkeypatch.setattr(teams, "BUS", teams.MessageBus())
+    teams._lead_inbox_event.clear()
     if hasattr(teams, "set_team_provider"):
         teams.set_team_provider(None)
+    teams._lead_inbox_event.clear()
     yield
     if hasattr(teams, "active_teammates"):
         teams.active_teammates.clear()
+        teams._teammate_states.clear()
+        teams._teammate_stop_events.clear()
     if hasattr(teams, "pending_requests"):
         teams.pending_requests.clear()
     if hasattr(teams, "set_team_provider"):
@@ -249,16 +255,18 @@ def test_plan_submission_and_approval_are_correlated_and_routed():
 
     assert teams.run_review_plan(request_id, True) == "Plan approved"
     reply = teams.BUS.read_inbox("alice")
-    assert reply == [
-        {
-            "from": "lead",
-            "to": "alice",
-            "content": "Approved",
-            "type": "plan_approval_response",
-            "ts": reply[0]["ts"],
-            "metadata": {"request_id": request_id, "approve": True},
-        }
-    ]
+    assert len(reply) == 1
+    assert reply[0]["id"].startswith("msg_")
+    assert {
+        key: reply[0][key]
+        for key in ("from", "to", "content", "type", "metadata")
+    } == {
+        "from": "lead",
+        "to": "alice",
+        "content": "Approved",
+        "type": "plan_approval_response",
+        "metadata": {"request_id": request_id, "approve": True},
+    }
     assert teams.pending_requests[request_id].status == "approved"
 
 
@@ -267,6 +275,7 @@ def test_shutdown_request_is_acknowledged_and_routed_to_its_request(monkeypatch)
     monkeypatch.setattr(teams, "IDLE_POLL_INTERVAL", 1)
     monkeypatch.setattr(teams, "IDLE_TIMEOUT", 1)
 
+    teams.active_teammates["alice"] = True
     assert teams.run_request_shutdown("alice") == "Shutdown request sent to alice"
     request_id = next(iter(teams.pending_requests))
 
@@ -281,11 +290,419 @@ def test_shutdown_request_is_acknowledged_and_routed_to_its_request(monkeypatch)
     assert teams.pending_requests[request_id].status == "approved"
 
 
+def test_reserved_lead_name_cannot_be_spawned_or_targeted():
+    class UnusedProvider:
+        pass
+
+    teams.set_team_provider(UnusedProvider())
+
+    assert teams.spawn_teammate_thread("lead", "developer", "steal inbox") == (
+        "Error: reserved teammate name: lead"
+    )
+    assert teams.run_send_message("lead", "orphan") == (
+        "Error: reserved teammate name: lead"
+    )
+    assert "lead" not in teams.active_teammates
+
+
+def test_check_inbox_returns_complete_content_before_acknowledging():
+    content = "begin-" + ("x" * 500) + "-end"
+    teams.BUS.send("alice", "lead", content, "result")
+
+    rendered = teams.run_check_inbox()
+
+    assert content in rendered
+    assert rendered.endswith("-end")
+    assert teams.run_check_inbox() == "(inbox empty)"
+
+
+def test_lead_delivery_only_acks_after_explicit_success():
+    teams.BUS.send("alice", "lead", "completed", "result")
+
+    batch = teams.claim_lead_inbox()
+
+    assert batch.messages[0]["content"] == "completed"
+    assert batch.path is not None and batch.path.exists()
+    assert not (config.MAILBOX_DIR / "lead.jsonl").exists()
+
+    teams.nack_lead_inbox(batch, "retry")
+    assert (config.MAILBOX_DIR / "lead.jsonl").exists()
+
+    retried = teams.claim_lead_inbox()
+    teams.ack_lead_inbox(retried)
+    assert not retried.path.exists()
+    assert not (config.MAILBOX_DIR / "lead.jsonl").exists()
+
+
+def test_team_results_errors_and_plan_requests_emit_unread_events(monkeypatch):
+    observed = []
+    monkeypatch.setattr(
+        teams, "notify", lambda event_type, payload: observed.append((event_type, payload))
+    )
+
+    teams.BUS.send("alice", "lead", "done", "result", {"task_id": "task_1"})
+    teams.BUS.send("alice", "lead", "failed", "error")
+    teams.BUS.send("alice", "lead", "review", "plan_approval_request")
+    teams.BUS.send("alice", "lead", "ordinary", "message")
+
+    unread = [item for item in observed if item[0] == "team_inbox_unread"]
+    assert [item[1]["message_type"] for item in unread] == [
+        "result",
+        "error",
+        "plan_approval_request",
+    ]
+    assert unread[0][1]["task_id"] == "task_1"
+    assert teams._lead_inbox_event.is_set()
+
+
+def test_unacknowledged_mailbox_batch_is_recovered_after_restart():
+    first_bus = teams.MessageBus()
+    first_bus.send("lead", "alice", "recover me")
+    claimed = first_bus.claim_inbox("alice")
+    assert claimed.messages[0]["content"] == "recover me"
+
+    restarted_bus = teams.MessageBus()
+    recovered = restarted_bus.claim_inbox("alice")
+    assert recovered.messages[0]["id"] == claimed.messages[0]["id"]
+    restarted_bus.ack_inbox(recovered)
+
+    assert restarted_bus.read_inbox("alice") == []
+
+
+def test_protocol_requests_reload_from_durable_state():
+    request = teams._create_protocol_request(
+        "plan_approval", "alice", "lead", "durable plan"
+    )
+    assert (config.MAILBOX_DIR / "protocol-requests.json").exists()
+
+    teams.pending_requests.clear()
+    teams._protocol_workspace = None
+    teams._ensure_protocol_state_loaded()
+
+    assert teams.pending_requests[request.request_id].payload == "durable plan"
+
+
+def test_inactive_teammate_does_not_receive_orphan_control_messages():
+    assert teams.run_request_shutdown("missing") == (
+        "Error: teammate 'missing' is not active"
+    )
+    assert teams.run_request_plan("missing", "work") == (
+        "Error: teammate 'missing' is not active"
+    )
+    assert teams.run_send_message("missing", "work") == (
+        "Error: teammate 'missing' is not active"
+    )
+    assert not (config.MAILBOX_DIR / "missing.jsonl").exists()
+
+
+def test_auto_claim_injects_full_task_description(monkeypatch):
+    task = tasks.create_task(
+        "api",
+        description="Implement the complete API contract and its edge cases.",
+    )
+    messages = []
+    work_state = {}
+    monkeypatch.setattr(teams, "IDLE_TIMEOUT", 0.1)
+    teams.update_team_settings(True)
+
+    assert teams.idle_poll(
+        "alice", messages, "alice", "developer", work_state=work_state
+    ) == "work"
+
+    assert task.id in messages[0]["content"]
+    assert task.description in messages[0]["content"]
+    assert work_state["task_id"] == task.id
+    assert tasks.load_task(task.id).owner == "alice"
+
+
+def test_workspace_auto_claim_defaults_off_and_persists(monkeypatch):
+    task = tasks.create_task("manual by default")
+    monkeypatch.setattr(teams, "IDLE_TIMEOUT", 0.02)
+    monkeypatch.setattr(teams, "IDLE_POLL_INTERVAL", 0.005)
+
+    assert teams.get_team_settings()["auto_claim_enabled"] is False
+    assert teams.idle_poll("alice", [], "alice", "developer") == "timeout"
+    assert tasks.load_task(task.id).status == "pending"
+
+    teams.update_team_settings(True)
+    assert teams.get_team_settings()["auto_claim_enabled"] is True
+
+
+def test_default_idle_wait_has_no_lifetime_timeout(monkeypatch):
+    stop_event = threading.Event()
+    result = []
+    monkeypatch.setattr(teams, "IDLE_POLL_INTERVAL", 0.01)
+
+    worker = threading.Thread(
+        target=lambda: result.append(
+            teams.idle_poll(
+                "always-online",
+                [],
+                "always-online",
+                "developer",
+                stop_event=stop_event,
+            )
+        )
+    )
+    worker.start()
+    time.sleep(0.05)
+
+    assert teams.IDLE_TIMEOUT is None
+    assert worker.is_alive()
+    stop_event.set()
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+    assert result == ["shutdown"]
+
+
+def test_teammate_profile_persists_and_stopped_agent_can_restart(monkeypatch):
+    class UnusedProvider:
+        def create(self, messages, system, tools, max_tokens, model=None):
+            raise AssertionError("an unassigned teammate must remain idle")
+
+    teams.set_team_provider(UnusedProvider())
+    monkeypatch.setattr(teams, "IDLE_POLL_INTERVAL", 0.01)
+
+    assert teams.run_spawn_teammate(
+        "persistent-alice", "frontend developer", "Wait for user assignment."
+    ).startswith("Teammate")
+    profile_path = config.WORKDIR / ".gugugaga" / "team-agents.json"
+    profile_data = profile_path.read_text(encoding="utf-8")
+    assert '"persistent-alice"' in profile_data
+    assert '"frontend developer"' in profile_data
+
+    assert teams.stop_teammate("persistent-alice") == (
+        "Stop requested for persistent-alice"
+    )
+    deadline = time.monotonic() + 1
+    while "persistent-alice" in teams.active_teammates and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert "persistent-alice" not in teams.active_teammates
+
+    teams._teammate_states.clear()
+    persisted = {
+        item["name"]: item for item in teams.list_teammate_states()
+    }["persistent-alice"]
+    assert persisted["status"] == "stopped"
+    assert persisted["online"] is False
+    assert persisted["role"] == "frontend developer"
+
+    assert teams.restart_teammate("persistent-alice").startswith("Teammate")
+    assert teams.active_teammates["persistent-alice"] is True
+    assert teams.stop_teammate("persistent-alice").startswith("Stop requested")
+    deadline = time.monotonic() + 1
+    while "persistent-alice" in teams.active_teammates and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+
+def test_stopping_one_teammate_does_not_stop_others(monkeypatch):
+    class UnusedProvider:
+        def create(self, messages, system, tools, max_tokens, model=None):
+            raise AssertionError("an unassigned teammate must remain idle")
+
+    teams.set_team_provider(UnusedProvider())
+    monkeypatch.setattr(teams, "IDLE_POLL_INTERVAL", 0.01)
+    assert teams.run_spawn_teammate("alice", "developer", "Wait.").startswith(
+        "Teammate"
+    )
+    assert teams.run_spawn_teammate("bob", "reviewer", "Wait.").startswith(
+        "Teammate"
+    )
+
+    assert teams.stop_teammate("alice") == "Stop requested for alice"
+    deadline = time.monotonic() + 1
+    while "alice" in teams.active_teammates and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert "alice" not in teams.active_teammates
+    assert teams.active_teammates["bob"] is True
+
+    assert teams.stop_teammate("bob") == "Stop requested for bob"
+    deadline = time.monotonic() + 1
+    while "bob" in teams.active_teammates and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert "bob" not in teams.active_teammates
+
+
+def test_manual_assignment_is_claimed_even_when_auto_claim_is_off(monkeypatch):
+    task = tasks.create_task("manual dispatch", description="full requirements")
+    teams.active_teammates["alice"] = True
+    teams._teammate_states["alice"] = {
+        "name": "alice",
+        "role": "developer",
+        "status": "idle",
+        "online": True,
+        "current_task_id": None,
+        "started_at": time.time(),
+        "last_active_at": time.time(),
+    }
+    teams.assign_task_to_teammate(task.id, "alice")
+    messages = []
+    work_state = {}
+    monkeypatch.setattr(teams, "IDLE_TIMEOUT", 0.1)
+
+    assert teams.idle_poll(
+        "alice", messages, "alice", "developer", work_state=work_state
+    ) == "work"
+    claimed = tasks.load_task(task.id)
+    assert claimed.owner == "alice"
+    assert claimed.assignee == "alice"
+    assert task.description in messages[0]["content"]
+
+
+def test_tool_spawned_teammate_waits_for_manual_assignment(monkeypatch):
+    class SummaryProvider:
+        def __init__(self):
+            self.calls = 0
+
+        def create(self, messages, system, tools, max_tokens, model=None):
+            self.calls += 1
+            return ProviderResponse(
+                content=[TextBlock(text="Assigned task received.")],
+                stop_reason="end_turn",
+            )
+
+    provider = SummaryProvider()
+    teams.set_team_provider(provider)
+    monkeypatch.setattr(teams, "IDLE_POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(teams, "IDLE_TIMEOUT", 1.0)
+    task = tasks.create_task("manual only", description="Do not infer dispatch.")
+
+    assert teams.run_spawn_teammate(
+        "manual-alice", "developer", "You are the developer."
+    ).startswith("Teammate")
+    time.sleep(0.05)
+
+    assert provider.calls == 0
+    assert tasks.load_task(task.id).status == "pending"
+    assert tasks.load_task(task.id).assignee is None
+
+    teams.assign_task_to_teammate(task.id, "manual-alice")
+    deadline = time.monotonic() + 1
+    while provider.calls == 0 and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    claimed = tasks.load_task(task.id)
+    assert provider.calls == 1
+    assert claimed.status == "in_progress"
+    assert claimed.owner == "manual-alice"
+    assert claimed.assignee == "manual-alice"
+    assert teams.run_request_shutdown("manual-alice").startswith(
+        "Shutdown request"
+    )
+
+
+def test_automatic_lead_inbox_turn_cannot_spawn_teammate():
+    from gugugaga.observability import event_scope
+
+    with event_scope(source="team_inbox", agent_type="main"):
+        result = teams.run_spawn_teammate(
+            "chain-agent", "developer", "Start more work"
+        )
+
+    assert result.startswith("Error:")
+    assert "automatic Lead inbox Turn" in result
+    assert "chain-agent" not in teams.active_teammates
+
+    with event_scope(source="team_inbox", agent_type="main"):
+        assert teams.run_stop_teammate("chain-agent").startswith("Error:")
+        assert teams.run_restart_teammate("chain-agent").startswith("Error:")
+
+
+def test_model_claim_is_denied_without_assignment_when_auto_claim_is_off(
+    monkeypatch,
+):
+    class ClaimingProvider:
+        def __init__(self, task_id):
+            self.task_id = task_id
+            self.requests = []
+
+        def create(self, messages, system, tools, max_tokens, model=None):
+            self.requests.append(list(messages))
+            if len(self.requests) == 1:
+                return ProviderResponse(
+                    content=[
+                        ToolUseBlock(
+                            id="toolu_claim_unassigned",
+                            name="claim_task",
+                            input={"task_id": self.task_id},
+                        )
+                    ],
+                    stop_reason="tool_use",
+                )
+            return ProviderResponse(
+                content=[TextBlock(text="Did not claim unassigned work.")],
+                stop_reason="end_turn",
+            )
+
+    task = tasks.create_task("must be assigned")
+    provider = ClaimingProvider(task.id)
+    teams.set_team_provider(provider)
+    monkeypatch.setattr(teams, "IDLE_POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(teams, "IDLE_TIMEOUT", 0.02)
+
+    assert teams.spawn_teammate_thread(
+        "guard-alice", "developer", "Try to claim the task"
+    ).startswith("Teammate")
+    deadline = time.monotonic() + 1
+    while "guard-alice" in teams.active_teammates and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert tasks.load_task(task.id).status == "pending"
+    assert tasks.load_task(task.id).owner is None
+    assert "manual assignment required" in str(
+        provider.requests[1][-1]["content"]
+    )
+
+
+def test_task_completion_enforces_claim_owner():
+    task = tasks.create_task("owned")
+    assert tasks.claim_task(task.id, "alice").startswith("Claimed")
+
+    assert tasks.complete_task(task.id, owner="bob") == (
+        f"Task {task.id} is owned by alice, not bob"
+    )
+    assert tasks.load_task(task.id).status == "in_progress"
+    assert tasks.complete_task(task.id, owner="alice").startswith("Completed")
+
+
+def test_teammate_reports_each_completed_burst_without_idle_delay(monkeypatch):
+    class SummaryProvider:
+        def create(self, messages, system, tools, max_tokens, model=None):
+            return ProviderResponse(
+                content=[TextBlock(text="Immediate complete result.")],
+                stop_reason="end_turn",
+            )
+
+    teams.set_team_provider(SummaryProvider())
+    monkeypatch.setattr(teams, "IDLE_POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(teams, "IDLE_TIMEOUT", 1.0)
+    started = time.monotonic()
+    assert teams.spawn_teammate_thread(
+        "fast-alice", "developer", "Summarize"
+    ).startswith("Teammate")
+
+    deadline = time.monotonic() + 0.5
+    result = []
+    while not result and time.monotonic() < deadline:
+        result = teams.consume_lead_inbox()
+        if not result:
+            time.sleep(0.01)
+
+    assert result[0]["content"] == "Immediate complete result."
+    assert time.monotonic() - started < 0.5
+    assert "fast-alice" in teams.active_teammates
+    assert teams.run_request_shutdown("fast-alice").startswith("Shutdown request")
+    deadline = time.monotonic() + 1
+    while "fast-alice" in teams.active_teammates and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert "fast-alice" not in teams.active_teammates
+
+
 def test_two_agents_atomically_claim_only_one_unblocked_task():
     require_source_team_api()
     dependency = tasks.create_task("schema")
     assert tasks.claim_task(dependency.id, "lead").startswith("Claimed")
-    assert tasks.complete_task(dependency.id).startswith("Completed")
+    assert tasks.complete_task(dependency.id, owner="lead").startswith("Completed")
     candidate = tasks.create_task("api", blockedBy=[dependency.id])
     assert [item["id"] for item in teams.scan_unclaimed_tasks()] == [candidate.id]
 
@@ -530,18 +947,22 @@ def test_runtime_bootstrap_installs_provider_before_source_spawn_handler(
 
     monkeypatch.setenv("SILICONFLOW_API_KEY", "test-key")
     monkeypatch.setenv("SILICONFLOW_MODEL", "test-model")
-    monkeypatch.setattr(teams, "IDLE_POLL_INTERVAL", 1)
+    monkeypatch.setattr(teams, "IDLE_POLL_INTERVAL", 0.01)
     monkeypatch.setattr(teams, "IDLE_TIMEOUT", 1)
     settings = Settings.from_env(config.WORKDIR)
     provider = ScriptedContentBlockProvider()
     app = build_runtime(settings, provider=provider)
     try:
         assert app.runtime.provider is provider
+        task = tasks.create_task("runtime manual dispatch")
         assert TOOL_HANDLERS["spawn_teammate"](
             name="runtime-alice",
             role="developer",
             prompt="Create the file",
         ) == "Teammate 'runtime-alice' spawned as developer"
+        time.sleep(0.05)
+        assert provider.requests == []
+        teams.assign_task_to_teammate(task.id, "runtime-alice")
 
         deadline = time.monotonic() + 3
         while (
@@ -725,6 +1146,8 @@ def test_team_tool_definitions_and_handlers_are_bijective_and_prompted():
 
     team_tools = {
         "spawn_teammate",
+        "stop_teammate",
+        "restart_teammate",
         "send_message",
         "check_inbox",
         "request_shutdown",

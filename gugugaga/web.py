@@ -10,7 +10,7 @@ import sqlite3
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,12 +18,24 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, unquote, urlparse
 
+from . import config
 from .__main__ import GugugagaApp, build_runtime
 from .config import Settings
 from .context_modes import ContextModeError
 from .memory import memory_hit_kinds
 from .memory.repository import MemoryRepository
 from .observability import sanitize
+from .permissions import PermissionBroker
+from .subagents import snapshot_subagents
+from .tasks import load_task, release_task, unassign_task
+from .teams import (
+    assign_task_to_teammate,
+    get_team_settings,
+    list_teammate_states,
+    restart_teammate,
+    stop_teammate,
+    update_team_settings,
+)
 from .web_config import WebConfiguration
 
 
@@ -575,6 +587,7 @@ class DashboardStore:
                     "description": self._excerpt(raw.get("description"), 1000),
                     "status": status_by_id[task_id],
                     "owner": raw.get("owner"),
+                    "assignee": raw.get("assignee"),
                     "blocked_by": dependencies,
                     "dependencies": dependency_details,
                     "blocked": blocked and status_by_id[task_id] == "pending",
@@ -606,6 +619,119 @@ class DashboardStore:
         )
         return {"counts": counts, "tasks": tasks, "scheduled_tasks": scheduled}
 
+    def _subagent_trace_events(
+        self,
+        *,
+        session_id: str | None = None,
+        turn_id: str | None = None,
+        limit: int = 2000,
+    ) -> list[dict[str, Any]]:
+        directory = self.state_dir / "traces"
+        if not directory.exists():
+            return []
+        events: list[dict[str, Any]] = []
+        for path in sorted(directory.glob("*.jsonl"), reverse=True)[:7]:
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
+            for line in reversed(lines):
+                try:
+                    event = json.loads(line)
+                except (TypeError, ValueError):
+                    continue
+                if event.get("agent_type") != "subagent":
+                    continue
+                if session_id and event.get("session_id") != session_id:
+                    continue
+                if turn_id and event.get("turn_id") != turn_id:
+                    continue
+                events.append(event)
+                if len(events) >= limit:
+                    return list(reversed(events))
+        return list(reversed(events))
+
+    def subagent_current(self, turn_id: str | None = None) -> dict[str, Any]:
+        jobs = snapshot_subagents(turn_id)
+        selected_turn = turn_id or next(
+            (
+                str(job.get("parent_turn_id"))
+                for job in reversed(jobs)
+                if job.get("parent_turn_id")
+            ),
+            None,
+        )
+        events = (
+            self._subagent_trace_events(turn_id=selected_turn, limit=500)
+            if selected_turn
+            else []
+        )
+        return {
+            "turn_id": selected_turn,
+            "items": jobs,
+            "events": events,
+        }
+
+    def subagent_history(
+        self, session_id: str | None = None, *, current_turn_id: str | None = None
+    ) -> dict[str, Any]:
+        events = self._subagent_trace_events(session_id=session_id, limit=5000)
+        grouped: dict[tuple[str, str], dict[str, Any]] = {}
+        for event in events:
+            turn_id = str(event.get("turn_id") or "")
+            agent_id = str(event.get("agent_id") or "")
+            if not turn_id or not agent_id or turn_id == current_turn_id:
+                continue
+            key = (turn_id, agent_id)
+            item = grouped.setdefault(
+                key,
+                {
+                    "turn_id": turn_id,
+                    "subagent_id": agent_id,
+                    "session_id": event.get("session_id"),
+                    "status": "running",
+                    "description": "",
+                    "tool_count": 0,
+                    "started_at": event.get("timestamp"),
+                    "finished_at": None,
+                    "summary": "",
+                },
+            )
+            event_type = event.get("type")
+            if event_type == "subagent_start":
+                item["description"] = self._excerpt(event.get("description"), 500)
+            elif event_type == "tool":
+                item["tool_count"] += 1
+            elif event_type == "subagent_end":
+                item["status"] = "completed"
+                item["finished_at"] = event.get("timestamp")
+                item["summary"] = self._excerpt(
+                    event.get("reply")
+                    or event.get("result")
+                    or event.get("summary"),
+                    500,
+                )
+            elif event_type == "subagent_status" and event.get("status") in {
+                "completed",
+                "failed",
+                "cancelled",
+                "timed_out",
+            }:
+                item["status"] = event.get("status")
+                item["finished_at"] = event.get("timestamp")
+                if event.get("error"):
+                    item["summary"] = self._excerpt(event.get("error"), 500)
+            elif event_type in {"subagent_error", "turn_error"}:
+                item["status"] = "failed"
+                item["finished_at"] = event.get("timestamp")
+                item["summary"] = self._excerpt(event.get("error"), 500)
+        items = sorted(
+            grouped.values(),
+            key=lambda item: item.get("started_at") or "",
+            reverse=True,
+        )[:100]
+        return {"items": items}
+
 
 @dataclass
 class ChatResult:
@@ -623,17 +749,20 @@ class DashboardApplication:
         runtime_factory: Callable[[], GugugagaApp] | None = None,
     ):
         self.workspace = Path(workspace).expanduser().resolve()
+        config.configure_workspace(self.workspace)
         self.model = model
         self.configuration = WebConfiguration(self.workspace)
         self.configuration.apply_environment()
         self.store = DashboardStore(self.workspace)
         self.events = EventHub()
+        self.permissions = PermissionBroker(timeout_seconds=120)
         self._runtime_factory = runtime_factory
         self._app: GugugagaApp | None = None
         self._runtime_error: str | None = None
         self._runtime_lock = threading.Lock()
         self._turn_lock = threading.Lock()
         self._unsubscribe: Callable[[], None] | None = None
+        self._active_turn_id: str | None = None
         self.last_memory_hits = 0
 
     def _build_runtime(self) -> GugugagaApp:
@@ -641,7 +770,9 @@ class DashboardApplication:
             return self._runtime_factory()
         effective = self.configuration.effective(self.model)
         settings = Settings.from_env(self.workspace, effective["model"] or None)
-        return build_runtime(settings, approval_callback=None)
+        return build_runtime(
+            settings, approval_callback=self.permissions.callback
+        )
 
     def runtime(self) -> Any:
         if self._app is not None:
@@ -653,6 +784,9 @@ class DashboardApplication:
                     self._unsubscribe = self._app.runtime.recording.observer.subscribe(
                         "*", self._forward_runtime_event
                     )
+                    starter = getattr(self._app, "start_lead_inbox_loop", None)
+                    if callable(starter):
+                        starter(self._on_lead_inbox_reply)
                     self._runtime_error = None
                 except Exception as error:
                     self._runtime_error = str(error)
@@ -661,6 +795,11 @@ class DashboardApplication:
 
     def _forward_runtime_event(self, event: dict[str, Any]) -> None:
         """Translate context decisions into explicit dashboard graph transitions."""
+        if event.get("type") == "turn_start":
+            self._active_turn_id = str(event.get("turn_id") or "") or None
+        elif event.get("type") in {"turn_end", "turn_error"}:
+            if event.get("turn_id") == self._active_turn_id:
+                self._active_turn_id = None
         if (
             event.get("type") == "tool"
             and event.get("tool") == "load_skill"
@@ -683,6 +822,18 @@ class DashboardApplication:
             self.events.publish(
                 {"type": "runtime", "stage": "agent", "status": "active"}
             )
+
+    def _on_lead_inbox_reply(self, reply: str) -> None:
+        runtime = self._app.runtime if self._app is not None else None
+        coordinator = getattr(runtime, "context_coordinator", None)
+        self.events.publish(
+            {
+                "type": "lead_inbox_reply",
+                "status": "complete",
+                "reply": reply,
+                "session_id": getattr(coordinator, "session_id", None),
+            }
+        )
 
     def status(self) -> dict[str, Any]:
         runtime = self._app.runtime if self._app is not None else None
@@ -893,7 +1044,115 @@ class DashboardApplication:
         runtime = self._app.runtime if self._app is not None else None
         return self.store.overview(runtime, self.last_memory_hits, session_id)
 
+    def pending_permissions(self) -> dict[str, Any]:
+        return {"items": self.permissions.pending()}
+
+    def team_settings(self) -> dict[str, Any]:
+        return get_team_settings()
+
+    def set_team_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
+        value = payload.get("auto_claim_enabled")
+        if not isinstance(value, bool):
+            raise ValueError("auto_claim_enabled must be boolean")
+        settings = update_team_settings(value)
+        self.events.publish(
+            {
+                "type": "team_settings",
+                "action": "updated",
+                **settings,
+            }
+        )
+        return settings
+
+    def team_agents(self) -> dict[str, Any]:
+        return {"items": list_teammate_states()}
+
+    def stop_team_agent(self, name: str) -> dict[str, Any]:
+        result = stop_teammate(name)
+        if result.startswith("Error:"):
+            raise ValueError(result.removeprefix("Error:").strip())
+        self.events.publish(
+            {"type": "team_agent", "action": "stop_requested", "name": name}
+        )
+        return {"name": name, "status": "stopping", "message": result}
+
+    def restart_team_agent(self, name: str) -> dict[str, Any]:
+        # A stopped profile can outlive the Web process. Rebuild the shared
+        # runtime first so its provider and permission policy are installed
+        # before the teammate thread is recreated.
+        self.runtime()
+        result = restart_teammate(name)
+        if result.startswith("Error:"):
+            raise ValueError(result.removeprefix("Error:").strip())
+        self.events.publish(
+            {"type": "team_agent", "action": "restarted", "name": name}
+        )
+        return {"name": name, "status": "running", "message": result}
+
+    def assign_task(self, task_id: str, teammate: str) -> dict[str, Any]:
+        value = assign_task_to_teammate(task_id, teammate)
+        self.events.publish(
+            {
+                "type": "task_assignment",
+                "action": "assigned",
+                "task_id": task_id,
+                "teammate": teammate,
+            }
+        )
+        return value
+
+    def unassign_task(self, task_id: str) -> dict[str, Any]:
+        value = asdict(unassign_task(task_id))
+        self.events.publish(
+            {
+                "type": "task_assignment",
+                "action": "unassigned",
+                "task_id": task_id,
+            }
+        )
+        return value
+
+    def release_task(self, task_id: str) -> dict[str, Any]:
+        task = load_task(task_id)
+        active_owner = next(
+            (
+                agent
+                for agent in list_teammate_states()
+                if agent.get("online")
+                and agent.get("name") == task.owner
+                and agent.get("current_task_id") == task.id
+            ),
+            None,
+        )
+        if active_owner is not None:
+            raise ValueError(
+                f"task {task_id} is still running on teammate {task.owner}"
+            )
+        value = asdict(release_task(task_id))
+        self.events.publish(
+            {
+                "type": "task_assignment",
+                "action": "released",
+                "task_id": task_id,
+            }
+        )
+        return value
+
+    def subagent_current(self, turn_id: str | None = None) -> dict[str, Any]:
+        return self.store.subagent_current(turn_id or self._active_turn_id)
+
+    def subagent_history(self, session_id: str | None = None) -> dict[str, Any]:
+        return self.store.subagent_history(
+            session_id, current_turn_id=self._active_turn_id
+        )
+
+    def review_permission(
+        self, permission_id: str, approve: bool, feedback: str = ""
+    ) -> dict[str, Any]:
+        return self.permissions.review(permission_id, approve, feedback)
+
     def close(self) -> None:
+        self.permissions.close()
         if self._unsubscribe is not None:
             self._unsubscribe()
             self._unsubscribe = None
@@ -948,6 +1207,23 @@ def _handler_factory(application: DashboardApplication):
         def _error(self, status: int, message: str) -> None:
             self._json({"error": message}, status)
 
+        def _read_json_body(self, *, allow_empty: bool = False) -> dict[str, Any]:
+            length = int(self.headers.get("Content-Length", "0"))
+            if allow_empty and length == 0:
+                return {}
+            if length < 1 or length > MAX_REQUEST_BYTES:
+                raise ValueError("invalid request size")
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("JSON object required")
+            return payload
+
+        def _is_loopback(self) -> bool:
+            try:
+                return ipaddress.ip_address(self.client_address[0]).is_loopback
+            except ValueError:
+                return False
+
         def _asset(self, path: Path) -> None:
             try:
                 payload = path.read_bytes()
@@ -992,6 +1268,16 @@ def _handler_factory(application: DashboardApplication):
                     self._json(application.store.memories(kind, search))
                 elif parsed.path == "/api/tasks":
                     self._json(application.store.task_system())
+                elif parsed.path == "/api/team/settings":
+                    self._json(application.team_settings())
+                elif parsed.path == "/api/team/agents":
+                    self._json(application.team_agents())
+                elif parsed.path == "/api/subagents":
+                    turn_id = query.get("turn_id", [None])[0]
+                    self._json(application.subagent_current(turn_id))
+                elif parsed.path == "/api/subagents/history":
+                    session_id = query.get("session_id", [None])[0]
+                    self._json(application.subagent_history(session_id))
                 elif parsed.path == "/api/database/tables":
                     self._json({"items": application.store.tables()})
                 elif parsed.path == "/api/database/table":
@@ -1004,6 +1290,14 @@ def _handler_factory(application: DashboardApplication):
                     timeout = min(float(query.get("timeout", ["20"])[0]), 25.0)
                     items = application.events.wait_after(after, timeout)
                     self._json({"items": items})
+                elif parsed.path == "/api/permissions":
+                    if not self._is_loopback():
+                        self._error(
+                            HTTPStatus.FORBIDDEN,
+                            "permission review requires a local connection",
+                        )
+                    else:
+                        self._json(application.pending_permissions())
                 else:
                     self._error(HTTPStatus.NOT_FOUND, "not found")
             except KeyError as error:
@@ -1015,29 +1309,65 @@ def _handler_factory(application: DashboardApplication):
 
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
+            task_action = re.fullmatch(
+                r"/api/tasks/(task_[0-9]+_[0-9]{4})/(assign|unassign|release)",
+                parsed.path,
+            )
+            agent_action = re.fullmatch(
+                r"/api/team/agents/([A-Za-z0-9][A-Za-z0-9_-]{0,63})/(stop|restart)",
+                parsed.path,
+            )
             if parsed.path not in {
                 "/api/chat",
                 "/api/config",
                 "/api/session/new",
                 "/api/session/resume",
                 "/api/session/mode",
-            }:
+                "/api/permissions/review",
+            } and task_action is None and agent_action is None:
                 self._error(HTTPStatus.NOT_FOUND, "not found")
                 return
             try:
-                if parsed.path == "/api/config":
-                    try:
-                        is_loopback = ipaddress.ip_address(
-                            self.client_address[0]
-                        ).is_loopback
-                    except ValueError:
-                        is_loopback = False
-                    if not is_loopback:
+                if (
+                    parsed.path in {"/api/config", "/api/permissions/review"}
+                    or task_action
+                    or agent_action
+                ):
+                    if not self._is_loopback():
                         self._error(
                             HTTPStatus.FORBIDDEN,
-                            "configuration changes require a local connection",
+                            "configuration and permission changes require a local connection",
                         )
                         return
+                if task_action is not None:
+                    payload = self._read_json_body(allow_empty=True)
+                    task_id, action = task_action.groups()
+                    try:
+                        if action == "assign":
+                            teammate = str(payload.get("teammate", "")).strip()
+                            if not teammate:
+                                raise ValueError("teammate is required")
+                            self._json(application.assign_task(task_id, teammate))
+                        elif action == "unassign":
+                            self._json(application.unassign_task(task_id))
+                        else:
+                            self._json(application.release_task(task_id))
+                    except FileNotFoundError:
+                        self._error(HTTPStatus.NOT_FOUND, "task not found")
+                    except ValueError as error:
+                        self._error(HTTPStatus.CONFLICT, str(error))
+                    return
+                if agent_action is not None:
+                    self._read_json_body(allow_empty=True)
+                    name, action = agent_action.groups()
+                    try:
+                        if action == "stop":
+                            self._json(application.stop_team_agent(name))
+                        else:
+                            self._json(application.restart_team_agent(name))
+                    except ValueError as error:
+                        self._error(HTTPStatus.CONFLICT, str(error))
+                    return
                 if parsed.path == "/api/session/new":
                     length = int(self.headers.get("Content-Length", "0"))
                     payload = {}
@@ -1067,6 +1397,21 @@ def _handler_factory(application: DashboardApplication):
                     raise ValueError("JSON object required")
                 if parsed.path == "/api/config":
                     self._json(application.update_configuration(payload))
+                    return
+                if parsed.path == "/api/permissions/review":
+                    permission_id = str(payload.get("permission_id", ""))
+                    if not permission_id:
+                        raise ValueError("permission_id is required")
+                    approve = payload.get("approve")
+                    if not isinstance(approve, bool):
+                        raise ValueError("approve must be boolean")
+                    self._json(
+                        application.review_permission(
+                            permission_id,
+                            approve,
+                            str(payload.get("feedback", "")),
+                        )
+                    )
                     return
                 if parsed.path == "/api/session/resume":
                     session_id, message_count = application.resume_session(
@@ -1113,6 +1458,24 @@ def _handler_factory(application: DashboardApplication):
             except Exception as error:
                 status = HTTPStatus.SERVICE_UNAVAILABLE if "SILICONFLOW" in str(error) else HTTPStatus.INTERNAL_SERVER_ERROR
                 self._error(status, str(error))
+
+        def do_PUT(self) -> None:
+            parsed = urlparse(self.path)
+            if parsed.path != "/api/team/settings":
+                self._error(HTTPStatus.NOT_FOUND, "not found")
+                return
+            if not self._is_loopback():
+                self._error(
+                    HTTPStatus.FORBIDDEN,
+                    "team setting changes require a local connection",
+                )
+                return
+            try:
+                self._json(application.set_team_settings(self._read_json_body()))
+            except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
+                self._error(HTTPStatus.BAD_REQUEST, str(error))
+            except Exception as error:
+                self._error(HTTPStatus.INTERNAL_SERVER_ERROR, str(error))
 
     return DashboardHandler
 

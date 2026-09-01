@@ -15,6 +15,8 @@
     contextMode: 'cc',
     contextModeLocked: false,
     turnRunning: false,
+    permission: null,
+    teamAgents: [],
     pageScroll: { overview: 0, tasks: 0, memory: 0, database: 0 },
   };
 
@@ -31,6 +33,54 @@
     try { payload = await response.json(); } catch (_) { payload = {}; }
     if (!response.ok) throw new Error(payload.error || `Request failed (${response.status})`);
     return payload;
+  }
+
+  function renderPermission() {
+    const item = state.permission;
+    const backdrop = $('#permission-backdrop');
+    backdrop.hidden = !item;
+    if (!item) return;
+    const changed = backdrop.dataset.permissionId !== item.permission_id;
+    backdrop.dataset.permissionId = item.permission_id;
+    const source = item.source || {};
+    $('#permission-source').textContent = `来源：${source.agent_type || 'main'}${source.agent_id ? ` · ${source.agent_id}` : ''}${source.turn_id ? ` · ${source.turn_id}` : ''}`;
+    $('#permission-tool').textContent = item.tool || 'unknown tool';
+    $('#permission-arguments').textContent = JSON.stringify(item.arguments || {}, null, 2);
+    $('#permission-countdown').textContent = `剩余 ${Math.max(0, Math.ceil(Number(item.remaining_seconds || 0)))} 秒`;
+    if (changed) {
+      $('#permission-error').textContent = '';
+      $('#permission-feedback').value = '';
+    }
+  }
+
+  async function loadPermissions() {
+    try {
+      const payload = await api('/api/permissions');
+      state.permission = (payload.items || [])[0] || null;
+      renderPermission();
+    } catch (_) {}
+  }
+
+  async function reviewPermission(approve) {
+    if (!state.permission) return;
+    const buttons = [$('#permission-allow'), $('#permission-deny')];
+    buttons.forEach((button) => { button.disabled = true; });
+    try {
+      await api('/api/permissions/review', {
+        method: 'POST',
+        body: JSON.stringify({
+          permission_id: state.permission.permission_id,
+          approve,
+          feedback: $('#permission-feedback').value,
+        }),
+      });
+      $('#permission-feedback').value = '';
+      await loadPermissions();
+    } catch (error) {
+      $('#permission-error').textContent = error.message;
+    } finally {
+      buttons.forEach((button) => { button.disabled = false; });
+    }
   }
 
   function formatDate(value) {
@@ -128,11 +178,133 @@
       });
       card.append(dependencies);
     }
+    if (task.status === 'pending' && task.ready) {
+      const controls = document.createElement('div'); controls.className = 'task-assignment-controls';
+      if (task.assignee) {
+        const assigned = document.createElement('span'); assigned.textContent = `已指派 · ${task.assignee}`;
+        const cancel = document.createElement('button'); cancel.type = 'button'; cancel.textContent = '取消指派';
+        cancel.addEventListener('click', async () => {
+          cancel.disabled = true;
+          try {
+            await api(`/api/tasks/${encodeURIComponent(task.id)}/unassign`, { method: 'POST', body: '{}' });
+            await loadTasks();
+          } catch (error) { window.alert(error.message); }
+          finally { cancel.disabled = false; }
+        });
+        controls.append(assigned, cancel);
+      } else {
+        const candidates = state.teamAgents.filter((agent) => agent.online && agent.status === 'idle' && !agent.current_task_id);
+        const select = document.createElement('select'); select.setAttribute('aria-label', `为 ${task.subject} 选择 Team Agent`);
+        const placeholder = document.createElement('option'); placeholder.value = ''; placeholder.textContent = candidates.length ? '选择空闲 Agent' : '没有空闲 Agent'; select.append(placeholder);
+        candidates.forEach((agent) => {
+          const option = document.createElement('option'); option.value = agent.name; option.textContent = `${agent.name} · ${agent.role || 'teammate'}`; select.append(option);
+        });
+        const assign = document.createElement('button'); assign.type = 'button'; assign.textContent = '指派'; assign.disabled = !candidates.length;
+        select.addEventListener('change', () => { assign.disabled = !select.value; });
+        assign.addEventListener('click', async () => {
+          if (!select.value) return;
+          assign.disabled = true;
+          try {
+            await api(`/api/tasks/${encodeURIComponent(task.id)}/assign`, { method: 'POST', body: JSON.stringify({ teammate: select.value }) });
+            await loadTasks();
+          } catch (error) { window.alert(error.message); }
+          finally { assign.disabled = !select.value; }
+        });
+        controls.append(select, assign);
+      }
+      card.append(controls);
+    }
+    if (task.status === 'in_progress') {
+      const activeOwner = state.teamAgents.some((agent) => agent.online && agent.name === task.owner && agent.current_task_id === task.id);
+      if (!activeOwner) {
+        const controls = document.createElement('div'); controls.className = 'task-assignment-controls';
+        const release = document.createElement('button'); release.type = 'button'; release.textContent = '释放错误认领';
+        release.addEventListener('click', async () => {
+          if (!window.confirm(`确认将「${task.subject}」恢复为待处理吗？`)) return;
+          release.disabled = true;
+          try {
+            await api(`/api/tasks/${encodeURIComponent(task.id)}/release`, { method: 'POST', body: '{}' });
+            await loadTasks();
+          } catch (error) { window.alert(error.message); }
+          finally { release.disabled = false; }
+        });
+        controls.append(release); card.append(controls);
+      }
+    }
     const footer = document.createElement('footer');
     const owner = document.createElement('span'); owner.textContent = task.owner ? `负责人 · ${task.owner}` : '尚未分配';
     const updated = document.createElement('time'); updated.textContent = `更新于 ${formatDate(task.updated_at)}`;
     footer.append(owner, updated); card.append(footer);
     return card;
+  }
+
+  function renderTeamAgents(payload) {
+    state.teamAgents = payload.items || [];
+    const online = state.teamAgents.filter((agent) => agent.online);
+    $('#team-agent-count').textContent = `${online.length} online`;
+    const list = $('#team-agent-list'); list.replaceChildren();
+    if (!state.teamAgents.length) {
+      const empty = document.createElement('div'); empty.className = 'team-empty'; empty.textContent = '尚未创建 Team Agent'; list.append(empty); return;
+    }
+    state.teamAgents.forEach((agent) => {
+      const card = document.createElement('article'); card.className = `team-agent-item is-${agent.status || 'idle'}`;
+      const dot = document.createElement('span'); dot.className = `team-status-dot${agent.online ? ' is-online' : ''}`;
+      const body = document.createElement('div');
+      const name = document.createElement('strong'); name.textContent = agent.name;
+      const role = document.createElement('small'); role.textContent = `${agent.role || 'teammate'} · ${agent.status || 'unknown'}`;
+      body.append(name, role);
+      const task = document.createElement('code'); task.textContent = agent.current_task_id || 'idle';
+      const action = document.createElement('button'); action.type = 'button'; action.className = 'team-agent-action';
+      const canStop = Boolean(agent.online) && agent.status !== 'stopping';
+      action.textContent = canStop ? '关闭' : (agent.status === 'stopping' ? '关闭中' : '重新启动');
+      action.disabled = agent.status === 'stopping';
+      action.addEventListener('click', async () => {
+        const operation = canStop ? 'stop' : 'restart';
+        const verb = canStop ? '关闭' : '重新启动';
+        if (!window.confirm(`确认${verb} Team Agent「${agent.name}」吗？`)) return;
+        action.disabled = true;
+        try {
+          await api(`/api/team/agents/${encodeURIComponent(agent.name)}/${operation}`, { method: 'POST', body: '{}' });
+          await loadTasks();
+        } catch (error) { window.alert(error.message); }
+        finally { action.disabled = false; }
+      });
+      card.append(dot, body, task, action); list.append(card);
+    });
+  }
+
+  function renderSubagents(current, history) {
+    $('#subagent-current-turn').textContent = current.turn_id || 'no active turn';
+    const live = $('#subagent-current'); live.replaceChildren();
+    const events = current.events || [];
+    if (!events.length && !(current.items || []).length) {
+      const empty = document.createElement('div'); empty.className = 'team-empty'; empty.textContent = '当前没有 Subagent 活动'; live.append(empty);
+    } else {
+      (current.items || []).forEach((job) => {
+        const card = document.createElement('article'); card.className = 'subagent-job';
+        const title = document.createElement('strong'); title.textContent = `${job.subagent_id} · ${job.status}`;
+        const description = document.createElement('p'); description.textContent = job.description || '未提供任务描述';
+        card.append(title, description); live.append(card);
+      });
+      events.forEach((event) => {
+        const row = document.createElement('details'); row.className = 'subagent-event';
+        const summary = document.createElement('summary'); summary.textContent = `${formatDate(event.timestamp)} · ${event.agent_id || 'subagent'} · ${event.type}`;
+        const content = document.createElement('pre'); content.textContent = JSON.stringify(event, null, 2);
+        row.append(summary, content); live.append(row);
+      });
+    }
+    const past = $('#subagent-history'); past.replaceChildren();
+    const items = history.items || [];
+    if (!items.length) {
+      const empty = document.createElement('div'); empty.className = 'team-empty'; empty.textContent = '暂无历史 Subagent 摘要'; past.append(empty); return;
+    }
+    items.forEach((item) => {
+      const card = document.createElement('article'); card.className = 'subagent-history-item';
+      const title = document.createElement('strong'); title.textContent = `${item.subagent_id} · ${item.status}`;
+      const meta = document.createElement('small'); meta.textContent = `${item.turn_id} · ${item.tool_count} tools · ${formatDate(item.started_at)}`;
+      const description = document.createElement('p'); description.textContent = item.description || item.summary || '无摘要';
+      card.append(title, meta, description); past.append(card);
+    });
   }
 
   function renderTasks(data) {
@@ -193,7 +365,16 @@
     const button = $('#task-refresh');
     button.disabled = true;
     try {
-      renderTasks(await api('/api/tasks'));
+      const session = state.currentSessionId ? `?session_id=${encodeURIComponent(state.currentSessionId)}` : '';
+      const [tasks, settings, agents, current, history] = await Promise.all([
+        api('/api/tasks'), api('/api/team/settings'), api('/api/team/agents'),
+        api('/api/subagents'), api(`/api/subagents/history${session}`),
+      ]);
+      renderTeamAgents(agents);
+      renderTasks(tasks);
+      $('#team-auto-claim').checked = Boolean(settings.auto_claim_enabled);
+      $('#team-auto-state').textContent = settings.auto_claim_enabled ? '已开启' : '已关闭';
+      renderSubagents(current, history);
     } catch (error) {
       const board = $('#task-board'); board.replaceChildren();
       const failed = document.createElement('div'); failed.className = 'task-load-error'; failed.textContent = `任务数据加载失败：${error.message}`; board.append(failed);
@@ -201,6 +382,16 @@
   }
 
   $('#task-refresh').addEventListener('click', loadTasks);
+  $('#team-auto-claim').addEventListener('change', async (event) => {
+    const input = event.currentTarget; input.disabled = true;
+    try {
+      const settings = await api('/api/team/settings', { method: 'PUT', body: JSON.stringify({ auto_claim_enabled: input.checked }) });
+      input.checked = Boolean(settings.auto_claim_enabled);
+      $('#team-auto-state').textContent = settings.auto_claim_enabled ? '已开启' : '已关闭';
+    } catch (error) {
+      input.checked = !input.checked; window.alert(error.message);
+    } finally { input.disabled = false; }
+  });
 
   async function loadStatus() {
     try {
@@ -431,6 +622,18 @@
   }
 
   function enqueueEvent(event) {
+    if (event.type === 'permission_requested' || event.type === 'permission_resolved') {
+      loadPermissions();
+    }
+    if (event.type === 'team_inbox_unread') {
+      $('#event-chip').textContent = 'Team 消息未读';
+      if (state.page === 'tasks') loadTasks();
+    }
+    if (event.type === 'lead_inbox_reply') {
+      if (!event.session_id || event.session_id === state.currentSessionId) {
+        Promise.all([loadHistory(), loadSessions(), loadOverview()]);
+      }
+    }
     const item = normalizeEvent(event);
     if (!item) return;
     const previous = state.eventQueue[state.eventQueue.length - 1];
@@ -1038,12 +1241,21 @@
   $('#chat-input').addEventListener('keydown', (event) => {
     if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); $('#chat-form').requestSubmit(); }
   });
+  $('#permission-allow').addEventListener('click', () => reviewPermission(true));
+  $('#permission-deny').addEventListener('click', () => reviewPermission(false));
 
   async function init() {
     await loadStatus();
     await Promise.all([loadOverview(), loadSessions()]);
     await loadHistory();
+    await loadPermissions();
     pollEvents();
+    setInterval(() => {
+      if (!state.permission) return;
+      state.permission.remaining_seconds = Math.max(0, Number(state.permission.remaining_seconds || 0) - 1);
+      renderPermission();
+      if (state.permission.remaining_seconds <= 0) loadPermissions();
+    }, 1000);
     setInterval(() => { if (!state.turnRunning) loadOverview(); }, 5000);
     setInterval(() => { if (!state.turnRunning && state.page === 'tasks') loadTasks(); }, 15000);
   }

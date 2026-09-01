@@ -20,8 +20,8 @@ gugugaga 是一个面向单用户、本地工作空间的 Agent Runtime 原型�
 | Task System | 实验性 | 已有持久化 Task DAG 和任务认领，需要继续做健壮性测试 |
 | 后台任务 | 实验性 | 已有后台执行与结果收集，需要完善取消、超时和退出恢复 |
 | 定时任务 | 实验性 | 已有 Cron 调度，需要完善时区、去重、错过执行和重启恢复 |
-| Subagent | 实验性 | 已有一次性 Subagent，需要完善预算、隔离和失败传播 |
-| Team Agent | 实验性 | 已有 Teammate、Mailbox 和任务协作，需要完善并发一致性 |
+| Subagent | 实验性 | 已有 Turn 内结构化并发、权限审批、取消、超时和失败传播 |
+| Team Agent | 实验性 | 已有 Teammate、Mailbox 确认消费、协议持久化和原子任务状态，仍需要长时间故障注入 |
 | 钉钉 / 飞书 | 规划中 | 计划通过官方机器人接口接收和回复消息 |
 | 语音 | 规划中 | 计划增加语音输入、转写和语音回复能力 |
 | LLM-as-a-Judge | 规划中 | 计划作为最终质量评测与回归门禁 |
@@ -99,13 +99,34 @@ Memory Consolidation 不保证每次都会生成记忆。临时问题、普通�
 - `edit_file`
 - `glob`
 - `todo_write`
-- `task`
+- `spawn_subagent`
+- `check_subagent`
+- `wait_subagents`
+- `cancel_subagent`
+- `review_subagent_permission`
 - `load_skill`
 - `compact`
 - `web_search`
 - Task、Cron 和 Team 相关工具
 
 文件工具限制在选定的 workspace 内，并统一使用 UTF-8。`bash` 能力更强，需要由权限 Hook 和运行环境共同约束。
+
+Subagent 在主 Agent 当前 Turn 内异步运行，默认最多同时执行 4 个。主 Agent
+可以继续处理独立工作或等待结果，但所有 Subagent 进入 `completed`、`failed`、
+`cancelled` 或 `timed_out` 前，本 Turn 不能结束。Subagent 可直接读取、搜索和分析；
+`bash`、写入和编辑会进入 `waiting_permission`，由主 Agent 针对准确的请求 ID、
+工具及参数审批。终态结果被主 Agent 消费后，Subagent Job 会从活动表自动移除。
+
+主 Agent、Subagent、Team Agent 和后台任务共享 workspace 写协调器。`write_file`
+和 `edit_file` 按规范化文件路径加锁；不同文件可以并行，同一文件串行。Bash 应通过
+`write_paths` 声明修改目标，无法精确声明时使用 workspace 全局写锁。Subagent 和
+Team Agent 修改已有文件前必须读取 SHA-256，并通过 `expected_sha256` 做乐观冲突
+检查；提交采用同目录临时文件加原子替换。Subagent 的 300 秒预算在等待锁时继续
+计算，若超时时正在写入，只获得一次 30 秒收尾窗口。
+
+Web 运行时的 Bash 风险操作使用本地审批弹窗，只支持“允许一次”或拒绝，默认
+120 秒后拒绝。Subagent 的 Bash 请求先由主 Agent 审核，再冒泡到同一个人工审批
+通道；审批 ID 单次消费，取消、超时或关闭都会默认拒绝。
 
 ## 快速开始
 
@@ -345,9 +366,11 @@ gugugaga/
 ├── tasks.py             # Task System
 ├── background.py        # 后台任务
 ├── cron.py              # 定时任务
-├── subagents.py         # 一次性 Subagent
+├── subagents.py         # Turn 内结构化异步 Subagent
 ├── teams.py             # Team Agent 与 Mailbox
 ├── observability.py     # Observer、Trace 和 Usage
+├── mutations.py         # workspace 并发写协调与分层锁
+├── stateio.py           # 原子状态写入与跨进程文件锁
 ├── web.py               # 本地 Web Server 与 API
 ├── web_search.py        # Tavily Search
 ├── web_config.py        # Web 配置持久化

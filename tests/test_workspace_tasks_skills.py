@@ -74,6 +74,108 @@ def test_task_dependency_claim_gate_is_durable(tmp_path, monkeypatch):
     assert tasks.load_task(dependent.id).status == "in_progress"
 
 
+def test_task_assignment_separates_reservation_from_ownership(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "TASKS_DIR", tmp_path / ".tasks")
+    task = tasks.create_task("assigned work")
+
+    assigned = tasks.assign_task(task.id, "alice")
+
+    assert assigned.assignee == "alice"
+    assert assigned.owner is None
+    assert assigned.status == "pending"
+    assert tasks.claim_task(task.id, "bob") == (
+        f"Task {task.id} is assigned to alice, not bob"
+    )
+    assert tasks.claim_task(task.id, "alice").startswith("Claimed")
+    assert tasks.load_task(task.id).owner == "alice"
+
+
+def test_claimed_task_can_be_released_for_manual_reassignment(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(config, "TASKS_DIR", tmp_path / ".tasks")
+    task = tasks.create_task("recover stale owner")
+    assert tasks.claim_task(task.id, "agent").startswith("Claimed")
+
+    released = tasks.release_task(task.id)
+
+    assert released.status == "pending"
+    assert released.owner is None
+    assert released.assignee is None
+    assert tasks.load_task(task.id) == released
+    with pytest.raises(ValueError, match="is not claimed"):
+        tasks.release_task(task.id)
+
+
+def test_lead_tool_handlers_cannot_claim_or_complete_team_tasks(
+    tmp_path, monkeypatch
+):
+    from gugugaga.tools import TOOL_HANDLERS
+
+    monkeypatch.setattr(config, "TASKS_DIR", tmp_path / ".tasks")
+    task = tasks.create_task("teammate-owned only")
+
+    assert TOOL_HANDLERS["claim_task"](task.id).startswith(
+        "Error: Lead cannot claim"
+    )
+    assert tasks.load_task(task.id).status == "pending"
+    assert TOOL_HANDLERS["complete_task"](task.id).startswith(
+        "Error: Lead cannot complete"
+    )
+
+
+def test_automatic_lead_inbox_turn_cannot_create_tasks(tmp_path, monkeypatch):
+    from gugugaga.observability import event_scope
+    from gugugaga.tools import TOOL_HANDLERS
+
+    monkeypatch.setattr(config, "TASKS_DIR", tmp_path / ".tasks")
+    with event_scope(source="team_inbox", agent_type="main"):
+        result = TOOL_HANDLERS["create_task"]("inbox duplicate")
+
+    assert result.startswith("Error:")
+    assert "automatic Lead inbox Turn" in result
+    assert tasks.list_tasks() == []
+
+
+def test_teammate_cannot_reserve_or_claim_two_active_tasks(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "TASKS_DIR", tmp_path / ".tasks")
+    first = tasks.create_task("first")
+    second = tasks.create_task("second")
+    tasks.assign_task(first.id, "alice")
+
+    with pytest.raises(ValueError, match="already has task"):
+        tasks.assign_task(second.id, "alice")
+
+    assert tasks.claim_task(first.id, "alice").startswith("Claimed")
+    assert tasks.claim_task(second.id, "alice") == (
+        f"Owner alice is already working on {first.id}"
+    )
+
+
+def test_old_task_json_without_assignee_remains_readable(tmp_path, monkeypatch):
+    import json
+
+    tasks_dir = tmp_path / ".tasks"
+    tasks_dir.mkdir()
+    monkeypatch.setattr(config, "TASKS_DIR", tasks_dir)
+    task_id = "task_1780000000_0001"
+    (tasks_dir / f"{task_id}.json").write_text(
+        json.dumps(
+            {
+                "id": task_id,
+                "subject": "legacy",
+                "description": "",
+                "status": "pending",
+                "owner": None,
+                "blockedBy": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert tasks.load_task(task_id).assignee is None
+
+
 @pytest.mark.parametrize(
     "malicious_id",
     [
@@ -231,7 +333,11 @@ def test_fixed_foundation_registry_has_one_handler_per_definition():
         "edit_file",
         "glob",
         "todo_write",
-        "task",
+        "spawn_subagent",
+        "check_subagent",
+        "wait_subagents",
+        "cancel_subagent",
+        "review_subagent_permission",
         "load_skill",
         "compact",
         "create_task",

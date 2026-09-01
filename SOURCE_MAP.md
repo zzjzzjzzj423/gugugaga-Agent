@@ -21,7 +21,7 @@ side remains S20's Anthropic-style content-block protocol.
 | `PROMPT_SECTIONS`, `assemble_system_prompt`, `SUB_SYSTEM` | `prompts.py` | retained prompt construction |
 | `safe_path`, `run_bash`, `run_read`, `run_write`, `run_edit`, `run_glob`, `call_tool_handler` | `workspace.py` and `tools.py` | retained file/tool dispatch |
 | `HOOKS`, `register_hook`, `trigger_hooks`, `DENY_LIST`, `DESTRUCTIVE`, `permission_hook`, `log_hook`, `large_output_hook`, `user_prompt_hook`, `stop_hook` | `hooks.py` | retained hooks and permission policy |
-| `SUB_TOOLS`, `SUB_HANDLERS`, `extract_text`, `has_tool_use`, `spawn_subagent` | `subagents.py` | retained one-shot subagent loop |
+| `SUB_TOOLS`, `SUB_HANDLERS`, `extract_text`, `has_tool_use`, `spawn_subagent` | `subagents.py` | retained blocking compatibility loop; structured async execution is documented below |
 | `estimate_size`, `block_type`, `message_has_tool_use`, `is_tool_result_message`, `collect_tool_results`, `persist_large_output`, `tool_result_budget`, `snip_compact`, `micro_compact`, `write_transcript`, `summarize_history`, `compact_history`, `reactive_compact`, `prepare_context`, `build_user_content`, `inject_background_notifications`, `update_context` | `context.py` | retained context and compaction flow |
 | `RecoveryState`, `retry_delay`, `with_retry`, `is_prompt_too_long_error` | `recovery.py` | retained recovery flow |
 | `_bg_counter`, `background_tasks`, `background_results`, `background_lock`, `is_slow_operation`, `should_run_background`, `start_background_task`, `collect_background_results` | `background.py` | retained background-task flow |
@@ -57,6 +57,27 @@ boundaries. It owns the in-process Observer, daily Trace JSONL, Usage JSONL,
 SQLite Chat Log, event context, redaction, and per-turn metadata capture. It is
 not claimed as part of the pinned S20 source baseline and does not alter the
 fixed S01-S17 tool registry.
+
+## Post-S20 structured Subagent extension
+
+`gugugaga/subagents.py` adds Turn-scoped structured concurrency above the
+retained blocking Subagent loop. The exposed `task` execution tool is replaced
+by `spawn_subagent`, `check_subagent`, `wait_subagents`, `cancel_subagent`, and
+`review_subagent_permission`. Jobs are bounded to four concurrent executions,
+inherit the parent's context-compression configuration through an isolated child
+coordinator, time out after 300 seconds, and cannot outlive a normally completed
+parent Turn. Read/search/analysis operations proceed directly; Bash, writes, and
+edits enter `waiting_permission` until the Lead resolves the exact request.
+All main, Subagent, Team, and background workspace mutations share the
+post-S20 coordinator in `gugugaga/mutations.py`. Exact file writes use path
+locks, uncertain Bash writes use a workspace-wide lock, and Subagent/Team
+updates to existing files require a fresh SHA-256 before atomic replacement.
+Risky Subagent operations are reviewed by the Lead and policy-level ASK results
+bubble to the same local CLI/Web human approval callback used by the main Agent.
+Durable Team and Task state uses the post-S20 helpers in
+`gugugaga/stateio.py`: JSON state is committed by same-directory atomic
+replacement, while transition critical sections use a one-byte cross-process
+advisory lock.
 
 ## Post-S20 structured-memory extension
 

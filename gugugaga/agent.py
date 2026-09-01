@@ -46,7 +46,12 @@ from .permissions import PermissionPolicy
 from .prompts import PromptAssembler, assemble_system_prompt
 from .provider import ContextLengthError
 from .recovery import RecoveryState, is_prompt_too_long_error, with_retry
-from .subagents import extract_text
+from .subagents import (
+    cancel_turn_subagents,
+    collect_subagent_updates,
+    extract_text,
+    wait_for_subagent_barrier,
+)
 from .tools import (
     TOOL_DEFINITIONS,
     TOOL_HANDLERS,
@@ -133,6 +138,8 @@ class SourceRuntime:
             {}, [], self.context_coordinator.memory_dir / "MEMORY.md"
         )
         self.memory_state: dict[str, Any] = {"pending_turns": []}
+        self._lead_turn_lock = threading.Lock()
+        self.last_lead_inbox_succeeded = True
 
     @staticmethod
     def _turn_text(messages: list[dict[str, Any]], turn_start: int) -> str:
@@ -180,51 +187,124 @@ class SourceRuntime:
         }
 
     def run_turn(self, query: str, *, source: str = "cli") -> str:
+        with self._lead_turn_lock:
+            return self._run_turn_locked(query, source=source)
+
+    def run_pending_lead_inbox(
+        self, *, source: str = "team_inbox"
+    ) -> str | None:
+        """Process one claimed Lead inbox batch only when the Lead is idle."""
+
+        from .teams import ack_lead_inbox, claim_lead_inbox
+
+        if not self._lead_turn_lock.acquire(blocking=False):
+            return None
+        try:
+            batch = claim_lead_inbox(route_protocol=True)
+            if not batch.messages:
+                ack_lead_inbox(batch)
+                return None
+            return self._run_turn_locked("", source=source, inbox_batch=batch)
+        finally:
+            self._lead_turn_lock.release()
+
+    def _run_turn_locked(
+        self,
+        query: str,
+        *,
+        source: str,
+        inbox_batch=None,
+    ) -> str:
+        from .teams import (
+            ack_lead_inbox,
+            claim_lead_inbox,
+            nack_lead_inbox,
+            render_lead_inbox,
+        )
+
+        batch = inbox_batch or claim_lead_inbox(route_protocol=True)
+        inbox_prompt = render_lead_inbox(batch) if batch.messages else ""
+        submitted = "\n\n".join(
+            value for value in (inbox_prompt, query) if value
+        )
+        if not submitted:
+            ack_lead_inbox(batch)
+            return ""
         turn = self.recording.start_turn(
             session_id=self.context_coordinator.session_id,
-            user_message=query,
+            user_message=submitted,
             source=source,
         )
-        with turn:
-            trigger_hooks("UserPromptSubmit", query)
-            with agent_lock:
-                turn_start = len(self.messages)
-                self.messages.append({"role": "user", "content": query})
-                recalled = self.memory_service.recall(query)
-                if recalled:
-                    legacy = self.context.get("memories", "")
-                    self.context["memories"] = "\n\n".join(
-                        value for value in (legacy, recalled) if value
+        try:
+            with turn:
+                trigger_hooks("UserPromptSubmit", submitted)
+                with agent_lock:
+                    turn_start = len(self.messages)
+                    if inbox_prompt:
+                        self.messages.append(
+                            {"role": "user", "content": inbox_prompt}
+                        )
+                    if query:
+                        self.messages.append(
+                            {"role": "user", "content": query}
+                        )
+                    memory_query = query or inbox_prompt
+                    recalled = self.memory_service.recall(memory_query)
+                    if recalled:
+                        legacy = self.context.get("memories", "")
+                        self.context["memories"] = "\n\n".join(
+                            value for value in (legacy, recalled) if value
+                        )
+                    try:
+                        agent_loop(
+                            self.messages,
+                            self.context,
+                            self.permissions,
+                            self.approval_callback,
+                            self.memory_state,
+                            self.context_coordinator,
+                            self.memory_service,
+                            turn.turn_id,
+                            memory_query,
+                        )
+                    except BaseException:
+                        cancel_turn_subagents(turn.turn_id)
+                        raise
+                    self.context = update_context(
+                        self.context,
+                        self.messages,
+                        self.context_coordinator.memory_dir / "MEMORY.md",
                     )
-                agent_loop(
-                    self.messages,
-                    self.context,
-                    self.permissions,
-                    self.approval_callback,
-                    self.memory_state,
-                    self.context_coordinator,
-                    self.memory_service,
-                    turn.turn_id,
-                    query,
+                    recalled = self.memory_service.recall(memory_query)
+                    if recalled:
+                        legacy = self.context.get("memories", "")
+                        self.context["memories"] = "\n\n".join(
+                            value for value in (legacy, recalled) if value
+                        )
+                    reply = self._turn_text(self.messages, turn_start)
+                turn.finish(
+                    reply,
+                    meta={"context": self.context_coordinator.status()},
                 )
-                self.context = update_context(
-                    self.context,
-                    self.messages,
-                    self.context_coordinator.memory_dir / "MEMORY.md",
-                )
-                recalled = self.memory_service.recall(query)
-                if recalled:
-                    legacy = self.context.get("memories", "")
-                    self.context["memories"] = "\n\n".join(
-                        value for value in (legacy, recalled) if value
-                    )
-                reply = self._turn_text(self.messages, turn_start)
-            turn.finish(
-                reply,
-                meta={"context": self.context_coordinator.status()},
+                self.memory_service.on_exchange_completed(turn_id=turn.turn_id)
+        except BaseException as error:
+            self.last_lead_inbox_succeeded = False
+            nack_lead_inbox(batch, f"{type(error).__name__}: {error}")
+            raise
+        delivery_failed = bool(batch.messages) and any(
+            marker in reply
+            for marker in (
+                "[PROVIDER_FAILED]",
+                "[CONTEXT_RECOVERY_EXHAUSTED]",
             )
-            self.memory_service.on_exchange_completed(turn_id=turn.turn_id)
+        )
+        if delivery_failed:
+            self.last_lead_inbox_succeeded = False
+            nack_lead_inbox(batch, "Lead Turn returned a recoverable failure")
             return reply
+        self.last_lead_inbox_succeeded = True
+        ack_lead_inbox(batch)
+        return reply
 
     def context_status(self) -> dict[str, Any]:
         return self.context_coordinator.status()
@@ -431,6 +511,17 @@ def agent_loop(
             print(f"  \033[35m[cron inject] {job.prompt[:60]}\033[0m")
 
         inject_background_notifications(messages)
+        subagent_notes = collect_subagent_updates(turn_id)
+        if subagent_notes:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": note}
+                        for note in subagent_notes
+                    ],
+                }
+            )
 
         if rounds_since_todo >= 3:
             messages.append(
@@ -483,6 +574,7 @@ def agent_loop(
                         ],
                     }
                 )
+                cancel_turn_subagents(turn_id)
                 return
 
         try:
@@ -524,6 +616,7 @@ def agent_loop(
                         ],
                     }
                 )
+                cancel_turn_subagents(turn_id)
                 return
             messages.append(
                 {
@@ -540,6 +633,7 @@ def agent_loop(
                     ],
                 }
             )
+            cancel_turn_subagents(turn_id)
             return
 
         if response.stop_reason == "max_tokens":
@@ -559,6 +653,7 @@ def agent_loop(
                 )
                 state.recovery_count += 1
                 continue
+            cancel_turn_subagents(turn_id)
             return
 
         max_tokens = config.DEFAULT_MAX_TOKENS
@@ -613,8 +708,20 @@ def agent_loop(
             messages.append({"role": "user", "content": results})
             continue
 
-        messages.append({"role": "assistant", "content": response.content})
         if response.stop_reason != "tool_use":
+            barrier_notes, settled = wait_for_subagent_barrier(turn_id)
+            if barrier_notes or not settled:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": note}
+                            for note in barrier_notes
+                        ],
+                    }
+                )
+                continue
+            messages.append({"role": "assistant", "content": response.content})
             trigger_hooks("Stop", messages)
             if memory_service is None:
                 pending_turns = memory_state.setdefault("pending_turns", [])
@@ -630,6 +737,7 @@ def agent_loop(
                     memory_store.extract_batch(batch)
             return
 
+        messages.append({"role": "assistant", "content": response.content})
         results = []
         for block in response.content:
             if block.type != "tool_use":
@@ -768,7 +876,13 @@ def agent_loop(
                     "tool": block.name,
                     "args": _observable_tool_args(block.name, block.input),
                     "output": output,
-                    "status": "ok",
+                    "status": (
+                        "error"
+                        if str(output).startswith(
+                            ("Error:", "Unknown:", "Conflict:")
+                        )
+                        else "ok"
+                    ),
                     "latency_ms": round(
                         (time.monotonic() - tool_started) * 1000
                     ),
@@ -1013,7 +1127,13 @@ class AgentRuntime:
                     tool_status = "denied"
                 else:
                     output = self.registry.execute(call.name, call.arguments)
-                    tool_status = "ok"
+                    tool_status = (
+                        "error"
+                        if str(output).startswith(
+                            ("Error:", "Unknown:", "Conflict:")
+                        )
+                        else "ok"
+                    )
                 self.hooks.trigger(HookEvent.POST_TOOL_USE, call=call, output=output)
                 notify(
                     "tool",

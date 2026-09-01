@@ -3,12 +3,15 @@ from __future__ import annotations
 import gc
 import json
 import threading
+import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+from gugugaga import tasks, teams
+from gugugaga.models import ToolCall
 from gugugaga.observability import Observer
 from gugugaga.web import (
     DashboardApplication,
@@ -267,6 +270,32 @@ def test_chat_publishes_runtime_and_observer_events():
         gc.collect()
 
 
+def test_web_runtime_starts_shared_lead_inbox_loop_and_forwards_reply():
+    class InboxAwareApp(FakeApp):
+        def __init__(self):
+            super().__init__()
+            self.inbox_callback = None
+
+        def start_lead_inbox_loop(self, callback=None):
+            self.inbox_callback = callback
+
+    with TemporaryDirectory(prefix=".web-inbox-test-", dir=Path.cwd()) as directory:
+        fake_app = InboxAwareApp()
+        application = DashboardApplication(directory, runtime_factory=lambda: fake_app)
+
+        application.runtime()
+        assert callable(fake_app.inbox_callback)
+        fake_app.inbox_callback("Team result handled.")
+
+        events = application.events.wait_after(0, 0)
+        assert events[-1]["type"] == "lead_inbox_reply"
+        assert events[-1]["reply"] == "Team result handled."
+        assert events[-1]["session_id"] == "session_current"
+        application.close()
+        del application
+        gc.collect()
+
+
 def test_store_exposes_task_board_and_scheduled_jobs():
     with TemporaryDirectory(prefix=".web-test-", dir=Path.cwd()) as directory:
         root = Path(directory)
@@ -337,6 +366,172 @@ def test_store_exposes_task_board_and_scheduled_jobs():
         gc.collect()
 
 
+def test_team_settings_assignment_and_offline_guard():
+    with TemporaryDirectory(prefix=".web-team-test-", dir=Path.cwd()) as directory:
+        application = DashboardApplication(directory, runtime_factory=FakeApp)
+        task = tasks.create_task("dispatch me")
+
+        assert application.team_settings()["auto_claim_enabled"] is False
+        assert application.set_team_settings(
+            {"auto_claim_enabled": True}
+        )["auto_claim_enabled"] is True
+        try:
+            application.assign_task(task.id, "alice")
+            raise AssertionError("offline teammates must be rejected")
+        except ValueError as error:
+            assert "offline" in str(error)
+
+        now = 1.0
+        teams.active_teammates["alice"] = True
+        teams._teammate_states["alice"] = {
+            "name": "alice",
+            "role": "developer",
+            "status": "idle",
+            "online": True,
+            "current_task_id": None,
+            "started_at": now,
+            "last_active_at": now,
+        }
+        assigned = application.assign_task(task.id, "alice")
+        assert assigned["assignee"] == "alice"
+        assert assigned["owner"] is None
+        assert application.team_agents()["items"][0]["current_task_id"] == task.id
+        assert application.unassign_task(task.id)["assignee"] is None
+        assert tasks.claim_task(task.id, "agent").startswith("Claimed")
+        released = application.release_task(task.id)
+        assert released["status"] == "pending"
+        assert released["owner"] is None
+
+        active = tasks.create_task("active teammate work")
+        assert tasks.claim_task(active.id, "alice").startswith("Claimed")
+        teams._teammate_states["alice"]["current_task_id"] = active.id
+        try:
+            application.release_task(active.id)
+            raise AssertionError("active teammate work must not be released")
+        except ValueError as error:
+            assert "still running" in str(error)
+        teams.active_teammates.clear()
+        teams._teammate_states.clear()
+        application.close()
+        del application
+        gc.collect()
+
+
+def test_web_can_stop_and_restart_persisted_team_agent():
+    class UnusedProvider:
+        def create(self, messages, system, tools, max_tokens, model=None):
+            raise AssertionError("an unassigned teammate must remain idle")
+
+    with TemporaryDirectory(prefix=".web-team-lifecycle-", dir=Path.cwd()) as directory:
+        teams.active_teammates.clear()
+        teams._teammate_states.clear()
+        teams._teammate_stop_events.clear()
+        application = DashboardApplication(directory, runtime_factory=FakeApp)
+        teams.set_team_provider(UnusedProvider())
+        try:
+            assert teams.run_spawn_teammate(
+                "web-alice", "developer", "Wait for user assignment."
+            ).startswith("Teammate")
+
+            stopped = application.stop_team_agent("web-alice")
+            assert stopped["name"] == "web-alice"
+            assert stopped["status"] == "stopping"
+            assert stopped["message"] == "Stop requested for web-alice"
+            deadline = time.monotonic() + 1
+            while "web-alice" in teams.active_teammates and time.monotonic() < deadline:
+                time.sleep(0.01)
+            item = application.team_agents()["items"][0]
+            assert item["name"] == "web-alice"
+            assert item["status"] == "stopped"
+            assert item["online"] is False
+
+            restarted = application.restart_team_agent("web-alice")
+            assert restarted["name"] == "web-alice"
+            assert restarted["status"] == "running"
+            assert restarted["message"].startswith("Teammate")
+            assert teams.active_teammates["web-alice"] is True
+        finally:
+            if "web-alice" in teams.active_teammates:
+                application.stop_team_agent("web-alice")
+            deadline = time.monotonic() + 1
+            while "web-alice" in teams.active_teammates and time.monotonic() < deadline:
+                time.sleep(0.01)
+            teams.stop_all_teammates()
+            teams.set_team_provider(None)
+            teams.active_teammates.clear()
+            teams._teammate_states.clear()
+            teams._teammate_stop_events.clear()
+            application.close()
+            del application
+            gc.collect()
+
+
+def test_subagent_history_is_summary_only():
+    with TemporaryDirectory(prefix=".web-subagent-test-", dir=Path.cwd()) as directory:
+        root = Path(directory)
+        store = DashboardStore(root)
+        trace_dir = root / ".gugugaga" / "traces"
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        events = [
+            {
+                "type": "subagent_start",
+                "timestamp": "2026-09-01T01:00:00+00:00",
+                "session_id": "session_one",
+                "turn_id": "turn_old",
+                "agent_type": "subagent",
+                "agent_id": "subagent_a",
+                "description": "inspect implementation",
+            },
+            {
+                "type": "tool",
+                "timestamp": "2026-09-01T01:00:01+00:00",
+                "session_id": "session_one",
+                "turn_id": "turn_old",
+                "agent_type": "subagent",
+                "agent_id": "subagent_a",
+                "tool": "read_file",
+                "args": {"secret": "must not reach history"},
+                "output": "full output must not reach history",
+            },
+            {
+                "type": "subagent_end",
+                "timestamp": "2026-09-01T01:00:02+00:00",
+                "session_id": "session_one",
+                "turn_id": "turn_old",
+                "agent_type": "subagent",
+                "agent_id": "subagent_a",
+                "reply": "inspection complete",
+            },
+        ]
+        (trace_dir / "2026-09-01.jsonl").write_text(
+            "\n".join(json.dumps(event) for event in events), encoding="utf-8"
+        )
+
+        item = store.subagent_history("session_one")["items"][0]
+
+        assert item["status"] == "completed"
+        assert item["tool_count"] == 1
+        assert item["summary"] == "inspection complete"
+        assert "args" not in item
+        assert "output" not in item
+        del store
+        gc.collect()
+
+
+def test_task_page_contains_team_and_subagent_controls():
+    html = (WEB_ASSETS / "index.html").read_text(encoding="utf-8")
+    script = (WEB_ASSETS / "app.js").read_text(encoding="utf-8")
+
+    assert 'id="team-auto-claim"' in html
+    assert 'id="team-agent-list"' in html
+    assert 'id="subagent-current"' in html
+    assert "/api/team/settings" in script
+    assert "/api/team/agents" in script
+    assert "loadTeamAgents" not in script
+    assert "/api/subagents/history" in script
+    assert ".innerHTML" not in script
+
+
 def test_http_server_serves_console_and_api():
     with TemporaryDirectory(prefix=".web-test-", dir=Path.cwd()) as directory:
         application = DashboardApplication(directory, runtime_factory=FakeApp)
@@ -367,6 +562,20 @@ def test_http_server_serves_console_and_api():
                 payload = json.loads(response.read())
                 assert payload["counts"]["total"] == 0
                 assert payload["scheduled_tasks"] == []
+            with urlopen(f"{base}/api/team/settings", timeout=3) as response:
+                assert json.loads(response.read())["auto_claim_enabled"] is False
+            request = Request(
+                f"{base}/api/team/settings",
+                data=json.dumps({"auto_claim_enabled": True}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="PUT",
+            )
+            with urlopen(request, timeout=3) as response:
+                assert json.loads(response.read())["auto_claim_enabled"] is True
+            with urlopen(f"{base}/api/team/agents", timeout=3) as response:
+                assert json.loads(response.read())["items"] == []
+            with urlopen(f"{base}/api/subagents", timeout=3) as response:
+                assert json.loads(response.read())["events"] == []
             with urlopen(f"{base}/api/database/tables", timeout=3) as response:
                 payload = json.loads(response.read())
                 assert any(item["name"] == "facts" for item in payload["items"])
@@ -444,6 +653,63 @@ def test_http_server_serves_console_and_api():
             server.server_close()
             application.close()
             thread.join(timeout=3)
+            del application
+            gc.collect()
+
+
+def test_web_permission_endpoint_can_resume_a_waiting_runtime_request():
+    with TemporaryDirectory(prefix=".web-permission-test-", dir=Path.cwd()) as directory:
+        application = DashboardApplication(directory, runtime_factory=FakeApp)
+        server = create_server(application, "127.0.0.1", 0)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        result = []
+        runtime_thread = threading.Thread(
+            target=lambda: result.append(
+                application.permissions.callback(
+                    ToolCall(
+                        "tool-web",
+                        "bash",
+                        {"command": "echo web", "write_paths": []},
+                    ),
+                    timeout_seconds=2,
+                )
+            )
+        )
+        runtime_thread.start()
+        try:
+            payload = {"items": []}
+            for _ in range(50):
+                with urlopen(f"{base}/api/permissions", timeout=3) as response:
+                    payload = json.loads(response.read())
+                if payload["items"]:
+                    break
+                threading.Event().wait(0.02)
+            assert len(payload["items"]) == 1
+            item = payload["items"][0]
+            assert item["tool"] == "bash"
+
+            request = Request(
+                f"{base}/api/permissions/review",
+                data=json.dumps(
+                    {"permission_id": item["permission_id"], "approve": True}
+                ).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(request, timeout=3) as response:
+                reviewed = json.loads(response.read())
+            assert reviewed["status"] == "approved"
+            runtime_thread.join(1)
+            assert result == [True]
+        finally:
+            application.permissions.close()
+            runtime_thread.join(1)
+            server.shutdown()
+            server.server_close()
+            application.close()
+            server_thread.join(timeout=3)
             del application
             gc.collect()
 

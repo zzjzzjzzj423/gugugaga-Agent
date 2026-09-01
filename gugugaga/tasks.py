@@ -10,10 +10,11 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from . import config
+from .stateio import atomic_write_text, interprocess_lock
 
 
 CURRENT_TODOS: list[dict] = []
-_task_claim_lock = threading.RLock()
+_task_state_lock = threading.RLock()
 _TASK_ID_PATTERN = re.compile(r"task_[0-9]+_[0-9]{4}\Z", re.ASCII)
 
 
@@ -25,6 +26,7 @@ class Task:
     status: str
     owner: str | None
     blockedBy: list[str]
+    assignee: str | None = None
 
 
 def _task_path(task_id: str) -> Path:
@@ -38,34 +40,50 @@ def create_task(
     description: str = "",
     blockedBy: list[str] | None = None,
 ) -> Task:
-    for dependency_id in blockedBy or []:
-        _task_path(dependency_id)
-    task = Task(
-        id=f"task_{int(time.time())}_{random.randint(0, 9999):04d}",
-        subject=subject,
-        description=description,
-        status="pending",
-        owner=None,
-        blockedBy=blockedBy or [],
-    )
-    save_task(task)
-    return task
+    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
+        for dependency_id in blockedBy or []:
+            _task_path(dependency_id)
+        while True:
+            task_id = f"task_{int(time.time())}_{random.randint(0, 9999):04d}"
+            if not _task_path(task_id).exists():
+                break
+        task = Task(
+            id=task_id,
+            subject=subject,
+            description=description,
+            status="pending",
+            owner=None,
+            blockedBy=list(blockedBy or []),
+        )
+        _save_task_unlocked(task)
+        return task
 
 
-def save_task(task: Task):
+def _save_task_unlocked(task: Task) -> None:
     path = _task_path(task.id)
-    config.TASKS_DIR.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(asdict(task), indent=2))
+    atomic_write_text(path, json.dumps(asdict(task), indent=2))
 
 
-def load_task(task_id: str) -> Task:
+def save_task(task: Task) -> None:
+    _task_path(task.id)
+    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
+        _save_task_unlocked(task)
+
+
+def _load_task_unlocked(task_id: str) -> Task:
     task = Task(**json.loads(_task_path(task_id).read_text()))
     if task.id != task_id:
         raise ValueError(f"task id mismatch: expected {task_id}, got {task.id}")
     return task
 
 
-def list_tasks() -> list[Task]:
+def load_task(task_id: str) -> Task:
+    _task_path(task_id)
+    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
+        return _load_task_unlocked(task_id)
+
+
+def _list_tasks_unlocked() -> list[Task]:
     return [
         Task(**json.loads(path.read_text()))
         for path in sorted(config.TASKS_DIR.glob("task_*.json"))
@@ -73,32 +91,59 @@ def list_tasks() -> list[Task]:
     ]
 
 
+def list_tasks() -> list[Task]:
+    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
+        return _list_tasks_unlocked()
+
+
 def get_task_json(task_id: str) -> str:
-    return json.dumps(asdict(load_task(task_id)), indent=2)
+    _task_path(task_id)
+    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
+        return json.dumps(asdict(_load_task_unlocked(task_id)), indent=2)
 
 
-def can_start(task_id: str) -> bool:
-    task = load_task(task_id)
+def _can_start_unlocked(task_id: str) -> bool:
+    task = _load_task_unlocked(task_id)
     for dependency_id in task.blockedBy:
         if not _task_path(dependency_id).exists():
             return False
-        if load_task(dependency_id).status != "completed":
+        if _load_task_unlocked(dependency_id).status != "completed":
             return False
     return True
 
 
+def can_start(task_id: str) -> bool:
+    _task_path(task_id)
+    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
+        return _can_start_unlocked(task_id)
+
+
 def _claim_task_unlocked(task_id: str, owner: str = "agent") -> str:
-    task = load_task(task_id)
+    task = _load_task_unlocked(task_id)
     if task.status != "pending":
         return f"Task {task_id} is {task.status}, cannot claim"
     if task.owner:
         return f"Task {task_id} already owned by {task.owner}"
-    if not can_start(task_id):
+    if task.assignee and task.assignee != owner:
+        return f"Task {task_id} is assigned to {task.assignee}, not {owner}"
+    active = next(
+        (
+            candidate
+            for candidate in _list_tasks_unlocked()
+            if candidate.id != task_id
+            and candidate.status == "in_progress"
+            and candidate.owner == owner
+        ),
+        None,
+    )
+    if active is not None:
+        return f"Owner {owner} is already working on {active.id}"
+    if not _can_start_unlocked(task_id):
         dependencies = [
             dependency_id
             for dependency_id in task.blockedBy
             if _task_path(dependency_id).exists()
-            and load_task(dependency_id).status != "completed"
+            and _load_task_unlocked(dependency_id).status != "completed"
         ]
         missing = [
             dependency_id
@@ -112,8 +157,9 @@ def _claim_task_unlocked(task_id: str, owner: str = "agent") -> str:
             parts.append(f"missing deps: {missing}")
         return "Cannot start — " + ", ".join(parts)
     task.owner = owner
+    task.assignee = owner
     task.status = "in_progress"
-    save_task(task)
+    _save_task_unlocked(task)
     print(f"  \033[36m[claim] {task.subject} → in_progress\033[0m")
     return f"Claimed {task.id} ({task.subject})"
 
@@ -121,28 +167,99 @@ def _claim_task_unlocked(task_id: str, owner: str = "agent") -> str:
 def claim_task(task_id: str, owner: str = "agent") -> str:
     # Autonomous teammates share one task directory. The full read/check/write
     # transition must be indivisible between their polling threads.
-    with _task_claim_lock:
+    _task_path(task_id)
+    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
         return _claim_task_unlocked(task_id, owner)
 
 
-def complete_task(task_id: str) -> str:
-    task = load_task(task_id)
-    if task.status != "in_progress":
-        return f"Task {task_id} is {task.status}, cannot complete"
-    task.status = "completed"
-    save_task(task)
-    unblocked = [
-        candidate.subject
-        for candidate in list_tasks()
-        if candidate.status == "pending"
-        and candidate.blockedBy
-        and can_start(candidate.id)
-    ]
-    print(f"  \033[32m[complete] {task.subject} ✓\033[0m")
-    message = f"Completed {task.id} ({task.subject})"
-    if unblocked:
-        message += f"\nUnblocked: {', '.join(unblocked)}"
-    return message
+def assign_task(task_id: str, assignee: str) -> Task:
+    """Reserve one ready task for an idle Team Agent without claiming it."""
+
+    value = str(assignee or "").strip()
+    if not value:
+        raise ValueError("assignee is required")
+    _task_path(task_id)
+    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
+        task = _load_task_unlocked(task_id)
+        if task.status != "pending" or task.owner:
+            raise ValueError(f"task {task_id} is not pending")
+        if not _can_start_unlocked(task_id):
+            raise ValueError(f"task {task_id} is blocked")
+        reserved = next(
+            (
+                candidate
+                for candidate in _list_tasks_unlocked()
+                if candidate.id != task_id
+                and candidate.assignee == value
+                and candidate.status in {"pending", "in_progress"}
+            ),
+            None,
+        )
+        if reserved is not None:
+            raise ValueError(
+                f"teammate {value} already has task {reserved.id}"
+            )
+        if task.assignee and task.assignee != value:
+            raise ValueError(
+                f"task {task_id} is already assigned to {task.assignee}"
+            )
+        task.assignee = value
+        _save_task_unlocked(task)
+        return task
+
+
+def unassign_task(task_id: str) -> Task:
+    """Remove a pending reservation. Claimed work must be completed by its owner."""
+
+    _task_path(task_id)
+    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
+        task = _load_task_unlocked(task_id)
+        if task.status != "pending" or task.owner:
+            raise ValueError(f"task {task_id} has already been claimed")
+        if not task.assignee:
+            raise ValueError(f"task {task_id} is not assigned")
+        task.assignee = None
+        _save_task_unlocked(task)
+        return task
+
+
+def release_task(task_id: str) -> Task:
+    """Return abandoned or incorrectly claimed work to the pending queue."""
+
+    _task_path(task_id)
+    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
+        task = _load_task_unlocked(task_id)
+        if task.status != "in_progress" or not task.owner:
+            raise ValueError(f"task {task_id} is not claimed")
+        task.status = "pending"
+        task.owner = None
+        task.assignee = None
+        _save_task_unlocked(task)
+        return task
+
+
+def complete_task(task_id: str, owner: str = "agent") -> str:
+    _task_path(task_id)
+    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
+        task = _load_task_unlocked(task_id)
+        if task.status != "in_progress":
+            return f"Task {task_id} is {task.status}, cannot complete"
+        if task.owner != owner:
+            return f"Task {task_id} is owned by {task.owner}, not {owner}"
+        task.status = "completed"
+        _save_task_unlocked(task)
+        unblocked = [
+            candidate.subject
+            for candidate in _list_tasks_unlocked()
+            if candidate.status == "pending"
+            and candidate.blockedBy
+            and _can_start_unlocked(candidate.id)
+        ]
+        print(f"  \033[32m[complete] {task.subject} ✓\033[0m")
+        message = f"Completed {task.id} ({task.subject})"
+        if unblocked:
+            message += f"\nUnblocked: {', '.join(unblocked)}"
+        return message
 
 
 def _normalize_todos(todos):
@@ -217,7 +334,7 @@ def run_claim_task(task_id: str) -> str:
 
 def run_complete_task(task_id: str) -> str:
     try:
-        return complete_task(task_id)
+        return complete_task(task_id, owner="agent")
     except FileNotFoundError:
         return f"Error: task {task_id} not found"
     except ValueError as error:
