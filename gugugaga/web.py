@@ -23,7 +23,6 @@ from .__main__ import GugugagaApp, build_runtime
 from .config import Settings
 from .context_modes import ContextModeError
 from .interactions import interaction_broker
-from .memory import memory_hit_kinds
 from .memory.repository import MemoryRepository
 from .observability import sanitize
 from .permissions import PermissionBroker
@@ -929,6 +928,38 @@ class DashboardApplication:
                     "kinds": ["procedural"],
                 }
             )
+        if (
+            is_main_event
+            and event.get("type") == "memory"
+            and event.get("action") == "retrieval_gate"
+        ):
+            hit_count = int(event.get("hit_count") or 0)
+            kinds = list(event.get("kinds") or [])
+            self.last_memory_hits = hit_count
+            self.events.publish(
+                {
+                    "type": "runtime",
+                    "stage": "retrieval_gate",
+                    "status": "complete",
+                    "decision": event.get("decision", "skip"),
+                    "reason": event.get("reason", "unknown"),
+                    "memory_hits": hit_count,
+                    "memory_kinds": kinds,
+                }
+            )
+            if hit_count:
+                self.events.publish(
+                    {
+                        "type": "runtime",
+                        "stage": "memory_injection",
+                        "status": "active",
+                        "memory_hits": hit_count,
+                        "memory_kinds": kinds,
+                    }
+                )
+            self.events.publish(
+                {"type": "runtime", "stage": "working_context", "status": "active"}
+            )
         if is_main_event and event.get("type") == "context":
             self.events.publish(
                 {"type": "runtime", "stage": "compression_gate", "status": "active"}
@@ -1128,23 +1159,10 @@ class DashboardApplication:
         try:
             runtime = self.runtime()
             self.events.publish({"type": "runtime", "stage": "input", "status": "active"})
-            self.events.publish({"type": "runtime", "stage": "retrieval_gate", "status": "active"})
-            recalled = runtime.memory_service.recall(value)
-            hits = len(re.findall(r"(?m)^- \[", recalled))
-            kinds = list(memory_hit_kinds(recalled))
-            self.last_memory_hits = hits
-            self.events.publish(
-                {
-                    "type": "runtime",
-                    "stage": "memory_injection" if hits else "working_context",
-                    "status": "active",
-                    "memory_hits": hits,
-                    "memory_kinds": kinds,
-                }
-            )
-            self.events.publish({"type": "runtime", "stage": "working_context", "status": "active"})
-            self.events.publish({"type": "runtime", "stage": "compression_gate", "status": "active"})
             reply = runtime.run_turn(value, source="web")
+            recalled = getattr(runtime, "last_memory_recall", None)
+            hits = int(getattr(recalled, "hit_count", 0) or 0)
+            self.last_memory_hits = hits
             self.events.publish({"type": "runtime", "stage": "reply", "status": "complete"})
             return ChatResult(
                 reply=reply,

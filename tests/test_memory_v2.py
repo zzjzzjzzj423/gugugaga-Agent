@@ -39,6 +39,47 @@ Past episodes (historical context only):
     assert memory_hit_kinds(rendered) == ("semantic", "episodic")
 
 
+def test_retrieval_gate_skips_trivial_and_unrelated_queries(tmp_path):
+    service = MemoryService(
+        tmp_path / "state.db", ScriptedProvider(), start_worker=False
+    )
+    service.save_note(
+        subject="language_preference",
+        content="The user prefers Rust examples",
+        turn_id="turn-memory",
+    )
+
+    trivial = service.recall_for_turn("hello")
+    unrelated = service.recall_for_turn("weather forecast")
+
+    assert trivial.decision == "skip"
+    assert trivial.reason == "trivial_query"
+    assert unrelated.decision == "skip"
+    assert unrelated.reason == "no_relevant_memory"
+    assert unrelated.content == ""
+
+
+def test_retrieval_gate_uses_relevance_and_direct_reference_fallback(tmp_path):
+    service = MemoryService(
+        tmp_path / "state.db", ScriptedProvider(), start_worker=False
+    )
+    service.save_note(
+        subject="language_preference",
+        content="The user prefers Rust examples",
+        turn_id="turn-memory",
+    )
+
+    relevant = service.recall_for_turn("Explain Rust ownership")
+    direct = service.recall_for_turn("What did I tell you previously?")
+
+    assert relevant.should_inject
+    assert relevant.reason == "lexical_match"
+    assert relevant.hit_count == 1
+    assert direct.should_inject
+    assert direct.reason == "direct_reference"
+    assert direct.hit_count == 1
+
+
 def test_explicit_save_is_immediate_deduplicated_and_forgettable(tmp_path):
     service = MemoryService(
         tmp_path / "state.db", ScriptedProvider(), start_worker=False
@@ -297,11 +338,21 @@ def test_runtime_executes_save_note_inside_tool_loop_and_logs_pending_exchange(
     )
     app = build_runtime(make_settings(tmp_path, monkeypatch), provider=provider)
     try:
+        recall_calls = 0
+        original_recall = app.runtime.memory_service.recall_for_turn
+
+        def counted_recall(query):
+            nonlocal recall_calls
+            recall_calls += 1
+            return original_recall(query)
+
+        app.runtime.memory_service.recall_for_turn = counted_recall
         assert app.runtime.run_turn("记住我叫周子健") == "好的，我已经记住了。"
         tool_result = provider.requests[1]["messages"][-1]["content"][0]["content"]
         assert json.loads(tool_result)["status"] == "added"
         assert app.runtime.memory_service.status()["facts"] == 1
         assert app.runtime.memory_service.status()["pending"] == 1
+        assert recall_calls == 1
         assert any(
             getattr(spec, "name", None) == "save_note"
             or (isinstance(spec, dict) and spec.get("name") == "save_note")

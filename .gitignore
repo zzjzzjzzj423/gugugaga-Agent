@@ -3,4 +3,10 @@
 __pycache__/
 *.py[cod]
 .gugugaga/
+eval/locomo_refined/data/*.jsonl
+eval/locomo_refined/runs/
+eval/.gaokao-source/
+eval/gaokao_ic/runs/
+eval/gaokao_ic/.test_workspaces/
+eval/gaokao_ic/.pytest_tmp/
 

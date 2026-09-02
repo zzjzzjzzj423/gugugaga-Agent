@@ -22,7 +22,7 @@ gugugaga 是一个面向单用户、本地 Workspace 的 Agent Runtime。它将�
 | Memory | 可用 | 显式事实、后台整合、语义记忆、情景记忆、审计、更新和遗忘 |
 | Web Search | 可选 | 配置 Tavily 后注册 `web_search` |
 
-完整测试基线：`264 passed`。
+完整测试基线：`266 passed`。
 
 ## 运行模型
 
@@ -209,6 +209,8 @@ CLI 示例：
 
 当前实现具备凭据遮蔽、严格 JSON 校验、重要度阈值、重复检测、更新/替代、遗忘、租约、失败重试和审计记录。召回目前主要依据中文字符与英文 Token 的词面重合，并受 Token 预算限制。
 
+Retrieval Gate 每个 Turn 只执行一次：空输入、简单寒暄和无相关记忆时跳过；明确引用过去信息的请求允许回退到少量近期记忆，其他请求只有存在词面相关项时才注入。Gate 的判定、原因、命中数量和记忆类型会进入运行事件，Web Overview 展示同一份真实判定结果。
+
 ## 快速开始
 
 ### 环境要求
@@ -343,14 +345,14 @@ $workspaceDir = "C:\path\to\your-workspace"
 │   ├── usage.jsonl              # 模型和 Token 使用记录
 │   ├── team-agents.json         # Team Agent 持久化配置
 │   ├── team-settings.json       # Workspace Team 自动领取设置
-│   └── agent-interactions.json  # steer/queue/redirect/stop 状态
+│   ├── agent-interactions.json  # steer/queue/redirect/stop 状态
+│   └── skills/                  # Runtime 与 Web 共用的 Workspace Skills
 ├── .tasks/                      # Task System JSON 状态
 ├── .mailboxes/                  # Team Agent 与 Lead 邮箱
 ├── .transcripts/                # 上下文模式会话记录
 ├── .memory/                     # 兼容 Memory 文件
 ├── .task_outputs/               # 大型工具结果
 ├── .scheduled_tasks.json        # Cron 持久化状态
-└── skills/                      # Workspace Skills
 ```
 
 ## 测试

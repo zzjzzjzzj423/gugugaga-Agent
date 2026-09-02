@@ -20,7 +20,7 @@ from gugugaga.provider import ProviderResponse, TextBlock, ToolUseBlock
 
 
 ALL_DERIVED_PATHS = {
-    "SKILLS_DIR": "skills",
+    "SKILLS_DIR": ".gugugaga/skills",
     "TRANSCRIPT_DIR": ".transcripts",
     "TOOL_RESULTS_DIR": ".task_outputs/tool-results",
     "TASKS_DIR": ".tasks",

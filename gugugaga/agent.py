@@ -36,7 +36,7 @@ from .hooks import HookEvent, HookManager
 from .hooks import trigger_hooks
 from .interactions import AgentInteraction, interaction_broker
 from .models import ChatProvider, ToolCall, ToolSpec
-from .memory import MemoryService
+from .memory import MemoryService, RecallResult
 from .observability import (
     RecordingSystem,
     event_scope,
@@ -139,6 +139,7 @@ class SourceRuntime:
             {}, [], self.context_coordinator.memory_dir / "MEMORY.md"
         )
         self.memory_state: dict[str, Any] = {"pending_turns": []}
+        self.last_memory_recall = RecallResult()
         self._lead_turn_lock = threading.Lock()
         self.last_lead_inbox_succeeded = True
 
@@ -176,10 +177,12 @@ class SourceRuntime:
             if message.get("role") == "user" and isinstance(message.get("content"), str):
                 query = message["content"]
                 break
-        recalled = self.memory_service.recall(query)
-        if recalled:
+        recalled = self.memory_service.recall_for_turn(query)
+        if recalled.should_inject:
             state["memories"] = "\n\n".join(
-                value for value in (state.get("memories", ""), recalled) if value
+                value
+                for value in (state.get("memories", ""), recalled.content)
+                if value
             )
         return {
             **state,
@@ -287,11 +290,12 @@ class SourceRuntime:
                             {"role": "user", "content": query}
                         )
                     memory_query = query or inbox_prompt
-                    recalled = self.memory_service.recall(memory_query)
-                    if recalled:
+                    recalled = self.memory_service.recall_for_turn(memory_query)
+                    self.last_memory_recall = recalled
+                    if recalled.should_inject:
                         legacy = self.context.get("memories", "")
                         self.context["memories"] = "\n\n".join(
-                            value for value in (legacy, recalled) if value
+                            value for value in (legacy, recalled.content) if value
                         )
                     try:
                         agent_loop(
@@ -304,6 +308,7 @@ class SourceRuntime:
                             self.memory_service,
                             turn.turn_id,
                             memory_query,
+                            recalled,
                         )
                     except BaseException:
                         cancel_turn_subagents(turn.turn_id)
@@ -313,11 +318,10 @@ class SourceRuntime:
                         self.messages,
                         self.context_coordinator.memory_dir / "MEMORY.md",
                     )
-                    recalled = self.memory_service.recall(memory_query)
-                    if recalled:
+                    if recalled.should_inject:
                         legacy = self.context.get("memories", "")
                         self.context["memories"] = "\n\n".join(
-                            value for value in (legacy, recalled) if value
+                            value for value in (legacy, recalled.content) if value
                         )
                     reply = self._turn_text(self.messages, turn_start)
                 turn.finish(
@@ -375,6 +379,7 @@ class SourceRuntime:
             {}, self.messages, self.context_coordinator.memory_dir / "MEMORY.md"
         )
         self.memory_state = {"pending_turns": []}
+        self.last_memory_recall = RecallResult()
         return self.context_coordinator.session_id
 
     def start_new_session(self, context_mode: str | None = None) -> str:
@@ -534,6 +539,7 @@ def agent_loop(
     memory_service: MemoryService | None = None,
     turn_id: str | None = None,
     memory_query: str = "",
+    memory_recall: RecallResult | None = None,
 ):
     global rounds_since_todo
     tools = (
@@ -576,6 +582,8 @@ def agent_loop(
         if memory_service is None
         else None
     )
+    if memory_service is not None and memory_recall is None:
+        memory_recall = memory_service.recall_for_turn(memory_query)
 
     iteration = 0
     while True:
@@ -644,12 +652,13 @@ def agent_loop(
             context_coordinator.memory_dir / "MEMORY.md",
         )
         if memory_service is not None:
-            recalled = memory_service.recall(memory_query)
-            if recalled:
+            if memory_recall is not None and memory_recall.should_inject:
                 legacy = context.get("memories", "")
                 context["memories"] = "\n\n".join(
-                    value for value in (legacy, recalled) if value
+                    value for value in (legacy, memory_recall.content) if value
                 )
+            else:
+                context["memories"] = ""
         system = assemble_system_prompt(context)
         request_context = RequestContext(system=system, tools=tools)
 

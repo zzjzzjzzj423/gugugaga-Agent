@@ -11,6 +11,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from gugugaga import tasks, teams
+from gugugaga.memory import RecallResult
 from gugugaga.models import ToolCall
 from gugugaga.observability import Observer
 from gugugaga.web import (
@@ -108,6 +109,7 @@ class FakeRuntime:
         self.context_coordinator = FakeCoordinator()
         self.resumed_messages = []
         self.messages = []
+        self.last_memory_recall = RecallResult()
 
     def start_new_session(self, context_mode=None):
         self.context_coordinator = FakeCoordinator(
@@ -134,6 +136,24 @@ class FakeRuntime:
 
     def run_turn(self, query: str, *, source: str = "web") -> str:
         self.context_coordinator.locked = True
+        self.last_memory_recall = RecallResult(
+            content=self.memory_service.recall(query),
+            decision="retrieve",
+            reason="lexical_match",
+            hit_count=2,
+            kinds=("semantic", "episodic"),
+        )
+        self.recording.observer.notify(
+            "memory",
+            {
+                "action": "retrieval_gate",
+                "status": "open",
+                "decision": "retrieve",
+                "reason": "lexical_match",
+                "hit_count": 2,
+                "kinds": ["semantic", "episodic"],
+            },
+        )
         self.recording.observer.notify(
             "context", {"status": "skipped", "result_code": "NO_COMPRESSIBLE_CONTENT"}
         )
@@ -155,6 +175,12 @@ class FakeApp:
 def test_store_exposes_real_memory_and_sqlite_views():
     with TemporaryDirectory(prefix=".web-test-", dir=Path.cwd()) as directory:
         store = DashboardStore(directory)
+        manifest = Path(directory) / ".gugugaga" / "skills" / "review" / "SKILL.md"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text(
+            "---\nname: review\ndescription: Review changes\n---\nInstructions",
+            encoding="utf-8",
+        )
         saved = store.repository.save_fact(
             subject="preference",
             content="Prefer concise answers",
@@ -212,6 +238,7 @@ def test_store_exposes_real_memory_and_sqlite_views():
         assert saved.status == "added"
         assert semantic["items"][0]["text"] == "Prefer concise answers"
         assert len(procedural["items"]) >= 3
+        assert any(item["subject"] == "review" for item in procedural["items"])
         assert [item["session_id"] for item in sessions[:2]] == ["session_recent", "session_old"]
         assert sessions[0]["title"] == "Review my weekly goals"
         assert sessions[0]["context_mode"] == "cc"
@@ -284,6 +311,12 @@ def test_chat_publishes_runtime_and_observer_events():
         assert result.memory_hits == 2
         assert result.session_id == "session_current"
         assert any(event.get("stage") == "retrieval_gate" for event in events)
+        assert any(
+            event.get("stage") == "retrieval_gate"
+            and event.get("decision") == "retrieve"
+            and event.get("reason") == "lexical_match"
+            for event in events
+        )
         assert any(event.get("type") == "llm" for event in events)
         assert any(event.get("type") == "tool" for event in events)
         assert any(

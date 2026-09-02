@@ -163,9 +163,10 @@ class MemoryRepository:
         user_content: str,
         assistant_content: str,
         source: str = "test",
+        completed_at: str | None = None,
     ) -> None:
         """Test/integration helper that records one complete exchange."""
-        now = utc_now()
+        now = completed_at or utc_now()
         with self._lock, self._connect() as connection:
             connection.executemany(
                 """
@@ -679,7 +680,14 @@ class MemoryRepository:
         words = set(re.findall(r"[a-z0-9_]{2,}|[\u3400-\u9fff]", folded))
         return words
 
-    def recall(self, query: str, *, fact_limit: int = 12, episode_limit: int = 5) -> str:
+    def recall(
+        self,
+        query: str,
+        *,
+        fact_limit: int = 12,
+        episode_limit: int = 5,
+        allow_recent_fallback: bool = False,
+    ) -> str:
         query_tokens = self._tokens(query)
         with self._lock, self._connect() as connection:
             facts = connection.execute(
@@ -702,7 +710,7 @@ class MemoryRepository:
                 overlap = len(query_tokens & self._tokens(text))
                 values.append((overlap, -index, row))
             values.sort(key=lambda item: (item[0], item[1]), reverse=True)
-            if values and not any(item[0] for item in values):
+            if allow_recent_fallback and values and not any(item[0] for item in values):
                 return [item[2] for item in values[: min(limit, 3)]]
             return [item[2] for item in values if item[0] > 0][:limit]
 

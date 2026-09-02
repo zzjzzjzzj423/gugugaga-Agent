@@ -58,3 +58,18 @@ class SaveNoteResult:
 
     def to_json(self) -> str:
         return json.dumps(self.as_dict(), ensure_ascii=False)
+
+
+@dataclass(frozen=True)
+class RecallResult:
+    """One turn-scoped Retrieval Gate decision and its prompt payload."""
+
+    content: str = ""
+    decision: str = "skip"
+    reason: str = "no_relevant_memory"
+    hit_count: int = 0
+    kinds: tuple[str, ...] = field(default_factory=tuple)
+
+    @property
+    def should_inject(self) -> bool:
+        return self.decision == "retrieve" and bool(self.content)

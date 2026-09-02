@@ -9,7 +9,7 @@ MODEL = os.getenv("SILICONFLOW_MODEL", "")
 PRIMARY_MODEL = MODEL
 FALLBACK_MODEL = os.getenv("SILICONFLOW_FALLBACK_MODEL")
 
-SKILLS_DIR = WORKDIR / "skills"
+SKILLS_DIR = WORKDIR / ".gugugaga" / "skills"
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 TOOL_RESULTS_DIR = WORKDIR / ".task_outputs" / "tool-results"
 TASKS_DIR = WORKDIR / ".tasks"
@@ -53,7 +53,7 @@ def configure_workspace(workspace: Path | str) -> Path:
     global TASKS_DIR, MAILBOX_DIR, MEMORY_DIR, MEMORY_INDEX, DURABLE_PATH
 
     WORKDIR = Path(workspace).expanduser().resolve()
-    SKILLS_DIR = WORKDIR / "skills"
+    SKILLS_DIR = WORKDIR / ".gugugaga" / "skills"
     TRANSCRIPT_DIR = WORKDIR / ".transcripts"
     TOOL_RESULTS_DIR = WORKDIR / ".task_outputs" / "tool-results"
     TASKS_DIR = WORKDIR / ".tasks"
