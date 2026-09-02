@@ -9,4 +9,5 @@ eval/.gaokao-source/
 eval/gaokao_ic/runs/
 eval/gaokao_ic/.test_workspaces/
 eval/gaokao_ic/.pytest_tmp/
+eval/gaokao_ic/.debug/
 

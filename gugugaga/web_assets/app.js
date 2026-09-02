@@ -17,8 +17,11 @@
     turnRunning: false,
     permission: null,
     teamAgents: [],
+    teamMessageIds: new Set(),
+    teamMessagesInitialized: false,
     teamDetailName: null,
     teamDetail: null,
+    teamConfigDirty: false,
     pageScroll: { overview: 0, tasks: 0, memory: 0, database: 0 },
   };
 
@@ -255,16 +258,105 @@
     return card;
   }
 
+  function teamGraphNode(name) {
+    return $(`.team-agent-node[data-agent-name="${CSS.escape(String(name || '').toLowerCase())}"]`);
+  }
+
+  function teamGraphPoint(node, graphRect) {
+    const rect = node.getBoundingClientRect();
+    return { x: rect.left - graphRect.left + (rect.width / 2), y: rect.top - graphRect.top + (rect.height / 2) };
+  }
+
+  function teamEdgeKey(from, to) {
+    return [String(from).toLowerCase(), String(to).toLowerCase()].sort().join('--');
+  }
+
+  function appendTeamGraphEdge(from, to, transient = false) {
+    const graph = $('#team-agent-graph');
+    const svg = $('#team-graph-edges');
+    const fromNode = teamGraphNode(from); const toNode = teamGraphNode(to);
+    if (!graph || !svg || !fromNode || !toNode) return null;
+    const graphRect = graph.getBoundingClientRect();
+    const start = teamGraphPoint(fromNode, graphRect); const end = teamGraphPoint(toNode, graphRect);
+    const edge = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+    edge.setAttribute('x1', String(start.x)); edge.setAttribute('y1', String(start.y));
+    edge.setAttribute('x2', String(end.x)); edge.setAttribute('y2', String(end.y));
+    edge.setAttribute('class', `team-graph-edge${transient ? ' is-transient' : ''}`);
+    edge.dataset.edgeKey = teamEdgeKey(from, to);
+    svg.append(edge);
+    return edge;
+  }
+
+  function drawTeamGraphEdges() {
+    const graph = $('#team-agent-graph'); const svg = $('#team-graph-edges');
+    if (!graph || !svg || graph.clientWidth === 0 || graph.clientHeight === 0) return;
+    svg.setAttribute('viewBox', `0 0 ${graph.clientWidth} ${graph.clientHeight}`);
+    svg.replaceChildren();
+    state.teamAgents.forEach((agent) => appendTeamGraphEdge('lead', agent.name));
+  }
+
+  function animateTeamMessage(message) {
+    const from = String(message.from_agent || message.from || '').toLowerCase();
+    const to = String(message.to_agent || message.to || '').toLowerCase();
+    const graph = $('#team-agent-graph'); const layer = $('#team-mail-layer');
+    const fromNode = teamGraphNode(from); const toNode = teamGraphNode(to);
+    if (!from || !to || !graph || !layer || !fromNode || !toNode || graph.clientWidth === 0) return;
+    drawTeamGraphEdges();
+    const key = teamEdgeKey(from, to);
+    let edge = $(`.team-graph-edge[data-edge-key="${CSS.escape(key)}"]`, $('#team-graph-edges'));
+    const transient = !edge;
+    if (!edge) edge = appendTeamGraphEdge(from, to, true);
+    edge?.classList.add('is-active');
+
+    const graphRect = graph.getBoundingClientRect();
+    const start = teamGraphPoint(fromNode, graphRect); const end = teamGraphPoint(toNode, graphRect);
+    const mail = document.createElement('span'); mail.className = 'team-mail'; mail.textContent = '✉';
+    mail.style.left = `${start.x - 14}px`; mail.style.top = `${start.y - 14}px`;
+    mail.setAttribute('aria-label', `${from} 向 ${to} 发送了 ${message.message_type || message.type || '消息'}`);
+    layer.append(mail); fromNode.classList.add('is-sending');
+    const finish = () => {
+      mail.remove(); fromNode.classList.remove('is-sending'); toNode.classList.add('is-receiving');
+      edge?.classList.remove('is-active');
+      if (transient) edge?.remove();
+      window.setTimeout(() => toNode.classList.remove('is-receiving'), 650);
+    };
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches || !mail.animate) {
+      finish(); return;
+    }
+    const flight = mail.animate([
+      { transform: 'translate3d(0, 0, 0) scale(.86)', opacity: .35 },
+      { transform: `translate3d(${(end.x - start.x) * .5}px, ${(end.y - start.y) * .5 - 10}px, 0) scale(1.08)`, opacity: 1, offset: .52 },
+      { transform: `translate3d(${end.x - start.x}px, ${end.y - start.y}px, 0) scale(.92)`, opacity: .5 },
+    ], { duration: 920, easing: 'cubic-bezier(.22,.8,.28,1)', fill: 'forwards' });
+    flight.finished.then(finish).catch(finish);
+  }
+
+  function rememberTeamMessage(message, animate = true) {
+    const id = String(message.message_id || message.id || '');
+    if (!id || state.teamMessageIds.has(id)) return;
+    state.teamMessageIds.add(id);
+    if (state.teamMessageIds.size > 500) state.teamMessageIds = new Set([...state.teamMessageIds].slice(-300));
+    if (animate) animateTeamMessage(message);
+  }
+
+  function renderTeamCommunications(payload) {
+    const initial = !state.teamMessagesInitialized;
+    (payload.items || []).forEach((message) => rememberTeamMessage(message, !initial));
+    state.teamMessagesInitialized = true;
+  }
+
   function renderTeamAgents(payload) {
     state.teamAgents = payload.items || [];
     const online = state.teamAgents.filter((agent) => agent.online);
     $('#team-agent-count').textContent = `${online.length} online`;
     const list = $('#team-agent-list'); list.replaceChildren();
     if (!state.teamAgents.length) {
-      const empty = document.createElement('div'); empty.className = 'team-empty'; empty.textContent = '尚未创建 Team Agent'; list.append(empty); return;
+      const empty = document.createElement('div'); empty.className = 'team-empty'; empty.textContent = '尚未创建 Team Agent'; list.append(empty);
+      requestAnimationFrame(drawTeamGraphEdges); return;
     }
     state.teamAgents.forEach((agent) => {
-      const card = document.createElement('article'); card.className = `team-agent-item is-${agent.status || 'idle'}`;
+      const card = document.createElement('article'); card.className = `team-agent-item team-agent-node is-${agent.status || 'idle'}${agent.online ? ' is-online' : ''}`;
+      card.dataset.agentName = String(agent.name).toLowerCase();
       card.tabIndex = 0;
       card.setAttribute('role', 'button');
       card.setAttribute('aria-label', `查看 Team Agent ${agent.name} 的工作详情`);
@@ -314,6 +406,7 @@
       actions.append(action, remove);
       card.append(dot, body, task, actions); list.append(card);
     });
+    requestAnimationFrame(drawTeamGraphEdges);
   }
 
   function appendTeamEmpty(container, text) {
@@ -329,6 +422,44 @@
     return event.summary || event.status || event.type;
   }
 
+  function teamConfigurationState(configuration) {
+    const states = {
+      active: '当前已生效',
+      pending: '任务结束后生效',
+      restarting: '正在重启生效',
+      next_start: '下次启动生效',
+    };
+    return states[configuration.apply_state] || '配置状态未知';
+  }
+
+  function renderTeamConfiguration(configuration) {
+    $('#team-config-state').textContent = teamConfigurationState(configuration);
+    if (state.teamConfigDirty) return;
+    const editable = configuration.editable !== false;
+    $('#team-config-role').value = configuration.role || '';
+    $('#team-config-role').disabled = !editable;
+    $('#team-config-prompt').value = configuration.prompt || '';
+    $('#team-config-prompt').disabled = !editable;
+    $('#team-config-save').disabled = !editable;
+    $('#team-config-reset').disabled = !editable;
+    const allowed = new Set(configuration.allowed_tools || []);
+    const tools = $('#team-config-tools'); tools.replaceChildren();
+    (configuration.tool_catalog || []).forEach((tool) => {
+      const label = document.createElement('label');
+      label.className = `team-config-tool${tool.required ? ' is-required' : ''}`;
+      const input = document.createElement('input'); input.type = 'checkbox';
+      input.dataset.toolName = tool.name;
+      input.checked = tool.required || allowed.has(tool.name);
+      input.disabled = Boolean(tool.required) || !editable;
+      input.addEventListener('change', () => { state.teamConfigDirty = true; });
+      const body = document.createElement('span');
+      const name = document.createElement('strong'); name.textContent = tool.name;
+      const description = document.createElement('small');
+      description.textContent = `${tool.label || tool.name} · ${tool.group || '其他'}${tool.required ? ' · 必需' : ''}`;
+      body.append(name, description); label.append(input, body); tools.append(label);
+    });
+  }
+
   function renderTeamAgentDetail(payload) {
     state.teamDetail = payload;
     const agent = payload.agent || {};
@@ -338,6 +469,7 @@
     $('#team-detail-phase').textContent = phase.phase || agent.activity_phase || agent.status || '—';
     $('#team-detail-task').textContent = payload.current_task ? `${payload.current_task.id} · ${payload.current_task.subject}` : '当前无执行任务';
     $('#team-detail-disclosure').textContent = payload.disclosure || '展示可审计的工作摘要，不展示模型隐藏思维链。';
+    renderTeamConfiguration(payload.configuration || {});
 
     const activity = $('#team-detail-activity'); activity.replaceChildren();
     const activityText = phase.summary || agent.activity_summary;
@@ -404,6 +536,7 @@
   async function openTeamAgentDetail(name) {
     state.teamDetailName = name;
     state.teamDetail = null;
+    state.teamConfigDirty = false;
     $('#team-detail-title').textContent = name;
     $('#team-detail-backdrop').hidden = false;
     document.body.classList.add('has-modal');
@@ -416,6 +549,7 @@
     document.body.classList.remove('has-modal');
     state.teamDetailName = null;
     state.teamDetail = null;
+    state.teamConfigDirty = false;
   }
 
   function renderSubagents(current, history) {
@@ -511,11 +645,13 @@
     button.disabled = true;
     try {
       const session = state.currentSessionId ? `?session_id=${encodeURIComponent(state.currentSessionId)}` : '';
-      const [tasks, settings, agents, current, history] = await Promise.all([
+      const [tasks, settings, agents, communications, current, history] = await Promise.all([
         api('/api/tasks'), api('/api/team/settings'), api('/api/team/agents'),
+        api('/api/team/communications'),
         api('/api/subagents'), api(`/api/subagents/history${session}`),
       ]);
       renderTeamAgents(agents);
+      renderTeamCommunications(communications);
       renderTasks(tasks);
       $('#team-auto-claim').checked = Boolean(settings.auto_claim_enabled);
       $('#team-auto-state').textContent = settings.auto_claim_enabled ? '已开启' : '已关闭';
@@ -524,6 +660,10 @@
       const board = $('#task-board'); board.replaceChildren();
       const failed = document.createElement('div'); failed.className = 'task-load-error'; failed.textContent = `任务数据加载失败：${error.message}`; board.append(failed);
     } finally { button.disabled = false; }
+  }
+
+  async function loadTeamCommunications() {
+    try { renderTeamCommunications(await api('/api/team/communications')); } catch (_) { /* best-effort animation */ }
   }
 
   $('#task-refresh').addEventListener('click', loadTasks);
@@ -568,6 +708,8 @@
   function renderConfiguration(data) {
     $('#settings-model').value = data.model || '';
     $('#settings-small-model').value = data.consolidation_model || '';
+    $('#settings-intent-model').value = data.intent_gate_model || '';
+    $('#settings-embedding-model').value = data.embedding_model || '';
     $('#settings-siliconflow-key').value = '';
     $('#settings-tavily-key').value = '';
     $('#settings-siliconflow-key').placeholder = data.siliconflow_api_key_configured
@@ -619,6 +761,8 @@
         body: JSON.stringify({
           model: $('#settings-model').value.trim(),
           consolidation_model: $('#settings-small-model').value.trim(),
+          intent_gate_model: $('#settings-intent-model').value.trim(),
+          embedding_model: $('#settings-embedding-model').value.trim(),
           siliconflow_api_key: $('#settings-siliconflow-key').value.trim(),
           tavily_api_key: $('#settings-tavily-key').value.trim(),
         }),
@@ -635,6 +779,24 @@
     }
   });
 
+  const backgroundStateLabels = {
+    idle: 'Idle', running: 'Running', failed: 'Failed',
+    retrying: 'Retry pending',
+    disabled: 'Disabled', indexing: 'Indexing', synced: 'Synced', failed: 'Failed',
+  };
+
+  function setBackgroundState(kind, value) {
+    const id = kind === 'consolidation' ? '#consolidation-state' : '#vector-index-state';
+    const target = $(id);
+    if (!target) return;
+    const normalized = String(value || (kind === 'consolidation' ? 'idle' : 'disabled')).toLowerCase();
+    target.textContent = backgroundStateLabels[normalized] || normalized;
+    const container = target.parentElement;
+    container?.classList.toggle('is-active', normalized === 'running' || normalized === 'indexing' || normalized === 'retrying');
+    container?.classList.toggle('is-error', normalized === 'failed');
+    container?.classList.toggle('is-disabled', normalized === 'disabled');
+  }
+
   async function loadOverview(sessionId = state.viewingSessionId || state.currentSessionId) {
     try {
       const query = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : '';
@@ -643,8 +805,31 @@
       $('#metric-turn-time').textContent = data.last_turn_at ? `更新于 ${formatDate(data.last_turn_at)}` : '尚无记录';
       $('#metric-latency').textContent = Number.isFinite(data.last_latency_ms) ? `${(data.last_latency_ms / 1000).toFixed(1)}s` : '—';
       $('#metric-memory').textContent = data.memory_hits || 0;
-      const memoryTotal = Number(data.memory?.facts || 0) + Number(data.memory?.episodes || 0);
-      $('#metric-memory-total').textContent = `${memoryTotal} 条长期记忆`;
+      $('#metric-memory-total').textContent = `Fact ${Number(data.memory?.facts || 0)} · Episode ${Number(data.memory?.episodes || 0)} · Evidence Hot ${Number(data.memory?.evidence_hot || 0)} / Cold ${Number(data.memory?.evidence_cold || 0)}`;
+      const consolidationState = String(data.memory?.consolidation_state || 'idle').toLowerCase();
+      setBackgroundState('consolidation', consolidationState);
+      const consolidationTarget = $('#consolidation-state');
+      const consolidationPending = Number(data.memory?.pending || 0);
+      const consolidationFailure = data.memory?.last_failure || {};
+      if (consolidationTarget && consolidationState === 'retrying') {
+        consolidationTarget.textContent = `Retry pending · ${consolidationPending}`;
+      }
+      if (consolidationTarget) {
+        const error = consolidationFailure.error_code || '';
+        const attempts = Number(consolidationFailure.attempt_count || 0);
+        consolidationTarget.parentElement.title = error
+          ? `最近错误：${error} · 尝试 ${attempts} 次 · ${consolidationPending} 轮等待重试`
+          : `${consolidationPending} 轮等待整理`;
+      }
+      setBackgroundState('vector', data.memory?.vector_state);
+      const jobs = data.memory?.index_jobs || {};
+      const vectorState = $('#vector-index-state');
+      if (vectorState) vectorState.parentElement.title = `${Number(data.memory?.indexed || 0)} indexed · ${Number(jobs.pending || 0)} pending · ${Number(jobs.failed || 0)} failed`;
+      const retrieval = data.retrieval || {};
+      const strategy = retrieval.strategy && retrieval.strategy !== 'none'
+        ? retrieval.strategy
+        : retrieval.reason === 'intent_gate_skip' ? 'intent skip' : '—';
+      $('#retrieval-strategy').textContent = `Retrieval · ${strategy}`;
       $('#metric-context').textContent = Number.isFinite(data.context_ratio) ? `${data.context_ratio}%` : '—';
       $('#metric-context-mode').textContent = `${data.context?.display_name || 'CC'} mode · ${data.context?.successful_compactions || 0} 次压缩`;
       if (data.context?.mode) state.contextMode = data.context.mode;
@@ -659,7 +844,7 @@
 
   const stageOrder = ['input', 'retrieval_gate', 'memory_injection', 'working_context', 'compression_gate', 'compression', 'agent', 'tools', 'reply'];
   const stageLabels = {
-    input: '输入入口', retrieval_gate: 'Retrieval Gate', memory_injection: '记忆注入',
+    input: '输入入口', retrieval_gate: '记忆检索', memory_injection: '选择与注入',
     working_context: 'Working Context', compression_gate: 'Compression Gate',
     compression: 'Context Compression', agent: 'LLM Agent', tools: 'Tools',
     reply: '回复用户', consolidation: 'Memory Consolidation', error: '运行失败',
@@ -680,24 +865,18 @@
   function activateStage(stage, status = 'active') {
     const nodes = $$('[data-stage]');
     if (stage === 'input') resetRuntimeGraph();
-    if (stage === 'consolidation') {
-      const consolidation = $('[data-stage="consolidation"]');
-      consolidation?.classList.add(status === 'failed' ? 'is-error' : 'is-active');
-      setTimeout(() => consolidation?.classList.remove('is-active'), 900);
-    } else {
-      const previous = state.currentStage ? $(`[data-stage="${state.currentStage}"]`) : null;
-      if (previous && state.currentStage !== stage) {
-        previous.classList.remove('is-active');
-        if (!previous.classList.contains('is-error') && !previous.classList.contains('is-skipped')) previous.classList.add('is-complete');
-      }
-      const active = $(`[data-stage="${stage}"]`);
-      if (active) {
-        active.classList.remove('is-skipped');
-        active.classList.toggle('is-active', status !== 'error');
-        active.classList.toggle('is-error', status === 'error');
-      }
-      state.currentStage = stage;
+    const previous = state.currentStage ? $(`[data-stage="${state.currentStage}"]`) : null;
+    if (previous && state.currentStage !== stage) {
+      previous.classList.remove('is-active');
+      if (!previous.classList.contains('is-error') && !previous.classList.contains('is-skipped')) previous.classList.add('is-complete');
     }
+    const active = $(`[data-stage="${stage}"]`);
+    if (active) {
+      active.classList.toggle('is-skipped', status === 'skipped');
+      active.classList.toggle('is-active', status !== 'error' && status !== 'skipped');
+      active.classList.toggle('is-error', status === 'error');
+    }
+    state.currentStage = stage;
     $('#runtime-label').textContent = status === 'error' ? '运行失败' : `正在执行 · ${stageLabels[stage] || stage}`;
     $('#event-chip').textContent = stageLabels[stage] || stage;
     $('#typing-label').textContent = stageLabels[stage] || 'Agent 正在工作';
@@ -719,7 +898,7 @@
     if (!stage) {
       if (event.type === 'turn_start') return null;
       else if (event.type === 'llm') {
-        if (event.call_type === 'context_summary') return null;
+        if (event.call_type === 'context_summary' || String(event.call_type || '').startsWith('memory_')) return null;
         stage = 'agent';
       }
       else if (event.type === 'tool') stage = 'tools';
@@ -730,7 +909,15 @@
         else return null;
       }
       else if (event.type === 'memory') {
-        if (event.action === 'consolidate') stage = 'consolidation';
+        if (event.action === 'intent_gate' && event.status === 'active') stage = 'retrieval_gate';
+        else if (event.action === 'consolidate') {
+          const next = event.status === 'active' ? 'running' : event.status === 'failed' ? 'retrying' : 'idle';
+          return { action: 'background-state', kind: 'consolidation', value: next };
+        }
+        else if (event.action === 'index_outbox') {
+          const next = event.status === 'active' ? 'indexing' : event.status === 'failed' ? 'failed' : 'synced';
+          return { action: 'background-state', kind: 'vector', value: next };
+        }
         else if (event.action === 'recall' && event.status === 'hit') return { action: 'memory-hit', memoryKinds: event.kinds || [] };
         else return null;
       }
@@ -738,7 +925,7 @@
       else if (event.type === 'turn_error') stage = 'error';
     }
     if (stage === 'error') return { stage: 'agent', status: 'error' };
-    return stage ? { stage, status: event.status, memoryKinds: event.memory_kinds || [] } : null;
+    return stage ? { stage, status: event.status, memoryKinds: event.memory_kinds || [], strategy: event.strategy } : null;
   }
 
   async function playEventQueue() {
@@ -757,7 +944,15 @@
           activateMemoryKinds(item.memoryKinds);
           continue;
         }
+        if (item.action === 'background-state') {
+          setBackgroundState(item.kind, item.value);
+          if (item.value !== 'running' && item.value !== 'indexing') loadOverview();
+          continue;
+        }
         if (!item.stage) continue;
+        if (item.stage === 'retrieval_gate' && item.strategy && item.strategy !== 'none') {
+          $('#retrieval-strategy').textContent = `Retrieval · ${item.strategy}`;
+        }
         activateMemoryKinds(item.memoryKinds);
         if (item.stage === state.currentStage && item.status !== 'error') continue;
         activateStage(item.stage, item.status);
@@ -776,6 +971,10 @@
     if (event.type === 'team_inbox_unread') {
       $('#event-chip').textContent = 'Team 消息未读';
       if (state.page === 'tasks') loadTasks();
+    }
+    if (event.type === 'team_message') {
+      rememberTeamMessage(event);
+      if (state.page === 'tasks') $('#event-chip').textContent = `${event.from_agent || 'Agent'} → ${event.to_agent || 'Agent'}`;
     }
     if (event.type === 'lead_inbox_reply') {
       if (!event.session_id || event.session_id === state.currentSessionId) {
@@ -1152,7 +1351,88 @@
     return fragment;
   }
 
-  function addMessage(role, content, createdAt = new Date().toISOString()) {
+  function recallKindLabel(kind) {
+    return ({ fact: 'Semantic Fact', episode: 'Episodic', chat: 'Conversation Evidence' })[kind] || 'Memory';
+  }
+
+  function updateRecallFeedbackState(item, buttons, status) {
+    buttons.forEach((button) => {
+      const selected = item.feedback === button.dataset.feedback;
+      button.classList.toggle('is-selected', selected);
+      button.setAttribute('aria-pressed', String(selected));
+      button.disabled = !item.feedback_enabled || Boolean(item.feedbackSaving);
+    });
+    if (item.kind === 'chat') status.textContent = '原始对话证据 · 仅查看';
+    else if (!item.memory_available) status.textContent = 'Memory 已失效，不能继续反馈';
+    else if (item.feedbackSaving) status.textContent = '正在记录反馈…';
+    else if (item.feedback) {
+      const label = item.feedback === 'helpful' ? '👍 Helpful' : '👎 Irrelevant';
+      status.textContent = `已记录 ${label} · Helpful ${Number(item.helpful_count || 0)} / Irrelevant ${Number(item.irrelevant_count || 0)}`;
+    } else status.textContent = '这条记忆对本次回答有帮助吗？';
+  }
+
+  function renderRecallPanel(memories, open = false) {
+    if (!Array.isArray(memories) || !memories.length) return null;
+    const panel = document.createElement('details'); panel.className = 'recall-panel'; panel.open = open;
+    const summary = document.createElement('summary');
+    const summaryLabel = document.createElement('span'); summaryLabel.textContent = `本轮召回 ${memories.length} 条记忆`;
+    const summaryHint = document.createElement('small'); summaryHint.textContent = '查看来源与反馈';
+    summary.append(summaryLabel, summaryHint); panel.append(summary);
+    const list = document.createElement('div'); list.className = 'recall-list';
+    memories.forEach((item) => {
+      const card = document.createElement('article'); card.className = `recall-card kind-${item.kind || 'unknown'}`;
+      const heading = document.createElement('header');
+      const badge = document.createElement('span'); badge.className = 'recall-kind'; badge.textContent = recallKindLabel(item.kind);
+      const title = document.createElement('strong'); title.textContent = item.subject || recallKindLabel(item.kind);
+      heading.append(badge, title);
+      const body = document.createElement('p'); body.textContent = String(item.text || '');
+      const sources = (item.retrieval_sources || []).map((value) => String(value).toUpperCase()).join(' + ');
+      const meta = document.createElement('small'); meta.className = 'recall-score';
+      const score = Number(item.final_score);
+      meta.textContent = `${sources || 'RECALL'}${Number.isFinite(score) ? ` · Final ${(score * 100).toFixed(1)}%` : ''}`;
+      const feedbackRow = document.createElement('footer');
+      const status = document.createElement('small'); status.className = 'recall-feedback-status';
+      const controls = document.createElement('span'); controls.className = 'recall-feedback-controls';
+      const feedbackOptions = item.kind === 'chat' ? [] : ['helpful', 'irrelevant'];
+      const buttons = feedbackOptions.map((feedback) => {
+        const button = document.createElement('button'); button.type = 'button'; button.dataset.feedback = feedback;
+        button.textContent = feedback === 'helpful' ? '👍' : '👎';
+        button.title = feedback === 'helpful' ? '这条记忆有帮助' : '这条记忆不相关';
+        button.setAttribute('aria-label', button.title);
+        button.addEventListener('click', async () => {
+          if (!item.feedback_enabled || item.feedbackSaving || item.feedback === feedback) return;
+          item.feedbackSaving = true; updateRecallFeedbackState(item, buttons, status);
+          let feedbackError = null;
+          try {
+            const updated = await api('/api/memories/feedback', {
+              method: 'POST',
+              body: JSON.stringify({
+                session_id: item.session_id,
+                turn_id: item.turn_id,
+                memory_key: item.memory_key,
+                feedback,
+              }),
+            });
+            Object.assign(item, updated);
+          } catch (error) {
+            feedbackError = error;
+          } finally {
+            item.feedbackSaving = false;
+            updateRecallFeedbackState(item, buttons, status);
+            if (feedbackError) status.textContent = `反馈失败：${feedbackError.message}`;
+          }
+        });
+        controls.append(button); return button;
+      });
+      updateRecallFeedbackState(item, buttons, status);
+      feedbackRow.append(status);
+      if (buttons.length) feedbackRow.append(controls);
+      card.append(heading, body, meta, feedbackRow); list.append(card);
+    });
+    panel.append(list); return panel;
+  }
+
+  function addMessage(role, content, createdAt = new Date().toISOString(), recalledMemories = [], recallOpen = false) {
     const empty = $('.chat-empty'); if (empty) empty.remove();
     const wrapper = document.createElement('article'); wrapper.className = `message ${role}`;
     if (role !== 'user') {
@@ -1164,6 +1444,10 @@
     if (role === 'user') messageContent.textContent = String(content || '').trim();
     else { messageContent.classList.add('markdown-body'); messageContent.append(renderMarkdown(content)); }
     bubble.append(messageContent);
+    if (role !== 'user') {
+      const recallPanel = renderRecallPanel(recalledMemories, recallOpen);
+      if (recallPanel) bubble.append(recallPanel);
+    }
     const time = document.createElement('time'); time.className = 'message-time'; time.textContent = formatDate(createdAt); bubble.append(time); wrapper.append(bubble);
     $('#chat-messages').append(wrapper); $('#chat-messages').scrollTop = $('#chat-messages').scrollHeight;
   }
@@ -1257,7 +1541,7 @@
       if (!(data.items || []).length) {
         const empty = document.createElement('div'); empty.className = 'chat-empty'; empty.textContent = '这是一个新对话，长期记忆仍然可用。'; container.append(empty); updateConversationMode(); return;
       }
-      data.items.forEach((item) => addMessage(item.role, item.content, item.created_at));
+      data.items.forEach((item) => addMessage(item.role, item.content, item.created_at, item.recalled_memories || []));
       updateConversationMode();
     } catch (error) {
       const empty = document.createElement('div'); empty.className = 'chat-empty'; empty.textContent = error.message; $('#chat-messages').append(empty);
@@ -1368,7 +1652,7 @@
         state.currentSessionId = data.session_id;
         state.viewingSessionId = data.session_id;
       }
-      addMessage('assistant', data.reply || 'Agent 未返回文本。');
+      addMessage('assistant', data.reply || 'Agent 未返回文本。', new Date().toISOString(), data.recalled_memories || [], true);
       await loadOverview();
       await loadSessions();
       if (state.page === 'memory') await loadMemories();
@@ -1408,6 +1692,54 @@
   $('#team-detail-close').addEventListener('click', closeTeamAgentDetail);
   $('#team-detail-backdrop').addEventListener('click', (event) => {
     if (event.target === $('#team-detail-backdrop')) closeTeamAgentDetail();
+  });
+  $('#team-config-form').addEventListener('input', () => { state.teamConfigDirty = true; });
+  $('#team-config-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (!state.teamDetailName) return;
+    const role = $('#team-config-role').value.trim();
+    const prompt = $('#team-config-prompt').value.trim();
+    if (!role) {
+      $('#team-config-result').textContent = '角色不能为空';
+      return;
+    }
+    if (!prompt) {
+      $('#team-config-result').textContent = 'Prompt 不能为空';
+      return;
+    }
+    const allowedTools = $$('[data-tool-name]', $('#team-config-tools'))
+      .filter((input) => input.checked)
+      .map((input) => input.dataset.toolName);
+    const save = $('#team-config-save'); const reset = $('#team-config-reset');
+    save.disabled = true; reset.disabled = true;
+    $('#team-config-result').textContent = '正在保存…';
+    try {
+      const result = await api(`/api/team/agents/${encodeURIComponent(state.teamDetailName)}/profile`, {
+        method: 'PUT', body: JSON.stringify({ role, prompt, allowed_tools: allowedTools }),
+      });
+      state.teamConfigDirty = false;
+      await Promise.all([loadTeamAgentDetail(), loadTasks()]);
+      $('#team-config-result').textContent = teamConfigurationState(result);
+    } catch (error) {
+      $('#team-config-result').textContent = error.message;
+    } finally { save.disabled = false; reset.disabled = false; }
+  });
+  $('#team-config-reset').addEventListener('click', async () => {
+    if (!state.teamDetailName) return;
+    if (!window.confirm('确认恢复创建时的角色、Prompt 和默认工具列表吗？')) return;
+    const save = $('#team-config-save'); const reset = $('#team-config-reset');
+    save.disabled = true; reset.disabled = true;
+    $('#team-config-result').textContent = '正在恢复默认配置…';
+    try {
+      const result = await api(`/api/team/agents/${encodeURIComponent(state.teamDetailName)}/profile`, {
+        method: 'PUT', body: JSON.stringify({ reset: true }),
+      });
+      state.teamConfigDirty = false;
+      await Promise.all([loadTeamAgentDetail(), loadTasks()]);
+      $('#team-config-result').textContent = teamConfigurationState(result);
+    } catch (error) {
+      $('#team-config-result').textContent = error.message;
+    } finally { save.disabled = false; reset.disabled = false; }
   });
   $('#team-interaction-form').addEventListener('submit', async (event) => {
     event.preventDefault();
@@ -1468,6 +1800,7 @@
     await loadHistory();
     await loadPermissions();
     pollEvents();
+    window.addEventListener('resize', () => requestAnimationFrame(drawTeamGraphEdges));
     setInterval(() => {
       if (!state.permission) return;
       state.permission.remaining_seconds = Math.max(0, Number(state.permission.remaining_seconds || 0) - 1);
@@ -1476,6 +1809,7 @@
     }, 1000);
     setInterval(() => { if (!state.turnRunning) loadOverview(); }, 5000);
     setInterval(() => { if (!state.turnRunning && state.page === 'tasks') loadTasks(); }, 15000);
+    setInterval(() => { if (state.page === 'tasks') loadTeamCommunications(); }, 2500);
     setInterval(loadTeamAgentDetail, 2500);
   }
 

@@ -140,6 +140,7 @@ class SourceRuntime:
         )
         self.memory_state: dict[str, Any] = {"pending_turns": []}
         self.last_memory_recall = RecallResult()
+        self.last_turn_id: str | None = None
         self._lead_turn_lock = threading.Lock()
         self.last_lead_inbox_succeeded = True
 
@@ -276,6 +277,7 @@ class SourceRuntime:
             # are filtered by the dashboard history reader.
             history_user_message=query or inbox_prompt,
         )
+        self.last_turn_id = turn.turn_id
         try:
             with turn:
                 trigger_hooks("UserPromptSubmit", submitted)
@@ -380,6 +382,7 @@ class SourceRuntime:
         )
         self.memory_state = {"pending_turns": []}
         self.last_memory_recall = RecallResult()
+        self.last_turn_id = None
         return self.context_coordinator.session_id
 
     def start_new_session(self, context_mode: str | None = None) -> str:

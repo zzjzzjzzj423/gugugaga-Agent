@@ -4,6 +4,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 WORKDIR = Path.cwd()
 MODEL = os.getenv("SILICONFLOW_MODEL", "")
 PRIMARY_MODEL = MODEL
@@ -64,6 +66,14 @@ def configure_workspace(workspace: Path | str) -> Path:
     return WORKDIR
 
 
+def load_workspace_environment(workspace: Path | str) -> Path:
+    """Load workspace-local environment values without overriding the process."""
+    workspace_path = Path(workspace).expanduser().resolve()
+    environment_path = workspace_path / ".env"
+    load_dotenv(dotenv_path=environment_path, override=False)
+    return environment_path
+
+
 @dataclass(frozen=True)
 class Settings:
     workspace: Path
@@ -99,7 +109,15 @@ class Settings:
     memory_consolidation_lease_seconds: int = 600
     memory_consolidation_max_facts: int = 10
     memory_consolidation_min_importance: float = 0.8
+    memory_evidence_hot_exchanges: int = 30
     memory_recall_token_budget: int = 2000
+    memory_intent_gate_enabled: bool = True
+    memory_intent_gate_model: str | None = None
+    memory_intent_gate_timeout_seconds: int = 5
+    memory_embedding_model: str | None = None
+    memory_retrieval_candidate_limit: int = 20
+    memory_retrieval_final_limit: int = 5
+    memory_retrieval_min_score: float = 0.20
 
     @classmethod
     def from_env(
@@ -107,6 +125,7 @@ class Settings:
     ) -> "Settings":
         workspace_path = Path(workspace).expanduser().resolve()
         workspace_path.mkdir(parents=True, exist_ok=True)
+        load_workspace_environment(workspace_path)
         api_key = os.getenv("SILICONFLOW_API_KEY", "").strip()
         model = (model_override or os.getenv("SILICONFLOW_MODEL", "")).strip()
         if not api_key:
@@ -126,13 +145,22 @@ class Settings:
         for path in paths.values():
             path.mkdir(parents=True, exist_ok=True)
         threshold = int(os.getenv("GUGUGAGA_MEMORY_CONSOLIDATION_EXCHANGES", "6"))
-        timeout_seconds = int(os.getenv("GUGUGAGA_MEMORY_CONSOLIDATION_TIMEOUT", "30"))
+        timeout_seconds = int(os.getenv("GUGUGAGA_MEMORY_CONSOLIDATION_TIMEOUT", "90"))
         lease_seconds = int(os.getenv("GUGUGAGA_MEMORY_CONSOLIDATION_LEASE", "600"))
         max_facts = int(os.getenv("GUGUGAGA_MEMORY_CONSOLIDATION_MAX_FACTS", "10"))
         min_importance = float(
             os.getenv("GUGUGAGA_MEMORY_CONSOLIDATION_MIN_IMPORTANCE", "0.8")
         )
+        evidence_hot_exchanges = int(
+            os.getenv("GUGUGAGA_MEMORY_EVIDENCE_HOT_EXCHANGES", "30")
+        )
         recall_budget = int(os.getenv("GUGUGAGA_MEMORY_RECALL_TOKENS", "2000"))
+        intent_gate_timeout = int(
+            os.getenv("GUGUGAGA_MEMORY_INTENT_GATE_TIMEOUT", "5")
+        )
+        candidate_limit = int(os.getenv("GUGUGAGA_MEMORY_RETRIEVAL_CANDIDATES", "20"))
+        final_limit = int(os.getenv("GUGUGAGA_MEMORY_RETRIEVAL_TOP_K", "5"))
+        min_score = float(os.getenv("GUGUGAGA_MEMORY_RETRIEVAL_MIN_SCORE", "0.20"))
         if not 1 <= threshold <= 100:
             raise ValueError("GUGUGAGA_MEMORY_CONSOLIDATION_EXCHANGES must be 1-100")
         if not 1 <= timeout_seconds <= 120:
@@ -145,8 +173,24 @@ class Settings:
             raise ValueError(
                 "GUGUGAGA_MEMORY_CONSOLIDATION_MIN_IMPORTANCE must be 0-1"
             )
+        if not 0 <= evidence_hot_exchanges <= 10_000:
+            raise ValueError(
+                "GUGUGAGA_MEMORY_EVIDENCE_HOT_EXCHANGES must be 0-10000"
+            )
         if not 0 <= recall_budget <= 8000:
             raise ValueError("GUGUGAGA_MEMORY_RECALL_TOKENS must be 0-8000")
+        if not 1 <= intent_gate_timeout <= 30:
+            raise ValueError("GUGUGAGA_MEMORY_INTENT_GATE_TIMEOUT must be 1-30")
+        if not 1 <= candidate_limit <= 100:
+            raise ValueError("GUGUGAGA_MEMORY_RETRIEVAL_CANDIDATES must be 1-100")
+        if not 1 <= final_limit <= 20:
+            raise ValueError("GUGUGAGA_MEMORY_RETRIEVAL_TOP_K must be 1-20")
+        if final_limit > candidate_limit:
+            raise ValueError(
+                "GUGUGAGA_MEMORY_RETRIEVAL_TOP_K must not exceed candidates"
+            )
+        if not 0 <= min_score <= 1:
+            raise ValueError("GUGUGAGA_MEMORY_RETRIEVAL_MIN_SCORE must be 0-1")
         return cls(
             workspace=workspace_path,
             state_dir=state,
@@ -175,6 +219,20 @@ class Settings:
             memory_consolidation_lease_seconds=lease_seconds,
             memory_consolidation_max_facts=max_facts,
             memory_consolidation_min_importance=min_importance,
+            memory_evidence_hot_exchanges=evidence_hot_exchanges,
             memory_recall_token_budget=recall_budget,
+            memory_intent_gate_enabled=_env_bool(
+                "GUGUGAGA_MEMORY_INTENT_GATE_ENABLED", True
+            ),
+            memory_intent_gate_model=(
+                os.getenv("GUGUGAGA_MEMORY_INTENT_GATE_MODEL", "").strip() or None
+            ),
+            memory_intent_gate_timeout_seconds=intent_gate_timeout,
+            memory_embedding_model=(
+                os.getenv("GUGUGAGA_MEMORY_EMBEDDING_MODEL", "").strip() or None
+            ),
+            memory_retrieval_candidate_limit=candidate_limit,
+            memory_retrieval_final_limit=final_limit,
+            memory_retrieval_min_score=min_score,
             **paths,
         )

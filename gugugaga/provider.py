@@ -232,3 +232,11 @@ class SiliconFlowProvider(ChatProvider):
                 time.sleep(min(2**attempt, 4))
         assert last_error is not None
         raise last_error
+
+    def embed(self, texts: list[str], *, model: str) -> list[list[float]]:
+        """Create embeddings using the configured OpenAI-compatible endpoint."""
+        if not texts:
+            return []
+        response = self.client.embeddings.create(model=model, input=texts)
+        ordered = sorted(response.data, key=lambda item: int(item.index))
+        return [[float(value) for value in item.embedding] for item in ordered]

@@ -25,12 +25,14 @@ class Batch:
 class FactCandidate:
     subject: str
     content: str
+    importance: float = 1.0
 
 
 @dataclass(frozen=True)
 class ConsolidationResult:
     facts: tuple[FactCandidate, ...] = field(default_factory=tuple)
     episode: str | None = None
+    episode_importance: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -61,6 +63,39 @@ class SaveNoteResult:
 
 
 @dataclass(frozen=True)
+class RecallItem:
+    """One structured candidate selected for a turn-scoped recall."""
+
+    memory_key: str
+    kind: str
+    subject: str
+    text: str
+    occurred_at: str | None = None
+    retrieval_sources: tuple[str, ...] = field(default_factory=tuple)
+    source_ranks: dict[str, int] = field(default_factory=dict)
+    relevance_score: float = 0.0
+    final_score: float = 0.0
+
+    @property
+    def feedback_enabled(self) -> bool:
+        return self.kind in {"fact", "episode"}
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "memory_key": self.memory_key,
+            "kind": self.kind,
+            "subject": self.subject,
+            "text": self.text,
+            "occurred_at": self.occurred_at,
+            "retrieval_sources": list(self.retrieval_sources),
+            "source_ranks": dict(self.source_ranks),
+            "relevance_score": self.relevance_score,
+            "final_score": self.final_score,
+            "feedback_enabled": self.feedback_enabled,
+        }
+
+
+@dataclass(frozen=True)
 class RecallResult:
     """One turn-scoped Retrieval Gate decision and its prompt payload."""
 
@@ -69,6 +104,9 @@ class RecallResult:
     reason: str = "no_relevant_memory"
     hit_count: int = 0
     kinds: tuple[str, ...] = field(default_factory=tuple)
+    memory_keys: tuple[str, ...] = field(default_factory=tuple)
+    items: tuple[RecallItem, ...] = field(default_factory=tuple)
+    strategy: str = "none"
 
     @property
     def should_inject(self) -> bool:

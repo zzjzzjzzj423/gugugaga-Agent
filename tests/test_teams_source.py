@@ -87,6 +87,30 @@ def test_message_bus_delivers_each_mailbox_in_fifo_order_once():
     assert bus.read_inbox("alice") == []
 
 
+def test_message_bus_records_content_free_routes_for_team_graph():
+    bus = teams.MessageBus()
+
+    message_id = bus.send(
+        "lead",
+        "alice",
+        "private implementation detail",
+        "task_assignment",
+        {"task_id": "task_7"},
+    )
+
+    item = teams.list_team_communications()[-1]
+    assert item == {
+        "id": message_id,
+        "from": "lead",
+        "to": "alice",
+        "type": "task_assignment",
+        "ts": item["ts"],
+        "task_id": "task_7",
+        "interaction_id": None,
+    }
+    assert "content" not in item
+
+
 @pytest.mark.parametrize(
     "malicious_name",
     [
@@ -398,6 +422,10 @@ def test_team_results_errors_and_plan_requests_emit_unread_events(monkeypatch):
     ]
     assert unread[0][1]["task_id"] == "task_1"
     assert teams._lead_inbox_event.is_set()
+    routed = [item for item in observed if item[0] == "team_message"]
+    assert len(routed) == 4
+    assert routed[0][1]["from_agent"] == "alice"
+    assert routed[0][1]["to_agent"] == "lead"
 
 
 def test_unacknowledged_mailbox_batch_is_recovered_after_restart():
@@ -500,6 +528,25 @@ def test_default_idle_wait_has_no_lifetime_timeout(monkeypatch):
     assert result == ["shutdown"]
 
 
+def test_ordinary_message_wakes_assignment_only_teammate(monkeypatch):
+    messages = []
+    work_state = {}
+    monkeypatch.setattr(teams, "IDLE_TIMEOUT", 0.1)
+    teams.BUS.send("lead", "alice", "Introduce yourself")
+
+    assert teams.idle_poll(
+        "alice",
+        messages,
+        "alice",
+        "developer",
+        work_state=work_state,
+        require_task=True,
+    ) == "work"
+
+    assert "Introduce yourself" in messages[0]["content"]
+    assert work_state.get("task_id") is None
+
+
 def test_teammate_profile_persists_and_stopped_agent_can_restart(monkeypatch):
     class UnusedProvider:
         def create(self, messages, system, tools, max_tokens, model=None):
@@ -537,6 +584,113 @@ def test_teammate_profile_persists_and_stopped_agent_can_restart(monkeypatch):
     assert teams.stop_teammate("persistent-alice").startswith("Stop requested")
     deadline = time.monotonic() + 1
     while "persistent-alice" in teams.active_teammates and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+
+def test_teammate_profile_configuration_persists_locks_core_tools_and_resets():
+    teams._persist_teammate_profile("alice", "developer", "Initial prompt")
+
+    updated = teams.update_teammate_profile(
+        "alice",
+        role="reviewer",
+        prompt="Review frontend changes",
+        allowed_tools=["glob"],
+    )
+
+    assert updated["role"] == "reviewer"
+    assert updated["initial_role"] == "developer"
+    assert updated["prompt"] == "Review frontend changes"
+    assert updated["initial_prompt"] == "Initial prompt"
+    assert updated["allowed_tools"] == [*teams.TEAM_CORE_TOOLS, "glob"]
+    assert updated["apply_state"] == "next_start"
+    payload = json.loads(
+        (config.WORKDIR / ".gugugaga" / "team-agents.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert payload["version"] == 2
+
+    reset = teams.update_teammate_profile("alice", reset=True)
+    assert reset["role"] == "developer"
+    assert reset["prompt"] == "Initial prompt"
+    assert reset["allowed_tools"] == list(teams.TEAM_DEFAULT_ALLOWED_TOOLS)
+
+
+def test_teammate_runtime_receives_only_configured_tools(monkeypatch):
+    class ToolCaptureProvider:
+        def __init__(self):
+            self.tools = None
+
+        def create(self, messages, system, tools, max_tokens, model=None):
+            self.tools = tools
+            return ProviderResponse(
+                content=[TextBlock(text="Configured tools received.")],
+                stop_reason="end_turn",
+            )
+
+    provider = ToolCaptureProvider()
+    teams.set_team_provider(provider)
+    monkeypatch.setattr(teams, "IDLE_POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(teams, "IDLE_TIMEOUT", 0.02)
+
+    assert teams.spawn_teammate_thread(
+        "configured-alice",
+        "developer",
+        "Inspect the workspace",
+        allowed_tools=["glob"],
+    ).startswith("Teammate")
+    deadline = time.monotonic() + 1
+    while provider.tools is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert {tool["name"] for tool in provider.tools} == {
+        *teams.TEAM_CORE_TOOLS,
+        "glob",
+    }
+    assert "bash" not in {tool["name"] for tool in provider.tools}
+
+
+def test_idle_teammate_configuration_update_restarts_with_saved_profile(monkeypatch):
+    class UnusedProvider:
+        def create(self, messages, system, tools, max_tokens, model=None):
+            raise AssertionError("an idle teammate must not call the provider")
+
+    teams.set_team_provider(UnusedProvider())
+    monkeypatch.setattr(teams, "IDLE_POLL_INTERVAL", 0.01)
+    assert teams.run_spawn_teammate(
+        "reload-alice", "developer", "Initial prompt"
+    ).startswith("Teammate")
+    deadline = time.monotonic() + 1
+    while (
+        teams._teammate_states.get("reload-alice", {}).get("status") != "idle"
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.01)
+
+    updated = teams.update_teammate_profile(
+        "reload-alice",
+        role="reviewer",
+        prompt="Updated prompt",
+        allowed_tools=["glob"],
+    )
+    assert updated["apply_state"] == "restarting"
+
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        state = teams._teammate_states.get("reload-alice", {})
+        if (
+            state.get("status") == "idle"
+            and state.get("configuration_updated_at") == updated["updated_at"]
+        ):
+            break
+        time.sleep(0.01)
+    state = teams._teammate_states["reload-alice"]
+    assert state["role"] == "reviewer"
+    assert state["active_allowed_tools"] == [*teams.TEAM_CORE_TOOLS, "glob"]
+    assert state["configuration_updated_at"] == updated["updated_at"]
+    assert teams.stop_teammate("reload-alice").startswith("Stop requested")
+    deadline = time.monotonic() + 1
+    while "reload-alice" in teams.active_teammates and time.monotonic() < deadline:
         time.sleep(0.01)
 
 
@@ -634,6 +788,56 @@ def test_tool_spawned_teammate_waits_for_manual_assignment(monkeypatch):
     assert teams.run_request_shutdown("manual-alice").startswith(
         "Shutdown request"
     )
+
+
+def test_tool_spawned_teammate_replies_to_ordinary_message_without_task(monkeypatch):
+    class ConversationalProvider:
+        def __init__(self):
+            self.calls = 0
+            self.requests = []
+
+        def create(self, messages, system, tools, max_tokens, model=None):
+            self.calls += 1
+            self.requests.append(messages)
+            return ProviderResponse(
+                content=[TextBlock(text="Hello, I am Alice, the frontend developer.")],
+                stop_reason="end_turn",
+            )
+
+    provider = ConversationalProvider()
+    teams.set_team_provider(provider)
+    monkeypatch.setattr(teams, "IDLE_POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(teams, "IDLE_TIMEOUT", 1.0)
+
+    assert teams.run_spawn_teammate(
+        "chat-alice", "frontend developer", "Wait for assigned work."
+    ).startswith("Teammate")
+    time.sleep(0.05)
+    assert provider.calls == 0
+
+    assert teams.run_send_message("chat-alice", "Please introduce yourself") == (
+        "Sent to chat-alice"
+    )
+    deadline = time.monotonic() + 2
+    replies = []
+    while not replies and time.monotonic() < deadline:
+        replies = teams.BUS.read_inbox("lead")
+        if not replies:
+            time.sleep(0.01)
+
+    assert provider.calls == 1
+    assert any(
+        "Please introduce yourself" in str(message.get("content", ""))
+        for message in provider.requests[0]
+    )
+    assert replies[-1]["type"] == "result"
+    assert "Hello, I am Alice" in replies[-1]["content"]
+    assert tasks.list_tasks() == []
+
+    assert teams.run_request_shutdown("chat-alice").startswith("Shutdown request")
+    deadline = time.monotonic() + 1
+    while "chat-alice" in teams.active_teammates and time.monotonic() < deadline:
+        time.sleep(0.01)
 
 
 def test_automatic_lead_inbox_turn_cannot_spawn_teammate():
