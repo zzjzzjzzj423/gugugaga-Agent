@@ -6,7 +6,7 @@ import time
 
 from gugugaga.__main__ import build_runtime, handle_command
 from gugugaga.config import Settings
-from gugugaga.memory import MemoryRepository, MemoryService, memory_hit_kinds
+from gugugaga.memory import MemoryRepository, MemoryService, RecallItem, memory_hit_kinds
 from gugugaga.memory.validation import parse_consolidation_result
 from gugugaga.models import ModelResponse, ToolCall
 from tests.fakes import ScriptedProvider
@@ -37,6 +37,266 @@ Past episodes (historical context only):
 </untrusted_memory>"""
 
     assert memory_hit_kinds(rendered) == ("semantic", "episodic")
+
+
+def test_retrieval_gate_skips_trivial_and_unrelated_queries(tmp_path):
+    service = MemoryService(
+        tmp_path / "state.db", ScriptedProvider(), start_worker=False
+    )
+    service.save_note(
+        subject="language_preference",
+        content="The user prefers Rust examples",
+        turn_id="turn-memory",
+    )
+
+    trivial = service.recall_for_turn("hello")
+    unrelated = service.recall_for_turn("weather forecast")
+
+    assert trivial.decision == "skip"
+    assert trivial.reason == "trivial_query"
+    assert unrelated.decision == "skip"
+    assert unrelated.reason == "no_relevant_memory"
+    assert unrelated.content == ""
+
+
+def test_retrieval_gate_uses_relevance_and_direct_reference_fallback(tmp_path):
+    service = MemoryService(
+        tmp_path / "state.db", ScriptedProvider(), start_worker=False
+    )
+    service.save_note(
+        subject="language_preference",
+        content="The user prefers Rust examples",
+        turn_id="turn-memory",
+    )
+
+    relevant = service.recall_for_turn("Explain Rust ownership")
+    direct = service.recall_for_turn("What did I tell you previously?")
+
+    assert relevant.should_inject
+    assert relevant.reason == "lexical_match"
+    assert relevant.hit_count == 1
+    assert relevant.items[0].kind == "fact"
+    assert relevant.items[0].feedback_enabled is True
+    assert relevant.items[0].retrieval_sources == ("bm25",)
+    assert direct.should_inject
+    assert direct.reason == "direct_reference"
+    assert direct.hit_count == 1
+
+
+def test_recall_feedback_is_idempotent_switchable_and_scoped_to_an_impression(tmp_path):
+    repository = MemoryRepository(tmp_path / "state.db")
+    saved = repository.save_fact(
+        subject="response_preference",
+        content="The user prefers concise answers",
+        source="explicit",
+        turn_id="turn-source",
+    )
+    memory_key = f"fact:{saved.fact_id}"
+    item = RecallItem(
+        memory_key=memory_key,
+        kind="fact",
+        subject="response_preference",
+        text="The user prefers concise answers",
+        retrieval_sources=("bm25", "vector"),
+        source_ranks={"bm25": 1, "vector": 2},
+        relevance_score=0.98,
+        final_score=0.91,
+    )
+    assert repository.record_recall_impressions(
+        session_id="session-feedback",
+        turn_id="turn-feedback-1",
+        query="How should you answer?",
+        items=[item],
+    ) == 1
+    initial = repository.recall_impressions(
+        session_id="session-feedback", turn_id="turn-feedback-1"
+    )[0]
+    assert initial["feedback"] is None
+    assert initial["feedback_enabled"] is True
+    assert initial["source_ranks"] == {"bm25": 1, "vector": 2}
+
+    first = repository.record_recall_feedback(
+        session_id="session-feedback",
+        turn_id="turn-feedback-1",
+        memory_key=memory_key,
+        feedback="helpful",
+    )
+    repeated = repository.record_recall_feedback(
+        session_id="session-feedback",
+        turn_id="turn-feedback-1",
+        memory_key=memory_key,
+        feedback="helpful",
+    )
+    assert first["helpful_count"] == repeated["helpful_count"] == 1
+    assert repeated["irrelevant_count"] == 0
+    assert repeated["feedback_score"] == 2 / 3
+
+    switched = repository.record_recall_feedback(
+        session_id="session-feedback",
+        turn_id="turn-feedback-1",
+        memory_key=memory_key,
+        feedback="irrelevant",
+    )
+    assert switched["helpful_count"] == 0
+    assert switched["irrelevant_count"] == 1
+    assert switched["feedback"] == "irrelevant"
+
+    repository.record_recall_impressions(
+        session_id="session-feedback",
+        turn_id="turn-feedback-2",
+        query="Be brief",
+        items=[item],
+    )
+    accumulated = repository.record_recall_feedback(
+        session_id="session-feedback",
+        turn_id="turn-feedback-2",
+        memory_key=memory_key,
+        feedback="helpful",
+    )
+    assert accumulated["helpful_count"] == 1
+    assert accumulated["irrelevant_count"] == 1
+    assert accumulated["feedback_score"] == 0.5
+
+    try:
+        repository.record_recall_feedback(
+            session_id="session-feedback",
+            turn_id="turn-not-recalled",
+            memory_key=memory_key,
+            feedback="helpful",
+        )
+        raise AssertionError("feedback must be limited to a real recall impression")
+    except KeyError:
+        pass
+
+
+def test_recall_feedback_changes_the_next_rerank_score(tmp_path):
+    service = MemoryService(
+        tmp_path / "state.db", ScriptedProvider(), start_worker=False
+    )
+    service.save_note(
+        subject="language_preference",
+        content="The user prefers Rust examples",
+        turn_id="turn-source",
+    )
+    initial = service.recall_for_turn("Explain Rust ownership")
+    service.repository.record_recall_impressions(
+        session_id="session-ranking",
+        turn_id="turn-ranking",
+        query="Explain Rust ownership",
+        items=initial.items,
+    )
+    service.repository.record_recall_feedback(
+        session_id="session-ranking",
+        turn_id="turn-ranking",
+        memory_key=initial.items[0].memory_key,
+        feedback="helpful",
+    )
+
+    reranked = service.recall_for_turn("Explain Rust ownership")
+
+    assert reranked.items[0].final_score > initial.items[0].final_score
+
+
+def test_memory_intent_gate_skips_only_high_confidence_self_contained_queries(tmp_path):
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                json.dumps(
+                    {
+                        "decision": "skip",
+                        "reason": "self_contained",
+                        "confidence": 0.95,
+                    }
+                )
+            )
+        ]
+    )
+    service = MemoryService(
+        tmp_path / "state.db",
+        provider,
+        intent_gate_model="gate-model",
+        start_worker=False,
+    )
+    service.save_note(
+        subject="language_preference",
+        content="The user prefers Rust examples",
+        turn_id="turn-memory",
+    )
+
+    result = service.recall_for_turn("What is the capital of France?")
+
+    assert result.decision == "skip"
+    assert result.reason == "intent_gate_skip"
+    assert len(provider.requests) == 1
+    assert provider.requests[0]["model"] == "gate-model"
+    assert provider.requests[0]["max_tokens"] == 120
+
+
+def test_memory_intent_gate_retrieves_and_fails_open(tmp_path):
+    provider = ScriptedProvider(
+        [
+            ModelResponse(
+                json.dumps(
+                    {
+                        "decision": "retrieve",
+                        "reason": "preference_may_apply",
+                        "confidence": 0.91,
+                    }
+                )
+            ),
+            ModelResponse("not-json"),
+            ModelResponse(
+                json.dumps(
+                    {
+                        "decision": "skip",
+                        "reason": "probably_self_contained",
+                        "confidence": 0.40,
+                    }
+                )
+            ),
+        ]
+    )
+    service = MemoryService(tmp_path / "state.db", provider, start_worker=False)
+    service.save_note(
+        subject="language_preference",
+        content="The user prefers Rust examples",
+        turn_id="turn-memory",
+    )
+
+    allowed = service.recall_for_turn("Explain Rust ownership")
+    failed_open = service.recall_for_turn("Show another Rust example")
+    uncertain = service.recall_for_turn("Give me one more Rust example")
+
+    assert allowed.should_inject
+    assert failed_open.should_inject
+    assert uncertain.should_inject
+    assert len(provider.requests) == 3
+
+
+def test_memory_intent_gate_does_not_call_llm_for_hard_skips_or_direct_references(tmp_path):
+    provider = ScriptedProvider()
+    service = MemoryService(tmp_path / "state.db", provider, start_worker=False)
+    service.save_note(
+        subject="language_preference",
+        content="The user prefers Rust examples",
+        turn_id="turn-memory",
+    )
+
+    assert service.recall_for_turn("   ").reason == "empty_query"
+    assert service.recall_for_turn("hello").reason == "trivial_query"
+    assert service.recall_for_turn("What did I tell you previously?").should_inject
+    disabled = MemoryService(
+        tmp_path / "disabled.db", provider, enabled=False, start_worker=False
+    )
+    no_budget = MemoryService(
+        tmp_path / "no-budget.db",
+        provider,
+        recall_token_budget=0,
+        start_worker=False,
+    )
+    assert disabled.recall_for_turn("Explain Rust").reason == "memory_disabled"
+    assert no_budget.recall_for_turn("Explain Rust").reason == "memory_disabled"
+    assert provider.requests == []
 
 
 def test_explicit_save_is_immediate_deduplicated_and_forgettable(tmp_path):
@@ -148,11 +408,38 @@ def test_failed_consolidation_stays_pending_and_retries_once(tmp_path):
     failed = service.status()
     assert failed["pending"] == 6
     assert failed["last_failure"]["error_code"] == "schema_invalid"
+    assert failed["consolidation_state"] == "retrying"
 
     assert service.retry_failed() == 12
     assert service.process_pending() == 1
     assert service.status()["consolidated"] == 6
+    assert service.status()["consolidation_state"] == "idle"
     assert len(provider.requests) == 2
+
+
+def test_successful_consolidation_reconciles_evidence_hot_window(tmp_path):
+    provider = ScriptedProvider(
+        [
+            ModelResponse('{"facts": [], "episode": null}'),
+            ModelResponse('{"facts": [], "episode": null}'),
+        ]
+    )
+    service = MemoryService(
+        tmp_path / "state.db",
+        provider,
+        threshold=1,
+        evidence_hot_exchanges=1,
+        start_worker=False,
+    )
+    record_exchanges(service.repository, 2)
+
+    assert service.process_pending(max_batches=2) == 2
+
+    status = service.status()
+    assert status["consolidated"] == 2
+    assert status["evidence_hot"] == 1
+    assert status["evidence_cold"] == 1
+    assert status["evidence_hot_limit"] == 1
 
 
 def test_consolidation_redacts_credentials_before_provider(tmp_path):
@@ -297,11 +584,21 @@ def test_runtime_executes_save_note_inside_tool_loop_and_logs_pending_exchange(
     )
     app = build_runtime(make_settings(tmp_path, monkeypatch), provider=provider)
     try:
+        recall_calls = 0
+        original_recall = app.runtime.memory_service.recall_for_turn
+
+        def counted_recall(query):
+            nonlocal recall_calls
+            recall_calls += 1
+            return original_recall(query)
+
+        app.runtime.memory_service.recall_for_turn = counted_recall
         assert app.runtime.run_turn("记住我叫周子健") == "好的，我已经记住了。"
         tool_result = provider.requests[1]["messages"][-1]["content"][0]["content"]
         assert json.loads(tool_result)["status"] == "added"
         assert app.runtime.memory_service.status()["facts"] == 1
         assert app.runtime.memory_service.status()["pending"] == 1
+        assert recall_calls == 1
         assert any(
             getattr(spec, "name", None) == "save_note"
             or (isinstance(spec, dict) and spec.get("name") == "save_note")

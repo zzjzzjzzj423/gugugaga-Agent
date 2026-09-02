@@ -115,7 +115,7 @@ def parse_consolidation_result(
             )
         _future_value(item["future_value"])
         if importance >= min_importance and item["durability"] == "long_term":
-            facts.append(FactCandidate(subject, content))
+            facts.append(FactCandidate(subject, content, importance))
     episode_value = value["episode"]
     if episode_value is None:
         episode = None
@@ -143,6 +143,9 @@ def parse_consolidation_result(
             if importance >= min_importance and episode_value["completed"]
             else None
         )
+        episode_importance = importance if episode is not None else 0.0
     else:
         raise MemoryValidationError("schema_invalid", "episode must be an object or null")
-    return ConsolidationResult(tuple(facts), episode)
+    if episode_value is None:
+        episode_importance = 0.0
+    return ConsolidationResult(tuple(facts), episode, episode_importance)

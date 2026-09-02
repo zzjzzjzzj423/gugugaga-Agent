@@ -280,7 +280,15 @@ def build_runtime(
         lease_seconds=settings.memory_consolidation_lease_seconds,
         max_facts=settings.memory_consolidation_max_facts,
         min_importance=settings.memory_consolidation_min_importance,
+        evidence_hot_exchanges=settings.memory_evidence_hot_exchanges,
         recall_token_budget=settings.memory_recall_token_budget,
+        intent_gate_enabled=settings.memory_intent_gate_enabled,
+        intent_gate_model=settings.memory_intent_gate_model,
+        intent_gate_timeout_seconds=settings.memory_intent_gate_timeout_seconds,
+        embedding_model=settings.memory_embedding_model,
+        retrieval_candidate_limit=settings.memory_retrieval_candidate_limit,
+        retrieval_final_limit=settings.memory_retrieval_final_limit,
+        retrieval_min_score=settings.memory_retrieval_min_score,
     )
     permissions = PermissionPolicy()
     initialize_background_tasks()
@@ -359,7 +367,7 @@ def handle_command(command: str, app: GugugagaApp) -> tuple[bool, str]:
             "/redirect <main|agent> <text>\n"
             "/stop <main|agent>\n"
             "/memory [list|status|search <text>|show <id>|update <fact_id> <text>|"
-            "forget <id>|retry]"
+            "forget <id>|feedback <id> <helpful|irrelevant>|retry]"
         )
     if command == "/status":
         teammates = ", ".join(sorted(active_teammates)) or "none"
@@ -433,12 +441,27 @@ def handle_command(command: str, app: GugugagaApp) -> tuple[bool, str]:
             memory_id = parts[2]
             kind = "episode" if memory_id.startswith("episode_") else "fact"
             return True, service.forget(kind, memory_id)
+        elif action == "feedback" and len(parts) == 4:
+            raw_id, feedback = parts[2], parts[3].casefold()
+            if feedback not in {"helpful", "irrelevant"}:
+                return True, "usage: /memory feedback <id> <helpful|irrelevant>"
+            if ":" in raw_id:
+                memory_key = raw_id
+            else:
+                kind = "episode" if raw_id.startswith("episode_") else "fact"
+                memory_key = f"{kind}:{raw_id}"
+            queued = service.record_feedback(
+                memory_key,
+                helpful=feedback == "helpful",
+            )
+            return True, "feedback_queued" if queued else "feedback_failed"
         elif action in {"list", "search"}:
             rows = service.list_memories()
         else:
             return True, (
                 "usage: /memory [list|status|search <text>|show <id>|"
-                "update <fact_id> <text>|forget <id>|retry]"
+                "update <fact_id> <text>|forget <id>|"
+                "feedback <id> <helpful|irrelevant>|retry]"
             )
         if not rows:
             return True, "(no memories)"

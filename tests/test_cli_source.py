@@ -20,7 +20,7 @@ from gugugaga.provider import ProviderResponse, TextBlock, ToolUseBlock
 
 
 ALL_DERIVED_PATHS = {
-    "SKILLS_DIR": "skills",
+    "SKILLS_DIR": ".gugugaga/skills",
     "TRANSCRIPT_DIR": ".transcripts",
     "TOOL_RESULTS_DIR": ".task_outputs/tool-results",
     "TASKS_DIR": ".tasks",
@@ -491,9 +491,7 @@ def test_cli_exit_during_provider_call_discards_late_tool_response(
             captured["app"].close()
 
 
-def test_missing_process_model_is_not_rehydrated_from_repository_dotenv(
-    tmp_path, monkeypatch
-):
+def test_missing_process_model_is_loaded_from_workspace_dotenv(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".env").write_text(
         "SILICONFLOW_API_KEY=dotenv-test-key\nSILICONFLOW_MODEL=dotenv-test-model\n",
@@ -502,5 +500,7 @@ def test_missing_process_model_is_not_rehydrated_from_repository_dotenv(
     monkeypatch.setenv("SILICONFLOW_API_KEY", "process-test-key")
     monkeypatch.delenv("SILICONFLOW_MODEL", raising=False)
 
-    with pytest.raises(ValueError, match="SILICONFLOW_MODEL"):
-        Settings.from_env(tmp_path)
+    settings = Settings.from_env(tmp_path)
+
+    assert settings.api_key == "process-test-key"
+    assert settings.model == "dotenv-test-model"

@@ -10,12 +10,16 @@ from typing import Any
 _ALLOWED_FIELDS = {
     "model",
     "consolidation_model",
+    "intent_gate_model",
+    "embedding_model",
     "siliconflow_api_key",
     "tavily_api_key",
 }
 _ENV_NAMES = {
     "model": "SILICONFLOW_MODEL",
     "consolidation_model": "GUGUGAGA_MEMORY_CONSOLIDATION_MODEL",
+    "intent_gate_model": "GUGUGAGA_MEMORY_INTENT_GATE_MODEL",
+    "embedding_model": "GUGUGAGA_MEMORY_EMBEDDING_MODEL",
     "siliconflow_api_key": "SILICONFLOW_API_KEY",
     "tavily_api_key": "TAVILY_API_KEY",
 }
@@ -84,6 +88,10 @@ class WebConfiguration:
                 or self._base_environment["model"],
                 "consolidation_model": stored.get("consolidation_model")
                 or self._base_environment["consolidation_model"],
+                "intent_gate_model": stored.get("intent_gate_model")
+                or self._base_environment["intent_gate_model"],
+                "embedding_model": stored.get("embedding_model")
+                or self._base_environment["embedding_model"],
                 "siliconflow_api_key": stored.get("siliconflow_api_key")
                 or self._base_environment["siliconflow_api_key"],
                 "tavily_api_key": stored.get("tavily_api_key")
@@ -95,6 +103,8 @@ class WebConfiguration:
         return {
             "model": value["model"],
             "consolidation_model": value["consolidation_model"],
+            "intent_gate_model": value["intent_gate_model"],
+            "embedding_model": value["embedding_model"],
             "siliconflow_api_key_configured": bool(value["siliconflow_api_key"]),
             "siliconflow_api_key_hint": _hint(value["siliconflow_api_key"]),
             "tavily_api_key_configured": bool(value["tavily_api_key"]),
@@ -119,6 +129,24 @@ class WebConfiguration:
                 stored["consolidation_model"] = consolidation_model
             else:
                 stored.pop("consolidation_model", None)
+            intent_gate_model = _clean(
+                payload.get("intent_gate_model"),
+                "intent_gate_model",
+                limit=300,
+            )
+            if intent_gate_model:
+                stored["intent_gate_model"] = intent_gate_model
+            else:
+                stored.pop("intent_gate_model", None)
+            embedding_model = _clean(
+                payload.get("embedding_model"),
+                "embedding_model",
+                limit=300,
+            )
+            if embedding_model:
+                stored["embedding_model"] = embedding_model
+            else:
+                stored.pop("embedding_model", None)
             for field in ("siliconflow_api_key", "tavily_api_key"):
                 secret = _clean(payload.get(field), field)
                 if secret:

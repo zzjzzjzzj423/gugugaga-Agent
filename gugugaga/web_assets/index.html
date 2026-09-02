@@ -38,29 +38,35 @@
       <section class="page is-active" id="page-overview" aria-labelledby="overview-title" aria-hidden="false">
         <header class="page-header">
           <div><p class="eyebrow">Live runtime</p><h1 id="overview-title">Agent Overview</h1><p>实时观察一次 Turn 的检索、上下文、推理、工具与记忆流动。</p></div>
-          <div class="live-state"><span class="status-dot"></span><span id="runtime-label">等待输入</span></div>
+          <div class="overview-status">
+            <div class="live-state"><span class="status-dot"></span><span id="runtime-label">等待输入</span></div>
+            <div class="background-states" aria-label="后台记忆状态">
+              <span><i class="status-dot"></i>Consolidation · <b id="consolidation-state">Idle</b></span>
+              <span><i class="status-dot"></i>Vector Index · <b id="vector-index-state">Disabled</b></span>
+            </div>
+          </div>
         </header>
 
         <div class="metric-grid">
           <article class="metric"><span>当前 Turn</span><strong id="metric-turn">#0</strong><small id="metric-turn-time">尚无记录</small></article>
           <article class="metric"><span>响应耗时</span><strong id="metric-latency">—</strong><small>最近一次完整回复</small></article>
-          <article class="metric"><span>记忆命中</span><strong id="metric-memory">0</strong><small id="metric-memory-total">0 条长期记忆</small></article>
+          <article class="metric"><span>记忆命中</span><strong id="metric-memory">0</strong><small id="metric-memory-total">Fact 0 · Episode 0 · Evidence Hot 0 / Cold 0</small></article>
           <article class="metric"><span>上下文占用</span><strong id="metric-context">—</strong><small id="metric-context-mode">CC mode</small></article>
         </div>
 
         <section class="runtime-panel">
           <div class="panel-heading">
             <div><h2>Agent Runtime Graph</h2><p>事件来自 gugugaga 进程内 Observer；当前动作会实时点亮。</p></div>
-            <span class="event-chip" id="event-chip">idle</span>
+            <div class="panel-chips"><span class="event-chip" id="retrieval-strategy">Retrieval · —</span><span class="event-chip" id="event-chip">idle</span></div>
           </div>
 
           <div class="runtime-graph" aria-live="polite">
             <div class="flow-row flow-main">
               <article class="runtime-node" data-stage="input"><span class="node-index">01</span><strong>输入入口</strong><small>接收用户提问</small></article>
               <span class="flow-arrow">→</span>
-              <article class="runtime-node" data-stage="retrieval_gate"><span class="node-index">02</span><strong>Retrieval Gate</strong><small>判断是否需要记忆</small></article>
+              <article class="runtime-node" data-stage="retrieval_gate"><span class="node-index">02</span><strong>记忆检索</strong><small>规则预检 · LLM Intent · Hybrid RRF</small></article>
               <span class="flow-arrow">→</span>
-              <article class="runtime-node" data-stage="memory_injection"><span class="node-index">03</span><strong>记忆注入</strong><small>装载命中的记忆</small></article>
+              <article class="runtime-node" data-stage="memory_injection"><span class="node-index">03</span><strong>选择与注入</strong><small>重排去重 · Post-Gate · 最多 5 个单元</small></article>
               <span class="flow-arrow">→</span>
               <article class="runtime-node" data-stage="working_context"><span class="node-index">04</span><strong>Working Context</strong><small>组装当前上下文</small></article>
             </div>
@@ -75,12 +81,12 @@
               <span class="flow-arrow">→</span>
               <article class="runtime-node" data-stage="reply"><span class="node-index">09</span><strong>回复用户</strong><small>完成本次 Turn</small></article>
             </div>
-            <div class="memory-bridge"><span>可检索</span><span class="bridge-line"></span><span>每 6 个 Exchange 自动沉淀</span></div>
+            <div class="memory-bridge"><span>可用记忆与证据</span><span class="bridge-line"></span><span>Conversation Evidence · 每 6 个完整 Exchange → Consolidation → Semantic / Episodic</span></div>
             <div class="memory-pillars">
               <article data-memory-stage="procedural"><span class="pillar-icon purple">P</span><div><strong>Procedural Memory</strong><small>Skills · 行为规则</small></div></article>
               <article data-memory-stage="semantic"><span class="pillar-icon teal">S</span><div><strong>Semantic Memory</strong><small>Facts · 用户事实与偏好</small></div></article>
               <article data-memory-stage="episodic"><span class="pillar-icon amber">E</span><div><strong>Episodic Memory</strong><small>历史事件摘要</small></div></article>
-              <article data-stage="consolidation"><span class="pillar-icon blue">C</span><div><strong>Consolidation</strong><small>提炼事实与事件</small></div></article>
+              <article data-memory-stage="evidence"><span class="pillar-icon blue">C</span><div><strong>Conversation Evidence</strong><small>chat_log · 完整 Exchange</small></div></article>
             </div>
           </div>
         </section>
@@ -113,10 +119,19 @@
 
         <section class="team-panel">
           <div class="panel-heading">
-            <div><h2>Team Agents</h2><p>仅在线且空闲的 Agent 可以接收人工指派；每个 Agent 同时最多一个任务。</p></div>
-            <span class="event-chip" id="team-agent-count">0 online</span>
+            <div><h2>Team Agent Graph</h2><p>节点表示协作成员；通信时，邮件图标会按发送方向沿连线传递。</p></div>
+            <div class="team-graph-legend"><span><i class="is-online"></i>在线</span><span aria-hidden="true">✉</span><span class="event-chip" id="team-agent-count">0 online</span></div>
           </div>
-          <div class="team-agent-list" id="team-agent-list"></div>
+          <div class="team-agent-graph" id="team-agent-graph">
+            <svg class="team-graph-edges" id="team-graph-edges" aria-hidden="true"></svg>
+            <div class="team-mail-layer" id="team-mail-layer" aria-live="polite"></div>
+            <div class="team-lead-node team-agent-node is-online" data-agent-name="lead">
+              <span class="team-node-avatar">L</span>
+              <div><strong>Lead Agent</strong><small>协调与汇总中心</small></div>
+              <span class="team-node-status">online</span>
+            </div>
+            <div class="team-agent-list" id="team-agent-list"></div>
+          </div>
         </section>
 
         <section class="subagent-panel">
@@ -241,6 +256,19 @@
           <p id="team-detail-disclosure">展示可审计的工作摘要，不展示模型隐藏思维链。</p>
         </section>
         <section class="team-detail-section"><h3>工作思路摘要</h3><div id="team-detail-activity" class="team-detail-activity"></div></section>
+        <section class="team-detail-section team-config-section">
+          <div class="team-config-heading"><div><h3>Agent 配置</h3><p>角色、自定义 Prompt 与可用工具仅对当前 Team Agent 生效。</p></div><span id="team-config-state">加载中</span></div>
+          <form id="team-config-form" class="team-config-form">
+            <label for="team-config-role"><span>角色</span><small>例如：前端开发、代码审查、研究员</small></label>
+            <input id="team-config-role" type="text" maxlength="200" required placeholder="输入当前 Team Agent 的角色…">
+            <label for="team-config-prompt"><span>自定义 Prompt</span><small>系统安全规则和任务权限不会被覆盖</small></label>
+            <textarea id="team-config-prompt" rows="6" maxlength="20000" required placeholder="输入当前 Team Agent 的角色与工作要求…"></textarea>
+            <div class="team-config-tools-heading"><strong>可用工具</strong><small>核心工具始终启用</small></div>
+            <div id="team-config-tools" class="team-config-tools"></div>
+            <p id="team-config-result" aria-live="polite"></p>
+            <footer><button id="team-config-reset" type="button">恢复初始配置</button><button class="primary" id="team-config-save" type="submit">保存配置</button></footer>
+          </form>
+        </section>
         <section class="team-detail-section"><h3>排队任务</h3><div id="team-detail-queue" class="team-detail-list"></div></section>
         <section class="team-detail-section"><h3>活动时间线</h3><div id="team-detail-timeline" class="team-detail-timeline"></div></section>
         <section class="team-detail-section"><h3>用户干预</h3><div id="team-detail-interactions" class="team-detail-list"></div></section>
@@ -275,6 +303,8 @@
       <form id="settings-form" class="settings-form">
         <label><span>主模型</span><small>用于聊天、推理和工具调用</small><input id="settings-model" name="model" type="text" required maxlength="300" placeholder="Qwen/Qwen3-Coder-30B-A3B-Instruct" autocomplete="off"></label>
         <label><span>记忆整理小模型</span><small>用于后台 Memory Consolidation；留空则使用主模型</small><input id="settings-small-model" name="consolidation_model" type="text" maxlength="300" placeholder="Qwen/Qwen3-8B" autocomplete="off"></label>
+        <label><span>记忆意图门控模型</span><small>用于 LLM Intent Gate；留空则依次使用记忆整理模型和主模型</small><input id="settings-intent-model" name="intent_gate_model" type="text" maxlength="300" placeholder="Qwen/Qwen3-8B" autocomplete="off"></label>
+        <label><span>Embedding Model</span><small>用于 Memory 向量索引和语义召回；保存并重载后会自动处理待索引任务</small><input id="settings-embedding-model" name="embedding_model" type="text" maxlength="300" placeholder="BAAI/bge-m3" autocomplete="off"></label>
         <label><span>SiliconFlow API Key</span><small id="siliconflow-key-state">尚未配置</small><input id="settings-siliconflow-key" name="siliconflow_api_key" type="password" maxlength="1000" placeholder="输入 Key" autocomplete="new-password"></label>
         <label><span>Tavily API Key</span><small id="tavily-key-state">尚未配置 · web_search 不可用</small><input id="settings-tavily-key" name="tavily_api_key" type="password" maxlength="1000" placeholder="tvly-…" autocomplete="new-password"></label>
         <div class="settings-note"><span>⌁</span><p>Tavily 搜索默认使用 Basic 深度。Key 以本地配置文件保存，请不要把工作区配置文件分享给他人。</p></div>

@@ -232,6 +232,7 @@ class ChatLog:
                     "last_error_code TEXT NULL",
                     "completed_at TEXT NULL",
                     "consolidated_at TEXT NULL",
+                    "retrieval_state TEXT NOT NULL DEFAULT 'hot'",
                 )
                 for definition in additions:
                     name = definition.split()[0]

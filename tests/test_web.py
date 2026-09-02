@@ -11,6 +11,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from gugugaga import tasks, teams
+from gugugaga.memory import RecallItem, RecallResult
 from gugugaga.models import ToolCall
 from gugugaga.observability import Observer
 from gugugaga.web import (
@@ -101,6 +102,21 @@ def test_chat_markdown_renderer_uses_safe_dom_nodes():
     assert ".markdown-table-wrap" in styles
 
 
+def test_agent_overview_uses_intent_gate_and_conversation_evidence_labels():
+    html = (WEB_ASSETS / "index.html").read_text(encoding="utf-8")
+    script = (WEB_ASSETS / "app.js").read_text(encoding="utf-8")
+
+    assert "规则预检 · LLM Intent · Hybrid RRF" in html
+    assert "重排去重 · Post-Gate · 最多 5 个单元" in html
+    assert 'data-memory-stage="evidence"' in html
+    assert "Conversation Evidence" in html
+    assert 'data-stage="consolidation"' not in html
+    assert "Fact ${Number(data.memory?.facts || 0)}" in script
+    assert "Retry pending" in script
+    assert "consolidationFailure.error_code" in script
+    assert "String(event.call_type || '').startsWith('memory_')" in script
+
+
 class FakeRuntime:
     def __init__(self):
         self.recording = SimpleNamespace(observer=Observer())
@@ -108,6 +124,10 @@ class FakeRuntime:
         self.context_coordinator = FakeCoordinator()
         self.resumed_messages = []
         self.messages = []
+        self.last_memory_recall = RecallResult()
+        self.last_turn_id = None
+        self.turn_count = 0
+        self.feedback_memory_key = "fact:fact_1"
 
     def start_new_session(self, context_mode=None):
         self.context_coordinator = FakeCoordinator(
@@ -134,6 +154,49 @@ class FakeRuntime:
 
     def run_turn(self, query: str, *, source: str = "web") -> str:
         self.context_coordinator.locked = True
+        self.turn_count += 1
+        self.last_turn_id = f"turn_fake_{self.turn_count}"
+        self.last_memory_recall = RecallResult(
+            content=self.memory_service.recall(query),
+            decision="retrieve",
+            reason="lexical_match",
+            hit_count=2,
+            kinds=("semantic", "episodic"),
+            memory_keys=(self.feedback_memory_key, "episode:episode_1"),
+            items=(
+                RecallItem(
+                    memory_key=self.feedback_memory_key,
+                    kind="fact",
+                    subject="response_preference",
+                    text="concise answers",
+                    retrieval_sources=("bm25", "vector"),
+                    source_ranks={"bm25": 1, "vector": 2},
+                    relevance_score=0.98,
+                    final_score=0.91,
+                ),
+                RecallItem(
+                    memory_key="episode:episode_1",
+                    kind="episode",
+                    subject="",
+                    text="designed the dashboard",
+                    retrieval_sources=("bm25",),
+                    source_ranks={"bm25": 2},
+                    relevance_score=0.49,
+                    final_score=0.52,
+                ),
+            ),
+        )
+        self.recording.observer.notify(
+            "memory",
+            {
+                "action": "retrieval_gate",
+                "status": "open",
+                "decision": "retrieve",
+                "reason": "lexical_match",
+                "hit_count": 2,
+                "kinds": ["semantic", "episodic"],
+            },
+        )
         self.recording.observer.notify(
             "context", {"status": "skipped", "result_code": "NO_COMPRESSIBLE_CONTENT"}
         )
@@ -155,6 +218,12 @@ class FakeApp:
 def test_store_exposes_real_memory_and_sqlite_views():
     with TemporaryDirectory(prefix=".web-test-", dir=Path.cwd()) as directory:
         store = DashboardStore(directory)
+        manifest = Path(directory) / ".gugugaga" / "skills" / "review" / "SKILL.md"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text(
+            "---\nname: review\ndescription: Review changes\n---\nInstructions",
+            encoding="utf-8",
+        )
         saved = store.repository.save_fact(
             subject="preference",
             content="Prefer concise answers",
@@ -172,6 +241,23 @@ def test_store_exposes_real_memory_and_sqlite_views():
             turn_id="turn_recent",
             user_content="Review my weekly goals",
             assistant_content="Your goals look achievable",
+        )
+        store.repository.record_recall_impressions(
+            session_id="session_recent",
+            turn_id="turn_recent",
+            query="Review my weekly goals",
+            items=[
+                RecallItem(
+                    memory_key=f"fact:{saved.fact_id}",
+                    kind="fact",
+                    subject="preference",
+                    text="Prefer concise answers",
+                    retrieval_sources=("bm25",),
+                    source_ranks={"bm25": 1},
+                    relevance_score=1.0,
+                    final_score=0.9,
+                )
+            ],
         )
         (Path(directory) / ".gugugaga" / "usage.jsonl").write_text(
             "\n".join(
@@ -212,11 +298,16 @@ def test_store_exposes_real_memory_and_sqlite_views():
         assert saved.status == "added"
         assert semantic["items"][0]["text"] == "Prefer concise answers"
         assert len(procedural["items"]) >= 3
+        assert any(item["subject"] == "review" for item in procedural["items"])
         assert [item["session_id"] for item in sessions[:2]] == ["session_recent", "session_old"]
         assert sessions[0]["title"] == "Review my weekly goals"
         assert sessions[0]["context_mode"] == "cc"
         assert store.session_context_mode("session_recent") == "cc"
         assert [item["role"] for item in recent_history] == ["user", "assistant"]
+        assert recent_history[1]["recalled_memories"][0]["memory_key"] == (
+            f"fact:{saved.fact_id}"
+        )
+        assert recent_history[1]["recalled_memories"][0]["feedback_enabled"] is True
         assert runtime_history == [
             {"role": "user", "content": "Review my weekly goals"},
             {
@@ -227,6 +318,10 @@ def test_store_exposes_real_memory_and_sqlite_views():
         assert recent_overview["session_id"] == "session_recent"
         assert recent_overview["context_ratio"] == 25.0
         assert recent_overview["context_tokens"] == 32_768
+        assert recent_overview["memory"]["evidence"] == 2
+        assert recent_overview["memory"]["evidence_hot"] == 2
+        assert recent_overview["memory"]["evidence_cold"] == 0
+        assert recent_overview["memory"]["indexed"] == 0
         assert old_overview["session_id"] == "session_old"
         assert old_overview["context_ratio"] == 50.0
         assert {item["name"] for item in tables} >= {"chat_log", "facts", "episodes"}
@@ -283,7 +378,18 @@ def test_chat_publishes_runtime_and_observer_events():
         assert result.reply == "reply: hello"
         assert result.memory_hits == 2
         assert result.session_id == "session_current"
+        assert result.turn_id == "turn_fake_1"
+        assert [item["kind"] for item in result.recalled_memories] == [
+            "fact",
+            "episode",
+        ]
         assert any(event.get("stage") == "retrieval_gate" for event in events)
+        assert any(
+            event.get("stage") == "retrieval_gate"
+            and event.get("decision") == "retrieve"
+            and event.get("reason") == "lexical_match"
+            for event in events
+        )
         assert any(event.get("type") == "llm" for event in events)
         assert any(event.get("type") == "tool" for event in events)
         assert any(
@@ -303,6 +409,131 @@ def test_chat_publishes_runtime_and_observer_events():
         assert fake_app.closed
         del application
         gc.collect()
+
+
+def test_chat_ui_renders_recall_cards_and_switchable_feedback_controls():
+    script = (WEB_ASSETS / "app.js").read_text(encoding="utf-8")
+    styles = (WEB_ASSETS / "styles.css").read_text(encoding="utf-8")
+
+    assert "function renderRecallPanel(memories, open = false)" in script
+    assert "本轮召回 ${memories.length} 条记忆" in script
+    assert "/api/memories/feedback" in script
+    assert "item.feedback === feedback" in script
+    assert "item.recalled_memories || []" in script
+    assert ".recall-panel" in styles
+    assert ".recall-feedback-controls" in styles
+
+
+def test_web_feedback_requires_a_recalled_memory_and_updates_history():
+    with TemporaryDirectory(prefix=".web-memory-feedback-", dir=Path.cwd()) as directory:
+        fake_app = FakeApp()
+        application = DashboardApplication(directory, runtime_factory=lambda: fake_app)
+        saved = application.store.repository.save_fact(
+            subject="response_preference",
+            content="Prefer concise answers",
+            source="explicit",
+            turn_id="turn-source",
+        )
+        fake_app.runtime.feedback_memory_key = f"fact:{saved.fact_id}"
+
+        result = application.chat("How should you answer?")
+        updated = application.record_memory_feedback(
+            {
+                "session_id": result.session_id,
+                "turn_id": result.turn_id,
+                "memory_key": result.recalled_memories[0]["memory_key"],
+                "feedback": "helpful",
+            }
+        )
+
+        assert updated["feedback"] == "helpful"
+        assert updated["helpful_count"] == 1
+        history = application.store.chat_history(result.session_id)
+        # FakeRuntime does not write chat rows, but the recall snapshot remains
+        # independently queryable for a real recorded assistant Turn.
+        assert history == []
+        recalled = application.store.repository.recall_impressions(
+            session_id=result.session_id, turn_id=result.turn_id
+        )
+        assert recalled[0]["feedback"] == "helpful"
+        try:
+            application.record_memory_feedback(
+                {
+                    "session_id": result.session_id,
+                    "turn_id": "turn-forged",
+                    "memory_key": result.recalled_memories[0]["memory_key"],
+                    "feedback": "irrelevant",
+                }
+            )
+            raise AssertionError("forged recall feedback must be rejected")
+        except KeyError:
+            pass
+        application.close()
+        del application
+        gc.collect()
+
+
+def test_http_memory_feedback_endpoint_is_idempotent_and_switchable():
+    with TemporaryDirectory(prefix=".web-memory-feedback-api-", dir=Path.cwd()) as directory:
+        fake_app = FakeApp()
+        application = DashboardApplication(directory, runtime_factory=lambda: fake_app)
+        saved = application.store.repository.save_fact(
+            subject="response_preference",
+            content="Prefer concise answers",
+            source="explicit",
+            turn_id="turn-source",
+        )
+        fake_app.runtime.feedback_memory_key = f"fact:{saved.fact_id}"
+        server = create_server(application, "127.0.0.1", 0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        try:
+            request = Request(
+                f"{base}/api/chat",
+                data=json.dumps({"message": "How should you answer?"}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(request, timeout=3) as response:
+                chat = json.loads(response.read())
+            assert chat["turn_id"] == "turn_fake_1"
+            assert chat["recalled_memories"][0]["feedback_enabled"] is True
+            payload = {
+                "session_id": chat["session_id"],
+                "turn_id": chat["turn_id"],
+                "memory_key": chat["recalled_memories"][0]["memory_key"],
+                "feedback": "helpful",
+            }
+            for _ in range(2):
+                request = Request(
+                    f"{base}/api/memories/feedback",
+                    data=json.dumps(payload).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urlopen(request, timeout=3) as response:
+                    updated = json.loads(response.read())
+                assert updated["helpful_count"] == 1
+                assert updated["irrelevant_count"] == 0
+            payload["feedback"] = "irrelevant"
+            request = Request(
+                f"{base}/api/memories/feedback",
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(request, timeout=3) as response:
+                switched = json.loads(response.read())
+            assert switched["helpful_count"] == 0
+            assert switched["irrelevant_count"] == 1
+        finally:
+            server.shutdown()
+            server.server_close()
+            application.close()
+            thread.join(timeout=3)
+            del application
+            gc.collect()
 
 
 def test_web_runtime_starts_shared_lead_inbox_loop_and_forwards_reply():
@@ -559,10 +790,19 @@ def test_task_page_contains_team_and_subagent_controls():
 
     assert 'id="team-auto-claim"' in html
     assert 'id="team-agent-list"' in html
+    assert 'id="team-agent-graph"' in html
+    assert 'id="team-mail-layer"' in html
     assert 'id="subagent-current"' in html
     assert 'id="team-detail-delete"' in html
+    assert 'id="team-config-form"' in html
+    assert 'id="team-config-role"' in html
+    assert 'id="team-config-prompt"' in html
+    assert 'id="team-config-tools"' in html
     assert "/api/team/settings" in script
     assert "/api/team/agents" in script
+    assert "/api/team/communications" in script
+    assert "/profile" in script
+    assert "animateTeamMessage" in script
     assert "method: 'DELETE'" in script
     assert "运行中不可删除" in script
     assert "loadTeamAgents" not in script
@@ -621,6 +861,8 @@ def test_http_server_serves_console_and_api():
                 html = response.read().decode("utf-8")
                 assert response.status == 200
                 assert "Agent Runtime Graph" in html
+                assert "规则预检 · LLM Intent · Hybrid RRF" in html
+                assert "Conversation Evidence" in html
                 assert "Compression Gate" in html
                 assert "Context Compression" in html
                 assert "历史对话" in html
@@ -658,6 +900,40 @@ def test_http_server_serves_console_and_api():
             with urlopen(request, timeout=3) as response:
                 assert json.loads(response.read())["auto_claim_enabled"] is True
             with urlopen(f"{base}/api/team/agents", timeout=3) as response:
+                assert json.loads(response.read())["items"] == []
+            teams._persist_teammate_profile(
+                "configured-alice", "developer", "Initial prompt"
+            )
+            request = Request(
+                f"{base}/api/team/agents/configured-alice/profile",
+                data=json.dumps(
+                    {
+                        "role": "reviewer",
+                        "prompt": "Review only",
+                        "allowed_tools": ["glob"],
+                    }
+                ).encode(),
+                headers={"Content-Type": "application/json"},
+                method="PUT",
+            )
+            with urlopen(request, timeout=3) as response:
+                profile = json.loads(response.read())
+                assert profile["role"] == "reviewer"
+                assert profile["prompt"] == "Review only"
+                assert profile["allowed_tools"] == [
+                    *teams.TEAM_CORE_TOOLS,
+                    "glob",
+                ]
+                assert profile["apply_state"] == "next_start"
+            with urlopen(
+                f"{base}/api/team/agents/configured-alice", timeout=3
+            ) as response:
+                detail = json.loads(response.read())
+                assert detail["configuration"]["role"] == "reviewer"
+                assert detail["configuration"]["prompt"] == "Review only"
+                assert detail["configuration"]["restart_required"] is False
+                assert len(detail["configuration"]["tool_catalog"]) == 14
+            with urlopen(f"{base}/api/team/communications", timeout=3) as response:
                 assert json.loads(response.read())["items"] == []
             with urlopen(f"{base}/api/subagents", timeout=3) as response:
                 assert json.loads(response.read())["events"] == []
@@ -804,6 +1080,8 @@ def test_configuration_api_masks_secrets_and_persists_workspace_settings(monkeyp
         "SILICONFLOW_API_KEY",
         "SILICONFLOW_MODEL",
         "GUGUGAGA_MEMORY_CONSOLIDATION_MODEL",
+        "GUGUGAGA_MEMORY_INTENT_GATE_MODEL",
+        "GUGUGAGA_MEMORY_EMBEDDING_MODEL",
         "TAVILY_API_KEY",
     ):
         monkeypatch.delenv(name, raising=False)
@@ -820,6 +1098,8 @@ def test_configuration_api_masks_secrets_and_persists_workspace_settings(monkeyp
                     {
                         "model": "Qwen/main",
                         "consolidation_model": "Qwen/small",
+                        "intent_gate_model": "Qwen/gate",
+                        "embedding_model": "BAAI/bge-m3",
                         "siliconflow_api_key": "sf-secret-1234",
                         "tavily_api_key": "tvly-secret-5678",
                     }
@@ -832,6 +1112,8 @@ def test_configuration_api_masks_secrets_and_persists_workspace_settings(monkeyp
             encoded = json.dumps(payload)
             assert payload["model"] == "Qwen/main"
             assert payload["consolidation_model"] == "Qwen/small"
+            assert payload["intent_gate_model"] == "Qwen/gate"
+            assert payload["embedding_model"] == "BAAI/bge-m3"
             assert payload["siliconflow_api_key_configured"] is True
             assert payload["siliconflow_api_key_hint"] == "••••1234"
             assert payload["tavily_api_key_configured"] is True
@@ -849,6 +1131,8 @@ def test_configuration_api_masks_secrets_and_persists_workspace_settings(monkeyp
                     {
                         "model": "Qwen/main-v2",
                         "consolidation_model": "",
+                        "intent_gate_model": "",
+                        "embedding_model": "",
                         "siliconflow_api_key": "",
                         "tavily_api_key": "",
                     }
@@ -860,6 +1144,8 @@ def test_configuration_api_masks_secrets_and_persists_workspace_settings(monkeyp
                 cleared = json.loads(response.read())
             assert cleared["model"] == "Qwen/main-v2"
             assert cleared["consolidation_model"] == ""
+            assert cleared["intent_gate_model"] == ""
+            assert cleared["embedding_model"] == ""
             assert cleared["siliconflow_api_key_hint"] == "••••1234"
             assert cleared["tavily_api_key_hint"] == "••••5678"
             stored = json.loads(
@@ -869,6 +1155,8 @@ def test_configuration_api_masks_secrets_and_persists_workspace_settings(monkeyp
             )
             assert stored["model"] == "Qwen/main-v2"
             assert "consolidation_model" not in stored
+            assert "intent_gate_model" not in stored
+            assert "embedding_model" not in stored
             with urlopen(f"{base}/api/status", timeout=3) as response:
                 status = json.loads(response.read())
             assert status["chat_configured"] is True
@@ -880,6 +1168,32 @@ def test_configuration_api_masks_secrets_and_persists_workspace_settings(monkeyp
             thread.join(timeout=3)
             del application
             gc.collect()
+
+
+def test_web_configuration_loads_embedding_model_from_workspace_dotenv(
+    tmp_path, monkeypatch
+):
+    for name in (
+        "SILICONFLOW_API_KEY",
+        "SILICONFLOW_MODEL",
+        "GUGUGAGA_MEMORY_EMBEDDING_MODEL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    (tmp_path / ".env").write_text(
+        "SILICONFLOW_API_KEY=dotenv-key\n"
+        "SILICONFLOW_MODEL=dotenv-model\n"
+        "GUGUGAGA_MEMORY_EMBEDDING_MODEL=BAAI/bge-m3\n",
+        encoding="utf-8",
+    )
+
+    application = DashboardApplication(tmp_path, runtime_factory=FakeApp)
+    try:
+        configuration = application.configuration_status()
+        assert configuration["model"] == "dotenv-model"
+        assert configuration["embedding_model"] == "BAAI/bge-m3"
+        assert configuration["siliconflow_api_key_configured"] is True
+    finally:
+        application.close()
 
 
 def test_configuration_reload_preserves_active_session(monkeypatch):
@@ -902,6 +1216,8 @@ def test_configuration_reload_preserves_active_session(monkeypatch):
             {
                 "model": "new-model",
                 "consolidation_model": "small-model",
+                "intent_gate_model": "gate-model",
+                "embedding_model": "embedding-model",
                 "siliconflow_api_key": "new-key",
                 "tavily_api_key": "tvly-key",
             }
@@ -916,5 +1232,33 @@ def test_configuration_reload_preserves_active_session(monkeypatch):
         ]
         application.close()
         del runtime
+        del application
+        gc.collect()
+
+
+def test_http_server_rejects_a_second_process_on_the_same_port():
+    with TemporaryDirectory(prefix=".web-exclusive-test-", dir=Path.cwd()) as directory:
+        application = DashboardApplication(directory, runtime_factory=FakeApp)
+        server = create_server(application, "127.0.0.1", 0)
+        duplicate = None
+        try:
+            assert server.allow_reuse_address is False
+            try:
+                duplicate = create_server(
+                    application,
+                    "127.0.0.1",
+                    server.server_address[1],
+                )
+            except OSError:
+                pass
+            else:
+                raise AssertionError("a second server bound the dashboard port")
+        finally:
+            if duplicate is not None:
+                duplicate.server_close()
+            server.server_close()
+            application.close()
+        del duplicate
+        del server
         del application
         gc.collect()

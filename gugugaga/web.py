@@ -6,6 +6,7 @@ import json
 import mimetypes
 import os
 import re
+import socket
 import sqlite3
 import threading
 import time
@@ -23,20 +24,24 @@ from .__main__ import GugugagaApp, build_runtime
 from .config import Settings
 from .context_modes import ContextModeError
 from .interactions import interaction_broker
-from .memory import memory_hit_kinds
 from .memory.repository import MemoryRepository
 from .observability import sanitize
 from .permissions import PermissionBroker
 from .subagents import snapshot_subagents
 from .tasks import delete_task, load_task, release_task, unassign_task
 from .teams import (
+    TEAM_DEFAULT_ALLOWED_TOOLS,
     assign_task_to_teammate,
     delete_teammate,
     get_team_settings,
+    list_team_communications,
     list_teammate_states,
     restart_teammate,
     stop_teammate,
     submit_team_interaction,
+    teammate_profile,
+    teammate_tool_catalog,
+    update_teammate_profile,
     update_team_settings,
 )
 from .web_config import WebConfiguration
@@ -98,11 +103,20 @@ class EventHub:
 class DashboardStore:
     """Read-only dashboard queries over gugugaga's real local state."""
 
-    def __init__(self, workspace: Path | str):
+    def __init__(
+        self,
+        workspace: Path | str,
+        *,
+        evidence_hot_exchanges: int | None = None,
+    ):
         self.workspace = Path(workspace).expanduser().resolve()
         self.state_dir = self.workspace / ".gugugaga"
         self.database = self.state_dir / "state.db"
         self.repository = MemoryRepository(self.database)
+        if evidence_hot_exchanges is not None:
+            self.repository.reconcile_evidence_lifecycle(
+                hot_exchanges=evidence_hot_exchanges
+            )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database, timeout=5)
@@ -161,6 +175,31 @@ class DashboardStore:
             except (TypeError, ValueError):
                 meta = {}
         memory = self.repository.status()
+        runtime_memory = getattr(runtime, "memory_service", None)
+        runtime_memory_status = getattr(runtime_memory, "status", None)
+        if callable(runtime_memory_status):
+            try:
+                memory = runtime_memory_status()
+            except Exception:
+                pass
+        if "vector_state" not in memory:
+            memory["vector_enabled"] = bool(
+                os.getenv("GUGUGAGA_MEMORY_EMBEDDING_MODEL", "").strip()
+            )
+            memory["vector_state"] = (
+                "failed"
+                if memory["vector_enabled"]
+                and int((memory.get("index_jobs") or {}).get("failed", 0)) > 0
+                else "indexing"
+                if memory["vector_enabled"]
+                and (
+                    int((memory.get("index_jobs") or {}).get("pending", 0)) > 0
+                    or int((memory.get("index_jobs") or {}).get("processing", 0)) > 0
+                )
+                else "synced"
+                if memory["vector_enabled"]
+                else "disabled"
+            )
         stored_context = meta.get("context")
         if runtime is not None and selected_session_id == current_session_id:
             context = runtime.context_status()
@@ -185,6 +224,15 @@ class DashboardStore:
             ratio = round((int(input_tokens) / window) * 100, 1)
         else:
             ratio = 0.0 if turn_count == 0 else None
+        recall = getattr(runtime, "last_memory_recall", None)
+        retrieval = None
+        if selected_session_id == current_session_id and recall is not None:
+            retrieval = {
+                "decision": str(getattr(recall, "decision", "skip")),
+                "reason": str(getattr(recall, "reason", "unknown")),
+                "strategy": str(getattr(recall, "strategy", "none")),
+                "hit_count": int(getattr(recall, "hit_count", 0) or 0),
+            }
         return {
             "session_id": selected_session_id,
             "turn_count": turn_count,
@@ -196,6 +244,7 @@ class DashboardStore:
             "model": meta.get("model") or os.getenv("SILICONFLOW_MODEL") or "not configured",
             "provider": meta.get("provider") or "siliconflow",
             "memory": memory,
+            "retrieval": retrieval,
             "context": context,
             "last_turn_at": last_assistant["created_at"] if last_assistant else None,
         }
@@ -283,6 +332,9 @@ class DashboardStore:
                 "WHERE session_id=? ORDER BY id DESC LIMIT ?",
                 (session_id, limit),
             ).fetchall()
+        recalls_by_turn: dict[str, list[dict[str, Any]]] = {}
+        for recall in self.repository.recall_impressions(session_id=session_id):
+            recalls_by_turn.setdefault(str(recall["turn_id"]), []).append(recall)
         items: list[dict[str, Any]] = []
         for row in reversed(rows):
             item = dict(row)
@@ -290,6 +342,10 @@ class DashboardStore:
                 item["content"] = self._strip_team_inbox(item["content"])
                 if not item["content"]:
                     continue
+            elif item["role"] == "assistant":
+                item["recalled_memories"] = recalls_by_turn.get(
+                    str(item["turn_id"]), []
+                )
             items.append(item)
         return items
 
@@ -832,8 +888,50 @@ class DashboardStore:
         )
         broker = interaction_broker(self.workspace)
         phase = broker.phase(f"team:{name}")
+        try:
+            profile = teammate_profile(name)
+            configuration_available = True
+        except KeyError:
+            # Preserve inspection for legacy or test-created runtime states that
+            # predate persisted Team Agent profiles.
+            profile = {
+                "role": state.get("role") or "teammate",
+                "initial_role": state.get("role") or "teammate",
+                "prompt": "",
+                "initial_prompt": "",
+                "allowed_tools": list(TEAM_DEFAULT_ALLOWED_TOOLS),
+                "updated_at": None,
+            }
+            configuration_available = False
+        active_configuration_updated_at = state.get("configuration_updated_at")
+        restart_required = bool(
+            state.get("online")
+            and active_configuration_updated_at != profile.get("updated_at")
+        )
         return {
             "agent": {**state, "interaction_phase": phase},
+            "configuration": {
+                "role": profile["role"],
+                "initial_role": profile["initial_role"],
+                "prompt": profile["prompt"],
+                "initial_prompt": profile["initial_prompt"],
+                "allowed_tools": profile["allowed_tools"],
+                "default_allowed_tools": list(TEAM_DEFAULT_ALLOWED_TOOLS),
+                "active_allowed_tools": state.get("active_allowed_tools"),
+                "tool_catalog": teammate_tool_catalog(),
+                "updated_at": profile.get("updated_at"),
+                "restart_required": restart_required,
+                "apply_state": (
+                    "pending"
+                    if restart_required and state.get("status") != "restarting"
+                    else "restarting"
+                    if restart_required
+                    else "active"
+                    if state.get("online")
+                    else "next_start"
+                ),
+                "editable": configuration_available,
+            },
             "current_task": current_task,
             "queued_tasks": queued_tasks,
             "interactions": broker.list(f"team:{name}", limit=200),
@@ -849,6 +947,8 @@ class ChatResult:
     reply: str
     memory_hits: int
     session_id: str
+    turn_id: str | None
+    recalled_memories: list[dict[str, Any]]
 
 
 class DashboardApplication:
@@ -861,10 +961,21 @@ class DashboardApplication:
     ):
         self.workspace = Path(workspace).expanduser().resolve()
         config.configure_workspace(self.workspace)
+        config.load_workspace_environment(self.workspace)
         self.model = model
         self.configuration = WebConfiguration(self.workspace)
         self.configuration.apply_environment()
-        self.store = DashboardStore(self.workspace)
+        evidence_hot_exchanges = int(
+            os.getenv("GUGUGAGA_MEMORY_EVIDENCE_HOT_EXCHANGES", "30")
+        )
+        if not 0 <= evidence_hot_exchanges <= 10_000:
+            raise ValueError(
+                "GUGUGAGA_MEMORY_EVIDENCE_HOT_EXCHANGES must be 0-10000"
+            )
+        self.store = DashboardStore(
+            self.workspace,
+            evidence_hot_exchanges=evidence_hot_exchanges,
+        )
         self.events = EventHub()
         self.permissions = PermissionBroker(timeout_seconds=120)
         self._runtime_factory = runtime_factory
@@ -928,6 +1039,43 @@ class DashboardApplication:
                     "status": "hit",
                     "kinds": ["procedural"],
                 }
+            )
+        if (
+            is_main_event
+            and event.get("type") == "memory"
+            and event.get("action") == "retrieval_gate"
+        ):
+            hit_count = int(event.get("hit_count") or 0)
+            kinds = list(event.get("kinds") or [])
+            self.last_memory_hits = hit_count
+            self.events.publish(
+                {
+                    "type": "runtime",
+                    "stage": "retrieval_gate",
+                    "status": (
+                        "complete"
+                        if event.get("decision") == "retrieve"
+                        else "skipped"
+                    ),
+                    "decision": event.get("decision", "skip"),
+                    "reason": event.get("reason", "unknown"),
+                    "strategy": event.get("strategy", "none"),
+                    "memory_hits": hit_count,
+                    "memory_kinds": kinds,
+                }
+            )
+            if hit_count:
+                self.events.publish(
+                    {
+                        "type": "runtime",
+                        "stage": "memory_injection",
+                        "status": "active",
+                        "memory_hits": hit_count,
+                        "memory_kinds": kinds,
+                    }
+                )
+            self.events.publish(
+                {"type": "runtime", "stage": "working_context", "status": "active"}
             )
         if is_main_event and event.get("type") == "context":
             self.events.publish(
@@ -1128,28 +1276,34 @@ class DashboardApplication:
         try:
             runtime = self.runtime()
             self.events.publish({"type": "runtime", "stage": "input", "status": "active"})
-            self.events.publish({"type": "runtime", "stage": "retrieval_gate", "status": "active"})
-            recalled = runtime.memory_service.recall(value)
-            hits = len(re.findall(r"(?m)^- \[", recalled))
-            kinds = list(memory_hit_kinds(recalled))
-            self.last_memory_hits = hits
-            self.events.publish(
-                {
-                    "type": "runtime",
-                    "stage": "memory_injection" if hits else "working_context",
-                    "status": "active",
-                    "memory_hits": hits,
-                    "memory_kinds": kinds,
-                }
-            )
-            self.events.publish({"type": "runtime", "stage": "working_context", "status": "active"})
-            self.events.publish({"type": "runtime", "stage": "compression_gate", "status": "active"})
             reply = runtime.run_turn(value, source="web")
+            recalled = getattr(runtime, "last_memory_recall", None)
+            hits = int(getattr(recalled, "hit_count", 0) or 0)
+            session_id = str(runtime.context_coordinator.session_id)
+            turn_id = str(getattr(runtime, "last_turn_id", "") or "") or None
+            recall_items = list(getattr(recalled, "items", ()) or ())
+            if turn_id and recall_items:
+                self.store.repository.record_recall_impressions(
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    query=value,
+                    items=recall_items,
+                )
+            recalled_memories = (
+                self.store.repository.recall_impressions(
+                    session_id=session_id, turn_id=turn_id
+                )
+                if turn_id
+                else []
+            )
+            self.last_memory_hits = hits
             self.events.publish({"type": "runtime", "stage": "reply", "status": "complete"})
             return ChatResult(
                 reply=reply,
                 memory_hits=hits,
-                session_id=runtime.context_coordinator.session_id,
+                session_id=session_id,
+                turn_id=turn_id,
+                recalled_memories=recalled_memories,
             )
         except Exception as error:
             self.events.publish(
@@ -1167,6 +1321,35 @@ class DashboardApplication:
 
     def pending_permissions(self) -> dict[str, Any]:
         return {"items": self.permissions.pending()}
+
+    def record_memory_feedback(self, payload: dict[str, Any]) -> dict[str, Any]:
+        session_id = str(payload.get("session_id") or "").strip()
+        turn_id = str(payload.get("turn_id") or "").strip()
+        memory_key = str(payload.get("memory_key") or "").strip()
+        feedback = str(payload.get("feedback") or "").strip().lower()
+        if not session_id or len(session_id) > 200:
+            raise ValueError("valid session_id is required")
+        if not turn_id or len(turn_id) > 200:
+            raise ValueError("valid turn_id is required")
+        if not memory_key or len(memory_key) > 300:
+            raise ValueError("valid memory_key is required")
+        item = self.store.repository.record_recall_feedback(
+            session_id=session_id,
+            turn_id=turn_id,
+            memory_key=memory_key,
+            feedback=feedback,
+        )
+        self.events.publish(
+            {
+                "type": "memory_feedback",
+                "status": "recorded",
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "memory_key": memory_key,
+                "feedback": feedback,
+            }
+        )
+        return item
 
     def team_settings(self) -> dict[str, Any]:
         return get_team_settings()
@@ -1188,8 +1371,51 @@ class DashboardApplication:
     def team_agents(self) -> dict[str, Any]:
         return {"items": list_teammate_states()}
 
+    def team_communications(self) -> dict[str, Any]:
+        return {"items": list_team_communications(limit=100)}
+
     def team_agent_detail(self, name: str) -> dict[str, Any]:
         return self.store.team_agent_detail(name)
+
+    def update_team_agent_profile(
+        self, name: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        reset = payload.get("reset", False)
+        if not isinstance(reset, bool):
+            raise ValueError("reset must be boolean")
+        if "role" in payload and not isinstance(payload["role"], str):
+            raise ValueError("role must be a string")
+        if "prompt" in payload and not isinstance(payload["prompt"], str):
+            raise ValueError("prompt must be a string")
+        if "allowed_tools" in payload and not isinstance(
+            payload["allowed_tools"], list
+        ):
+            raise ValueError("allowed_tools must be an array")
+        value = update_teammate_profile(
+            name,
+            role=payload.get("role"),
+            prompt=payload.get("prompt"),
+            allowed_tools=payload.get("allowed_tools"),
+            reset=reset,
+        )
+        self.events.publish(
+            {
+                "type": "team_agent_profile",
+                "action": "reset" if reset else "updated",
+                "name": name,
+                "status": value["apply_state"],
+                "changed_fields": (
+                    ["role", "prompt", "allowed_tools"]
+                    if reset
+                    else [
+                        field
+                        for field in ("role", "prompt", "allowed_tools")
+                        if field in payload
+                    ]
+                ),
+            }
+        )
+        return value
 
     def submit_interaction(
         self,
@@ -1461,6 +1687,8 @@ def _handler_factory(application: DashboardApplication):
                     self._json(application.team_settings())
                 elif parsed.path == "/api/team/agents":
                     self._json(application.team_agents())
+                elif parsed.path == "/api/team/communications":
+                    self._json(application.team_communications())
                 elif match := re.fullmatch(
                     r"/api/team/agents/([A-Za-z0-9][A-Za-z0-9_-]{0,63})",
                     parsed.path,
@@ -1517,6 +1745,7 @@ def _handler_factory(application: DashboardApplication):
                 "/api/session/new",
                 "/api/session/resume",
                 "/api/session/mode",
+                "/api/memories/feedback",
                 "/api/permissions/review",
                 "/api/interactions",
             } and task_action is None and agent_action is None:
@@ -1526,6 +1755,7 @@ def _handler_factory(application: DashboardApplication):
                 if (
                     parsed.path in {
                         "/api/config",
+                        "/api/memories/feedback",
                         "/api/permissions/review",
                         "/api/interactions",
                     }
@@ -1612,6 +1842,9 @@ def _handler_factory(application: DashboardApplication):
                         )
                     )
                     return
+                if parsed.path == "/api/memories/feedback":
+                    self._json(application.record_memory_feedback(payload))
+                    return
                 if parsed.path == "/api/interactions":
                     self._json(
                         application.submit_interaction(
@@ -1653,6 +1886,8 @@ def _handler_factory(application: DashboardApplication):
                         "reply": result.reply,
                         "memory_hits": result.memory_hits,
                         "session_id": result.session_id,
+                        "turn_id": result.turn_id,
+                        "recalled_memories": result.recalled_memories,
                     },
                     HTTPStatus.OK,
                 )
@@ -1701,7 +1936,11 @@ def _handler_factory(application: DashboardApplication):
 
         def do_PUT(self) -> None:
             parsed = urlparse(self.path)
-            if parsed.path != "/api/team/settings":
+            agent_profile = re.fullmatch(
+                r"/api/team/agents/([A-Za-z0-9][A-Za-z0-9_-]{0,63})/profile",
+                parsed.path,
+            )
+            if parsed.path != "/api/team/settings" and agent_profile is None:
                 self._error(HTTPStatus.NOT_FOUND, "not found")
                 return
             if not self._is_loopback():
@@ -1711,7 +1950,17 @@ def _handler_factory(application: DashboardApplication):
                 )
                 return
             try:
-                self._json(application.set_team_settings(self._read_json_body()))
+                payload = self._read_json_body()
+                if agent_profile is not None:
+                    self._json(
+                        application.update_team_agent_profile(
+                            agent_profile.group(1), payload
+                        )
+                    )
+                else:
+                    self._json(application.set_team_settings(payload))
+            except KeyError as error:
+                self._error(HTTPStatus.NOT_FOUND, str(error))
             except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
                 self._error(HTTPStatus.BAD_REQUEST, str(error))
             except Exception as error:
@@ -1720,12 +1969,30 @@ def _handler_factory(application: DashboardApplication):
     return DashboardHandler
 
 
+class ExclusiveThreadingHTTPServer(ThreadingHTTPServer):
+    """Prevent multiple dashboard processes from sharing one TCP port."""
+
+    allow_reuse_address = False
+
+    def server_bind(self) -> None:
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(
+                socket.SOL_SOCKET,
+                socket.SO_EXCLUSIVEADDRUSE,
+                1,
+            )
+        super().server_bind()
+
+
 def create_server(
     application: DashboardApplication,
     host: str = "127.0.0.1",
     port: int = 8765,
 ) -> ThreadingHTTPServer:
-    return ThreadingHTTPServer((host, port), _handler_factory(application))
+    return ExclusiveThreadingHTTPServer(
+        (host, port),
+        _handler_factory(application),
+    )
 
 
 def create_parser() -> argparse.ArgumentParser:

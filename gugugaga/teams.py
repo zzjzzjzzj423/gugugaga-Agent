@@ -8,6 +8,7 @@ import re
 import threading
 import time
 import uuid
+from collections import deque
 from contextvars import copy_context
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -27,6 +28,7 @@ from .permissions import PermissionPolicy
 from .mutations import mutation_actor_scope
 from .provider import is_context_length_error
 from .stateio import atomic_write_text, interprocess_lock
+from .skills import load_skill
 from .tasks import (
     append_task_intervention,
     assign_task,
@@ -39,7 +41,8 @@ from .tasks import (
     list_tasks,
     load_task,
 )
-from .workspace import run_bash, run_read, run_write
+from .web_search import run_web_search
+from .workspace import run_bash, run_edit, run_glob, run_read, run_write
 
 if TYPE_CHECKING:
     from .context_modes import SessionContextCoordinator
@@ -56,6 +59,58 @@ _lead_inbox_event = threading.Event()
 _LEAD_WAKE_MESSAGE_TYPES = frozenset(
     {"result", "error", "plan_approval_request"}
 )
+
+
+def _team_communications_path() -> Path:
+    return config.WORKDIR / ".gugugaga" / "team-communications.jsonl"
+
+
+def _record_team_communication(message: dict[str, Any]) -> None:
+    """Persist routing metadata for the Team graph without storing message text."""
+
+    path = _team_communications_path()
+    value = {
+        "id": message["id"],
+        "from": message["from"],
+        "to": message["to"],
+        "type": message["type"],
+        "ts": message["ts"],
+        "task_id": message.get("metadata", {}).get("task_id"),
+        "interaction_id": message.get("metadata", {}).get("interaction_id"),
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with interprocess_lock(path.with_suffix(".lock")), path.open(
+            "a", encoding="utf-8"
+        ) as handle:
+            handle.write(json.dumps(value, ensure_ascii=False) + "\n")
+    except OSError:
+        # The mailbox is authoritative. A visualization log failure must not
+        # change message delivery semantics.
+        return
+
+
+def list_team_communications(limit: int = 100) -> list[dict[str, Any]]:
+    """Return recent Team message routes for dashboard animation."""
+
+    limit = max(1, min(int(limit), 500))
+    path = _team_communications_path()
+    if not path.exists():
+        return []
+    items: deque[dict[str, Any]] = deque(maxlen=limit)
+    try:
+        with interprocess_lock(path.with_suffix(".lock")):
+            lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    for line in lines:
+        try:
+            value = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(value, dict):
+            items.append(value)
+    return list(items)
 
 
 def _validate_agent_name(name: str) -> str:
@@ -158,6 +213,19 @@ class MessageBus:
             handle.write(json.dumps(msg, ensure_ascii=False) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
+        _record_team_communication(msg)
+        notify(
+            "team_message",
+            {
+                "message_id": msg["id"],
+                "from_agent": from_agent,
+                "to_agent": to_agent,
+                "message_type": msg_type,
+                "task_id": msg["metadata"].get("task_id"),
+                "sent_at": msg["ts"],
+                "status": "sent",
+            },
+        )
         if to_agent == _LEAD_AGENT_NAME and msg_type in _LEAD_WAKE_MESSAGE_TYPES:
             _lead_inbox_event.set()
             notify(
@@ -279,6 +347,254 @@ _teammate_states: dict[str, dict[str, Any]] = {}
 _teammate_lifecycle_lock = threading.RLock()
 _teammate_stop_event = threading.Event()
 _team_accepting = False
+_teammate_profile_restart_pending: set[str] = set()
+
+
+TEAM_CORE_TOOLS = (
+    "send_message",
+    "list_tasks",
+    "get_task",
+    "claim_task",
+    "complete_task",
+)
+TEAM_OPTIONAL_TOOLS = (
+    "read_file",
+    "glob",
+    "todo_write",
+    "submit_plan",
+    "load_skill",
+    "web_search",
+    "write_file",
+    "edit_file",
+    "bash",
+)
+TEAM_DEFAULT_ALLOWED_TOOLS = (
+    *TEAM_CORE_TOOLS,
+    "read_file",
+    "submit_plan",
+    "write_file",
+    "bash",
+)
+_TEAM_TOOL_ORDER = (*TEAM_CORE_TOOLS, *TEAM_OPTIONAL_TOOLS)
+_TEAM_TOOL_LABELS = {
+    "send_message": ("发送消息", "协作"),
+    "list_tasks": ("查看任务列表", "任务系统"),
+    "get_task": ("查看任务详情", "任务系统"),
+    "claim_task": ("领取任务", "任务系统"),
+    "complete_task": ("完成任务", "任务系统"),
+    "read_file": ("读取文件", "工作区"),
+    "glob": ("查找文件", "工作区"),
+    "todo_write": ("维护执行计划", "规划"),
+    "submit_plan": ("提交方案审批", "规划"),
+    "load_skill": ("加载技能", "能力"),
+    "web_search": ("搜索互联网", "能力"),
+    "write_file": ("写入文件", "工作区"),
+    "edit_file": ("编辑文件", "工作区"),
+    "bash": ("执行命令", "工作区"),
+}
+
+
+def _normalize_teammate_tools(value: Any = None) -> list[str]:
+    if value is None:
+        requested = set(TEAM_DEFAULT_ALLOWED_TOOLS)
+    else:
+        if not isinstance(value, list):
+            raise ValueError("allowed_tools must be an array")
+        if any(not isinstance(item, str) for item in value):
+            raise ValueError("allowed_tools must contain tool names")
+        requested = {item.strip() for item in value if item.strip()}
+        unknown = requested.difference(_TEAM_TOOL_ORDER)
+        if unknown:
+            raise ValueError(
+                "unknown Team Agent tools: " + ", ".join(sorted(unknown))
+            )
+    requested.update(TEAM_CORE_TOOLS)
+    return [name for name in _TEAM_TOOL_ORDER if name in requested]
+
+
+def teammate_tool_catalog() -> list[dict[str, Any]]:
+    defaults = set(TEAM_DEFAULT_ALLOWED_TOOLS)
+    core = set(TEAM_CORE_TOOLS)
+    return [
+        {
+            "name": name,
+            "label": _TEAM_TOOL_LABELS[name][0],
+            "group": _TEAM_TOOL_LABELS[name][1],
+            "required": name in core,
+            "default_enabled": name in defaults,
+        }
+        for name in _TEAM_TOOL_ORDER
+    ]
+
+
+_TEAM_TOOL_DEFINITIONS = {
+    "send_message": {
+        "name": "send_message",
+        "description": (
+            "Send a message to another agent. To report to the workspace Lead, "
+            "set to='lead'; Lead, Leader, and main are normalized to that recipient."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "to": {"type": "string"},
+                "content": {"type": "string"},
+            },
+            "required": ["to", "content"],
+        },
+    },
+    "list_tasks": {
+        "name": "list_tasks",
+        "description": "List all tasks.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    "get_task": {
+        "name": "get_task",
+        "description": "Read the full task, including description and owner.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"task_id": {"type": "string"}},
+            "required": ["task_id"],
+        },
+    },
+    "claim_task": {
+        "name": "claim_task",
+        "description": "Claim a pending task.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"task_id": {"type": "string"}},
+            "required": ["task_id"],
+        },
+    },
+    "complete_task": {
+        "name": "complete_task",
+        "description": "Mark an in-progress task as completed.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"task_id": {"type": "string"}},
+            "required": ["task_id"],
+        },
+    },
+    "read_file": {
+        "name": "read_file",
+        "description": "Read file contents.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "limit": {"type": "integer"},
+                "offset": {"type": "integer"},
+                "include_hash": {"type": "boolean"},
+            },
+            "required": ["path"],
+        },
+    },
+    "glob": {
+        "name": "glob",
+        "description": "Find files matching a glob pattern.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"pattern": {"type": "string"}},
+            "required": ["pattern"],
+        },
+    },
+    "todo_write": {
+        "name": "todo_write",
+        "description": "Create and manage a task list for this Agent.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {"type": "string"},
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed"],
+                            },
+                        },
+                        "required": ["content", "status"],
+                    },
+                }
+            },
+            "required": ["todos"],
+        },
+    },
+    "submit_plan": {
+        "name": "submit_plan",
+        "description": "Submit a plan for Lead approval.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"plan": {"type": "string"}},
+            "required": ["plan"],
+        },
+    },
+    "load_skill": {
+        "name": "load_skill",
+        "description": "Load the full content of a skill by name.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+        },
+    },
+    "web_search": {
+        "name": "web_search",
+        "description": "Search the current public web with Tavily.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "minLength": 1, "maxLength": 400},
+                "max_results": {"type": "integer", "minimum": 1, "maximum": 10},
+                "topic": {"type": "string", "enum": ["general", "news", "finance"]},
+                "search_depth": {"type": "string", "enum": ["basic", "advanced"]},
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    },
+    "write_file": {
+        "name": "write_file",
+        "description": "Write content to a file.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "content": {"type": "string"},
+                "expected_sha256": {"type": "string"},
+            },
+            "required": ["path", "content"],
+        },
+    },
+    "edit_file": {
+        "name": "edit_file",
+        "description": "Replace exact text in a file once.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "old_text": {"type": "string"},
+                "new_text": {"type": "string"},
+                "expected_sha256": {"type": "string"},
+            },
+            "required": ["path", "old_text", "new_text"],
+        },
+    },
+    "bash": {
+        "name": "bash",
+        "description": "Run a shell command.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string"},
+                "write_paths": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["command"],
+        },
+    },
+}
 
 
 def _team_settings_path() -> Path:
@@ -311,17 +627,29 @@ def _load_teammate_profiles() -> dict[str, dict[str, Any]]:
         prompt = str(raw.get("prompt", "")).strip()
         if not role or not prompt:
             continue
+        try:
+            allowed_tools = _normalize_teammate_tools(raw.get("allowed_tools"))
+        except ValueError:
+            allowed_tools = list(TEAM_DEFAULT_ALLOWED_TOOLS)
         profiles[name] = {
             "name": name,
             "role": role,
+            "initial_role": str(raw.get("initial_role") or role).strip(),
             "prompt": prompt,
+            "initial_prompt": str(raw.get("initial_prompt") or prompt).strip(),
+            "allowed_tools": allowed_tools,
             "created_at": raw.get("created_at"),
             "updated_at": raw.get("updated_at"),
         }
     return profiles
 
 
-def _persist_teammate_profile(name: str, role: str, prompt: str) -> None:
+def _persist_teammate_profile(
+    name: str,
+    role: str,
+    prompt: str,
+    allowed_tools: list[str] | None = None,
+) -> dict[str, Any]:
     path = _team_profiles_path()
     with interprocess_lock(path.with_suffix(".lock")):
         try:
@@ -335,25 +663,31 @@ def _persist_teammate_profile(name: str, role: str, prompt: str) -> None:
             agents = {}
         now = time.time()
         previous = agents.get(name, {})
+        previous = previous if isinstance(previous, dict) else {}
+        normalized_tools = _normalize_teammate_tools(
+            allowed_tools
+            if allowed_tools is not None
+            else previous.get("allowed_tools")
+        )
         agents[name] = {
             "name": name,
             "role": role,
+            "initial_role": str(previous.get("initial_role") or role),
             "prompt": prompt,
-            "created_at": (
-                previous.get("created_at", now)
-                if isinstance(previous, dict)
-                else now
-            ),
+            "initial_prompt": str(previous.get("initial_prompt") or prompt),
+            "allowed_tools": normalized_tools,
+            "created_at": previous.get("created_at", now),
             "updated_at": now,
         }
         atomic_write_text(
             path,
             json.dumps(
-                {"version": 1, "agents": agents},
+                {"version": 2, "agents": agents},
                 ensure_ascii=False,
                 indent=2,
             ),
         )
+        return dict(agents[name])
 
 
 def _delete_teammate_profile(name: str) -> bool:
@@ -372,12 +706,82 @@ def _delete_teammate_profile(name: str) -> bool:
         atomic_write_text(
             path,
             json.dumps(
-                {"version": 1, "agents": agents},
+                {"version": 2, "agents": agents},
                 ensure_ascii=False,
                 indent=2,
             ),
         )
         return True
+
+
+def teammate_profile(name: str) -> dict[str, Any]:
+    _validate_teammate_name(name)
+    profile = _load_teammate_profiles().get(name)
+    if profile is None:
+        raise KeyError(f"teammate '{name}' was not found")
+    return profile
+
+
+def update_teammate_profile(
+    name: str,
+    *,
+    role: str | None = None,
+    prompt: str | None = None,
+    allowed_tools: list[str] | None = None,
+    reset: bool = False,
+) -> dict[str, Any]:
+    """Persist a Team Agent configuration and schedule a safe runtime reload."""
+
+    with _teammate_lifecycle_lock:
+        current = teammate_profile(name)
+        if reset:
+            next_role = current["initial_role"]
+            next_prompt = current["initial_prompt"]
+            next_tools = list(TEAM_DEFAULT_ALLOWED_TOOLS)
+        else:
+            next_role = current["role"] if role is None else str(role).strip()
+            next_prompt = current["prompt"] if prompt is None else str(prompt).strip()
+            next_tools = (
+                current["allowed_tools"]
+                if allowed_tools is None
+                else allowed_tools
+            )
+        if not next_role:
+            raise ValueError("teammate role is required")
+        if len(next_role) > 200:
+            raise ValueError("teammate role is too long")
+        if not next_prompt:
+            raise ValueError("teammate prompt is required")
+        if len(next_prompt) > 20_000:
+            raise ValueError("teammate prompt is too long")
+        normalized_tools = _normalize_teammate_tools(next_tools)
+        saved = _persist_teammate_profile(
+            name,
+            next_role,
+            next_prompt,
+            normalized_tools,
+        )
+        with _teammate_lock:
+            active = name in active_teammates
+            state = _teammate_states.get(name) or {}
+            status = str(state.get("status") or "stopped")
+            has_active_task = bool(state.get("current_task_id"))
+            if active:
+                _teammate_profile_restart_pending.add(name)
+                apply_state = "pending"
+                if status == "idle" and not has_active_task:
+                    stop_event = _teammate_stop_events.get(name)
+                    if stop_event is not None:
+                        state["status"] = "restarting"
+                        stop_event.set()
+                        apply_state = "restarting"
+            else:
+                apply_state = "next_start"
+        return {
+            **saved,
+            "apply_state": apply_state,
+            "restart_required": active,
+        }
 
 
 def get_team_settings() -> dict[str, Any]:
@@ -976,7 +1380,10 @@ def idle_poll(
                         "content": "<inbox>" + json.dumps(inbox) + "</inbox>",
                     }
                 )
-                if not require_task or (
+                ordinary_message = any(
+                    msg.get("type", "message") == "message" for msg in inbox
+                )
+                if ordinary_message or not require_task or (
                     work_state is not None and work_state.get("task_id")
                 ):
                     return "work"
@@ -1120,6 +1527,7 @@ def _spawn_teammate_thread_unlocked(
     role: str,
     prompt: str,
     *,
+    allowed_tools: list[str] | None = None,
     await_assignment: bool = False,
     persist_profile: bool = True,
 ) -> str:
@@ -1133,15 +1541,27 @@ def _spawn_teammate_thread_unlocked(
     prompt = str(prompt or "").strip()
     if not role:
         return "Error: teammate role is required"
+    if len(role) > 200:
+        return "Error: teammate role is too long"
     if not prompt:
         return "Error: teammate prompt is required"
+    if len(prompt) > 20_000:
+        return "Error: teammate prompt is too long"
+    try:
+        normalized_tools = _normalize_teammate_tools(allowed_tools)
+    except ValueError as error:
+        return f"Error: {error}"
     with _teammate_lock:
         if not _team_accepting:
             return "Error: teammate manager is not accepting new teammates"
         if name in active_teammates:
             return f"Teammate '{name}' already exists"
         if persist_profile:
-            _persist_teammate_profile(name, role, prompt)
+            profile = _persist_teammate_profile(
+                name, role, prompt, normalized_tools
+            )
+        else:
+            profile = _load_teammate_profiles().get(name, {})
         if not _teammate_threads:
             _teammate_stop_event.clear()
         stop_event = threading.Event()
@@ -1156,6 +1576,8 @@ def _spawn_teammate_thread_unlocked(
             "current_task_id": None,
             "started_at": now,
             "last_active_at": now,
+            "configuration_updated_at": profile.get("updated_at"),
+            "active_allowed_tools": normalized_tools,
         }
 
     protocol_ctx = {"waiting_plan": None, "waiting_since": None}
@@ -1167,7 +1589,9 @@ def _spawn_teammate_thread_unlocked(
         "modify in write_paths. The Task System is the authority for work "
         "dispatch. When workspace auto-claim is disabled, you may claim and "
         "execute only a task explicitly assigned to you. Do not start workspace "
-        "mutations from your role description or an ordinary inbox message."
+        "mutations from your role description or an ordinary inbox message. "
+        "An ordinary inbox message may wake you for a conversational response; "
+        "answer it without workspace mutations unless you also hold an active task."
     )
 
     def handle_inbox_message(agent_name: str, msg: dict, messages: list):
@@ -1235,113 +1659,12 @@ def _spawn_teammate_thread_unlocked(
         scope.__enter__()
         notify(
             "teammate_start",
-            {"name": name, "role": role, "prompt": prompt},
+            {"name": name, "role": role, "prompt_chars": len(prompt)},
         )
         messages = [{"role": "user", "content": prompt}]
         sub_tools = [
-            {
-                "name": "bash",
-                "description": "Run a shell command.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "command": {"type": "string"},
-                        "write_paths": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                        },
-                    },
-                    "required": ["command"],
-                },
-            },
-            {
-                "name": "read_file",
-                "description": "Read file.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "limit": {"type": "integer"},
-                        "offset": {"type": "integer"},
-                        "include_hash": {"type": "boolean"},
-                    },
-                    "required": ["path"],
-                },
-            },
-            {
-                "name": "write_file",
-                "description": "Write file.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "content": {"type": "string"},
-                        "expected_sha256": {"type": "string"},
-                    },
-                    "required": ["path", "content"],
-                },
-            },
-            {
-                "name": "send_message",
-                "description": (
-                    "Send a message to another agent. To report to the workspace "
-                    "Lead, set to='lead'; Lead, Leader, and main are normalized "
-                    "to the same reserved recipient."
-                ),
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "to": {"type": "string"},
-                        "content": {"type": "string"},
-                    },
-                    "required": ["to", "content"],
-                },
-            },
-            {
-                "name": "submit_plan",
-                "description": "Submit a plan for Lead approval.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {"plan": {"type": "string"}},
-                    "required": ["plan"],
-                },
-            },
-            {
-                "name": "list_tasks",
-                "description": "List all tasks.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {},
-                    "required": [],
-                },
-            },
-            {
-                "name": "get_task",
-                "description": "Read the full task, including description and owner.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {"task_id": {"type": "string"}},
-                    "required": ["task_id"],
-                },
-            },
-            {
-                "name": "claim_task",
-                "description": "Claim a pending task.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {"task_id": {"type": "string"}},
-                    "required": ["task_id"],
-                },
-            },
-            {
-                "name": "complete_task",
-                "description": "Mark an in-progress task as completed.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {"task_id": {"type": "string"}},
-                    "required": ["task_id"],
-                },
-            },
+            _TEAM_TOOL_DEFINITIONS[tool_name]
+            for tool_name in normalized_tools
         ]
 
         work_state: dict[str, Any] = {
@@ -1409,7 +1732,7 @@ def _spawn_teammate_thread_unlocked(
                         "Error: no active assigned task; workspace mutations "
                         "require a Task System assignment"
                     )
-            if handler in {run_bash, run_write}:
+            if handler in {run_bash, run_write, run_edit}:
                 arguments.setdefault("cancel_event", stop_event)
             return handler(**arguments)
 
@@ -1432,6 +1755,25 @@ def _spawn_teammate_thread_unlocked(
                     work_state["task_id"] = None
             return result
 
+        teammate_todos: list[dict[str, str]] = []
+
+        def update_todos(todos: list[dict[str, str]]) -> str:
+            if not isinstance(todos, list):
+                return "Error: todos must be an array"
+            normalized: list[dict[str, str]] = []
+            for index, item in enumerate(todos):
+                if not isinstance(item, dict):
+                    return f"Error: todos[{index}] must be an object"
+                content = str(item.get("content") or "").strip()
+                status = str(item.get("status") or "")
+                if not content:
+                    return f"Error: todos[{index}].content is required"
+                if status not in {"pending", "in_progress", "completed"}:
+                    return f"Error: todos[{index}].status is invalid"
+                normalized.append({"content": content, "status": status})
+            teammate_todos[:] = normalized
+            return f"Updated {len(normalized)} todos"
+
         sub_handlers = {
             "bash": lambda **arguments: run_task_mutation(
                 run_bash, **arguments
@@ -1440,6 +1782,13 @@ def _spawn_teammate_thread_unlocked(
             "write_file": lambda **arguments: run_task_mutation(
                 run_write, **arguments
             ),
+            "edit_file": lambda **arguments: run_task_mutation(
+                run_edit, **arguments
+            ),
+            "glob": run_glob,
+            "todo_write": update_todos,
+            "load_skill": load_skill,
+            "web_search": run_web_search,
             "send_message": send_message,
             "list_tasks": list_task_lines,
             "get_task": get_task_json,
@@ -1528,7 +1877,7 @@ def _spawn_teammate_thread_unlocked(
             attempted_recovery = False
             broker.clear_cancel(interaction_target)
             if await_assignment:
-                set_activity("idle", "等待用户分配或队列任务")
+                set_activity("idle", "等待用户分配、队列任务或普通消息")
                 initial_dispatch = idle_poll(
                     name,
                     messages,
@@ -1541,6 +1890,7 @@ def _spawn_teammate_thread_unlocked(
                 if initial_dispatch in ("shutdown", "timeout"):
                     return
             while not stop_event.is_set():
+                burst_has_task = bool(work_state.get("task_id"))
                 _set_teammate_state(name, status="running")
                 if len(messages) <= 3:
                     messages.insert(
@@ -1627,7 +1977,12 @@ def _spawn_teammate_thread_unlocked(
                         provider_messages = messages
                     iteration += 1
                     rounds_this_burst += 1
-                    set_activity("llm_running", "正在分析当前任务并规划下一步")
+                    set_activity(
+                        "llm_running",
+                        "正在分析当前任务并规划下一步"
+                        if burst_has_task
+                        else "正在处理收到的普通消息",
+                    )
                     try:
                         response = record_llm_call(
                             _team_provider,
@@ -1799,7 +2154,17 @@ def _spawn_teammate_thread_unlocked(
                         "Teammate exceeded maximum rounds "
                         f"({_team_max_rounds_per_burst})"
                     )
-                set_activity("idle", "任务阶段结束，等待下一项队列任务")
+                set_activity(
+                    "idle",
+                    "任务阶段结束，等待下一项队列任务"
+                    if burst_has_task
+                    else "消息处理完毕，等待用户分配、队列任务或新消息",
+                )
+                with _teammate_lock:
+                    reload_requested = name in _teammate_profile_restart_pending
+                if reload_requested and not work_state.get("task_id"):
+                    stop_event.set()
+                    break
                 idle_result = idle_poll(
                     name,
                     messages,
@@ -1833,6 +2198,7 @@ def _spawn_teammate_thread_unlocked(
             except Exception:
                 pass
         finally:
+            restart_with_saved_profile = False
             task_id = work_state.get("task_id")
             if task_id:
                 try:
@@ -1858,6 +2224,12 @@ def _spawn_teammate_thread_unlocked(
             notify("teammate_end", {"name": name})
             scope.__exit__(None, None, None)
             with _teammate_lock:
+                restart_with_saved_profile = (
+                    name in _teammate_profile_restart_pending
+                    and not failed
+                    and _team_accepting
+                )
+                _teammate_profile_restart_pending.discard(name)
                 active_teammates.pop(name, None)
                 _teammate_threads.pop(name, None)
                 _teammate_stop_events.pop(name, None)
@@ -1870,6 +2242,17 @@ def _spawn_teammate_thread_unlocked(
                             "current_task_id": None,
                             "last_active_at": time.time(),
                         }
+                    )
+            if restart_with_saved_profile:
+                result = restart_teammate(name)
+                if result.startswith("Error:"):
+                    notify(
+                        "teammate_error",
+                        {
+                            "name": name,
+                            "error_type": "ProfileReloadError",
+                            "error": result,
+                        },
                     )
 
     parent_context = copy_context()
@@ -1889,6 +2272,7 @@ def spawn_teammate_thread(
     role: str,
     prompt: str,
     *,
+    allowed_tools: list[str] | None = None,
     await_assignment: bool = False,
     persist_profile: bool = True,
 ) -> str:
@@ -1897,6 +2281,7 @@ def spawn_teammate_thread(
             name,
             role,
             prompt,
+            allowed_tools=allowed_tools,
             await_assignment=await_assignment,
             persist_profile=persist_profile,
         )
@@ -1910,6 +2295,7 @@ def stop_teammate(name: str) -> str:
     except ValueError as error:
         return f"Error: {error}"
     with _teammate_lock:
+        _teammate_profile_restart_pending.discard(name)
         thread = _teammate_threads.get(name)
         stop_event = _teammate_stop_events.get(name)
         if (
@@ -1941,6 +2327,7 @@ def restart_teammate(name: str) -> str:
             name,
             profile["role"],
             profile["prompt"],
+            allowed_tools=profile["allowed_tools"],
             await_assignment=True,
             persist_profile=False,
         )
@@ -1978,6 +2365,7 @@ def delete_teammate(name: str) -> dict[str, Any]:
             )
         profile_deleted = _delete_teammate_profile(name)
         with _teammate_lock:
+            _teammate_profile_restart_pending.discard(name)
             _teammate_states.pop(name, None)
             _teammate_threads.pop(name, None)
             _teammate_stop_events.pop(name, None)
@@ -1995,6 +2383,7 @@ def stop_all_teammates(timeout: float = 5.0) -> TeammateShutdownOutcome:
     global _team_accepting
     with _teammate_lock:
         _team_accepting = False
+        _teammate_profile_restart_pending.clear()
     _teammate_stop_event.set()
     with _teammate_lock:
         for stop_event in _teammate_stop_events.values():
