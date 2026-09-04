@@ -357,6 +357,12 @@ CLI 示例：
 
 模式只能在空白会话开始前选择，首条消息发出后锁定。
 
+默认计数器会根据模型名选择 Qwen、DeepSeek、GLM、OpenAI、Claude、
+Llama、Mistral 或 Gemma 的估算配置；未知模型使用保守回退配置。
+CC、Hermes 和 Pi 的自动触发都使用同一个近似 Token 计数器。该计数器
+不等价于模型官方 tokenizer；需要精确计数时，可通过 `TokenCounterRegistry`
+注册 Provider 对应的 tokenizer 实现。
+
 ## Memory 架构
 
 ### 4. 召回、RRF 与反馈闭环
@@ -369,15 +375,17 @@ flowchart TB
     P -->|"直接引用历史"| H["Hybrid Recall"]
     P -->|"其他输入"| IG{"LLM Intent Gate"}
     IG -->|"高置信度 skip"| SKIP
-    IG -->|"retrieve / fail-open"| H
+    IG -->|"retrieve + route"| H
+    IG -->|"低置信度 / fail-open<br/>规则路由兜底"| H
 
     C[("Active Facts<br/>Active Episodes<br/>Hot Evidence")] --> H
+    CE[("Cold Evidence<br/>lexical fallback")] --> B
     H --> B["FTS5 · BM25"]
     H --> V["Vector · optional"]
     B --> R["RRF Fusion"]
     V --> R
     R --> RR["手写重排<br/>相关性 · 重要度 · 反馈 · 时间 · 频率"]
-    RR --> S["去重 · 多样性<br/>Top K · Token Budget"]
+    RR --> S["去重 · 多样性<br/>路由配额 · Top K · Token Budget"]
     S --> WC["Working Context"]
     S --> RI[("Recall Impression")]
     RI -->|"Web 👍 / 👎<br/>仅 Fact / Episode"| FB["反馈计数"]
@@ -396,9 +404,9 @@ flowchart TB
     class WC,FB success;
 ```
 
-召回语料只包含 active Fact、active Episode 和 Hot Conversation Evidence。Cold Evidence 仍保存在 `chat_log`，但从 FTS 与向量索引移除，不参与普通召回。
+召回语料包含 active Fact、active Episode 和 Conversation Evidence。Hot Evidence 同时进入 FTS 与向量索引；Cold Evidence 仍保留在 FTS 中作为低成本原文兜底，但从向量索引移除。
 
-Hard Pre-Gate 先排除记忆关闭、预算为 0、空输入和简单寒暄。明确引用过去信息的请求直接进入召回；其他请求经过一次 LLM Intent Gate。只有高置信度 `skip` 才会关闭检索，低置信度、超时、非法输出或 Provider 异常都会 fail-open。
+Hard Pre-Gate 先排除记忆关闭、预算为 0、空输入和简单寒暄。明确引用过去信息的请求直接进入召回；其他请求经过一次 LLM Intent & Route Gate，同时返回 `retrieve/skip` 和 `fact/episode/evidence/mixed`。只有高置信度 `skip` 才会关闭检索；路由低置信度、超时、非法输出或 Provider 异常时使用确定性规则分类并 fail-open。
 
 FTS5/BM25 与可选向量检索各取默认 Top 20。RRF 不比较两种检索器不可直接对齐的原始分数，而只融合名次。对候选项 `d`，当前实现为：
 
@@ -421,7 +429,7 @@ final_score = 0.70 × relevance
 feedback = (helpful + 1) / (helpful + irrelevant + 2)
 ```
 
-最终结果还要经过最低分、词面/向量语义去重、同 subject 多样性、Top K（默认 5）和 Token Budget 限制，再以 `<untrusted_memory>` 注入 Working Context。
+最终结果还要经过最低分、词面/向量语义去重和同 subject 多样性，再根据 Gate 给出的路由分配 Top 5：Fact 为 `3 Fact + 1 Episode + 1 Evidence`，Episode 为 `3 Episode + 2 Evidence`，Evidence 为 `1 Fact + 1 Episode + 3 Evidence`，Mixed 为 `2 Fact + 1 Episode + 2 Evidence`。某层候选不足时从其他已通过相关性阈值的候选补位，之后再执行 Token Budget 限制并以 `<untrusted_memory>` 注入 Working Context。
 
 Web 会为实际注入的结果保存 Recall Impression，记录查询、来源排名、RRF 相关性、最终分数和位置。用户只能对这次真实召回中的 active Fact/Episode 点 👍 或 👎；Conversation Evidence 不开放反馈。反馈可幂等重放，也可以从 helpful 切换为 irrelevant，计数在同一事务中增减，并影响下一次重排。这一约束可防止前端伪造任意 Memory ID 来污染训练信号。
 
@@ -436,16 +444,17 @@ flowchart TB
     L --> V{"严格 JSON<br/>长期价值校验"}
 
     V -->|"成功"| TX["SQLite Transaction"]
-    TX --> M[("Facts · Episode<br/>Sources · Audit")]
+    TX --> M[("Facts · Episodes 0–5<br/>Sources · Audit")]
     TX --> LC["Evidence Lifecycle"]
     LC --> HOT["最近 N 个已整合 Exchange<br/>Hot · 可召回"]
-    LC --> COLD[("更早 Exchange<br/>Cold · 仅保留原文")]
+    LC --> COLD[("更早 Exchange<br/>Cold · FTS 兜底")]
 
     V -->|"失败 / 超时"| RP["Retry Pending<br/>60s → 300s → 1800s → 7200s → 86400s"]
     RP -.-> C
 
     M --> FTS["FTS5 · 同步"]
     HOT --> FTS
+    COLD --> FTS
     M --> OUT["Vector Outbox · 异步"]
     HOT --> OUT
 
@@ -590,8 +599,10 @@ $workspaceDir = "C:\path\to\your-workspace"
 | `GUGUGAGA_MEMORY_CONSOLIDATION_TIMEOUT` | `90` | 单次整合超时（秒） |
 | `GUGUGAGA_MEMORY_CONSOLIDATION_LEASE` | `600` | 整合租约（秒） |
 | `GUGUGAGA_MEMORY_CONSOLIDATION_MAX_FACTS` | `10` | 单批最大 Fact 候选数 |
-| `GUGUGAGA_MEMORY_CONSOLIDATION_MIN_IMPORTANCE` | `0.8` | 长期记忆最低重要度 |
-| `GUGUGAGA_MEMORY_EVIDENCE_HOT_EXCHANGES` | `30` | 保持可召回的最近已整合 Exchange 数量 |
+| `GUGUGAGA_MEMORY_CONSOLIDATION_MIN_IMPORTANCE` | `0.8` | Fact 最低重要度 |
+| `GUGUGAGA_MEMORY_CONSOLIDATION_MAX_EPISODES` | `5` | 单批最大 Episode 候选数 |
+| `GUGUGAGA_MEMORY_CONSOLIDATION_EPISODE_MIN_IMPORTANCE` | `0.6` | Episode 独立最低重要度 |
+| `GUGUGAGA_MEMORY_EVIDENCE_HOT_EXCHANGES` | `30` | 保留向量索引的最近已整合 Exchange 数量；更早 Evidence 仍支持词法召回 |
 | `GUGUGAGA_MEMORY_RECALL_TOKENS` | `2000` | 单次召回 Token 预算 |
 | `GUGUGAGA_MEMORY_INTENT_GATE_ENABLED` | `true` | 是否启用召回前 LLM Intent Gate |
 | `GUGUGAGA_MEMORY_INTENT_GATE_MODEL` | 整理模型/主模型 | Intent Gate 专用模型 |

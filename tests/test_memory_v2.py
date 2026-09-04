@@ -7,7 +7,7 @@ import time
 from gugugaga.__main__ import build_runtime, handle_command
 from gugugaga.config import Settings
 from gugugaga.memory import MemoryRepository, MemoryService, RecallItem, memory_hit_kinds
-from gugugaga.memory.validation import parse_consolidation_result
+from gugugaga.memory.validation import MemoryValidationError, parse_consolidation_result
 from gugugaga.models import ModelResponse, ToolCall
 from tests.fakes import ScriptedProvider
 
@@ -204,6 +204,7 @@ def test_memory_intent_gate_skips_only_high_confidence_self_contained_queries(tm
                 json.dumps(
                     {
                         "decision": "skip",
+                        "route": "mixed",
                         "reason": "self_contained",
                         "confidence": 0.95,
                     }
@@ -227,6 +228,8 @@ def test_memory_intent_gate_skips_only_high_confidence_self_contained_queries(tm
 
     assert result.decision == "skip"
     assert result.reason == "intent_gate_skip"
+    assert result.route == "mixed"
+    assert result.route_source == "llm"
     assert len(provider.requests) == 1
     assert provider.requests[0]["model"] == "gate-model"
     assert provider.requests[0]["max_tokens"] == 120
@@ -239,6 +242,7 @@ def test_memory_intent_gate_retrieves_and_fails_open(tmp_path):
                 json.dumps(
                     {
                         "decision": "retrieve",
+                        "route": "fact",
                         "reason": "preference_may_apply",
                         "confidence": 0.91,
                     }
@@ -249,6 +253,7 @@ def test_memory_intent_gate_retrieves_and_fails_open(tmp_path):
                 json.dumps(
                     {
                         "decision": "skip",
+                        "route": "episode",
                         "reason": "probably_self_contained",
                         "confidence": 0.40,
                     }
@@ -268,8 +273,14 @@ def test_memory_intent_gate_retrieves_and_fails_open(tmp_path):
     uncertain = service.recall_for_turn("Give me one more Rust example")
 
     assert allowed.should_inject
+    assert allowed.route == "fact"
+    assert allowed.route_source == "llm"
     assert failed_open.should_inject
+    assert failed_open.route == "mixed"
+    assert failed_open.route_source == "rule_fallback"
     assert uncertain.should_inject
+    assert uncertain.route == "mixed"
+    assert uncertain.route_source == "rule_fallback"
     assert len(provider.requests) == 3
 
 
@@ -350,12 +361,18 @@ def test_consolidation_starts_at_six_and_commits_atomically(tmp_path):
                                 "future_value": "后续可以持续提供针对性的面试准备帮助",
                             }
                         ],
-                        "episode": {
-                            "summary": "用户确定了大厂实习准备方向",
-                            "importance": 0.9,
-                            "completed": True,
-                            "future_value": "后续复盘准备进度时需要引用这个决定",
-                        },
+                        "episodes": [
+                            {
+                                "summary": "用户在2026年9月确定了大厂实习准备方向",
+                                "importance": 0.9,
+                                "future_value": "后续复盘准备进度时需要引用这个决定",
+                            },
+                            {
+                                "summary": "用户计划在2026年9月中旬参加面试",
+                                "importance": 0.7,
+                                "future_value": "后续安排面试准备时需要该时间边界",
+                            },
+                        ],
                     },
                     ensure_ascii=False,
                 )
@@ -378,7 +395,7 @@ def test_consolidation_starts_at_six_and_commits_atomically(tmp_path):
     assert service.process_pending() == 1
     assert service.status()["consolidated"] == 6
     assert service.status()["facts"] == 1
-    assert service.status()["episodes"] == 1
+    assert service.status()["episodes"] == 2
     assert provider.requests[0]["tools"] == []
     assert "30-day test" in provider.requests[0]["system"]
     with sqlite3.connect(tmp_path / "state.db") as connection:
@@ -392,11 +409,56 @@ def test_consolidation_starts_at_six_and_commits_atomically(tmp_path):
     assert batch_ids == 1
 
 
+def test_repository_migrates_legacy_single_episode_batch_constraint(tmp_path):
+    database = tmp_path / "legacy.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            CREATE TABLE episodes (
+                id TEXT PRIMARY KEY,
+                summary TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('active', 'forgotten')),
+                source_batch_id TEXT NOT NULL UNIQUE,
+                period_start TEXT NOT NULL,
+                period_end TEXT NOT NULL,
+                dedupe_key TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                forgotten_at TEXT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO episodes
+            (id, summary, status, source_batch_id, period_start, period_end,
+             dedupe_key, created_at)
+            VALUES ('episode_old', 'old experience', 'active', 'batch_old',
+                    '2026-09-01', '2026-09-01', 'batch_old', '2026-09-01')
+            """
+        )
+
+    MemoryRepository(database)
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            INSERT INTO episodes
+            (id, summary, status, source_batch_id, period_start, period_end,
+             dedupe_key, created_at)
+            VALUES ('episode_new', 'another experience', 'active', 'batch_old',
+                    '2026-09-02', '2026-09-02', 'batch_old:1', '2026-09-02')
+            """
+        )
+        assert connection.execute(
+            "SELECT COUNT(*) FROM episodes WHERE source_batch_id='batch_old'"
+        ).fetchone()[0] == 2
+
+
 def test_failed_consolidation_stays_pending_and_retries_once(tmp_path):
     provider = ScriptedProvider(
         [
             ModelResponse("not json"),
-            ModelResponse('{"facts": [], "episode": null}'),
+            ModelResponse('{"facts": [], "episodes": []}'),
         ]
     )
     service = MemoryService(
@@ -420,8 +482,8 @@ def test_failed_consolidation_stays_pending_and_retries_once(tmp_path):
 def test_successful_consolidation_reconciles_evidence_hot_window(tmp_path):
     provider = ScriptedProvider(
         [
-            ModelResponse('{"facts": [], "episode": null}'),
-            ModelResponse('{"facts": [], "episode": null}'),
+            ModelResponse('{"facts": [], "episodes": []}'),
+            ModelResponse('{"facts": [], "episodes": []}'),
         ]
     )
     service = MemoryService(
@@ -444,7 +506,7 @@ def test_successful_consolidation_reconciles_evidence_hot_window(tmp_path):
 
 def test_consolidation_redacts_credentials_before_provider(tmp_path):
     provider = ScriptedProvider(
-        [ModelResponse('{"facts": [], "episode": null}')]
+        [ModelResponse('{"facts": [], "episodes": []}')]
     )
     service = MemoryService(
         tmp_path / "state.db", provider, threshold=6, start_worker=False
@@ -483,12 +545,13 @@ def test_consolidation_admission_rejects_temporary_and_low_value_candidates():
                         "future_value": "可以调整后续回答风格",
                     },
                 ],
-                "episode": {
-                    "summary": "用户计划以后改进记忆系统",
-                    "importance": 0.95,
-                    "completed": False,
-                    "future_value": "以后可能继续实施这个计划",
-                },
+                "episodes": [
+                    {
+                        "summary": "用户计划在2026年9月改进记忆系统",
+                        "importance": 0.55,
+                        "future_value": "以后可能继续实施这个计划",
+                    }
+                ],
             },
             ensure_ascii=False,
         ),
@@ -496,10 +559,10 @@ def test_consolidation_admission_rejects_temporary_and_low_value_candidates():
     )
 
     assert result.facts == ()
-    assert result.episode is None
+    assert result.episodes == ()
 
 
-def test_consolidation_admission_accepts_durable_fact_and_completed_milestone():
+def test_consolidation_uses_independent_lower_threshold_for_episode():
     result = parse_consolidation_result(
         json.dumps(
             {
@@ -512,12 +575,13 @@ def test_consolidation_admission_accepts_durable_fact_and_completed_milestone():
                         "future_value": "可以持续调整后续回答的语言和篇幅",
                     }
                 ],
-                "episode": {
-                    "summary": "用户完成了 gugugaga 前后端打通",
-                    "importance": 0.85,
-                    "completed": True,
-                    "future_value": "后续迭代时需要了解这个项目里程碑",
-                },
+                "episodes": [
+                    {
+                        "summary": "用户在2026年9月完成了 gugugaga 前后端打通",
+                        "importance": 0.65,
+                        "future_value": "后续迭代时需要了解这个项目经历",
+                    }
+                ],
             },
             ensure_ascii=False,
         ),
@@ -527,7 +591,30 @@ def test_consolidation_admission_accepts_durable_fact_and_completed_milestone():
     assert [(item.subject, item.content) for item in result.facts] == [
         ("response_preference", "用户明确偏好简洁的中文回答")
     ]
-    assert result.episode == "用户完成了 gugugaga 前后端打通"
+    assert [item.summary for item in result.episodes] == [
+        "用户在2026年9月完成了 gugugaga 前后端打通"
+    ]
+
+
+def test_consolidation_rejects_more_than_five_episodes():
+    payload = {
+        "facts": [],
+        "episodes": [
+            {
+                "summary": f"用户在2026年9月{i + 1}日完成活动",
+                "importance": 0.7,
+                "future_value": "后续回答时间问题时有用",
+            }
+            for i in range(6)
+        ],
+    }
+
+    try:
+        parse_consolidation_result(json.dumps(payload, ensure_ascii=False))
+    except MemoryValidationError as error:
+        assert error.code == "schema_invalid"
+    else:
+        raise AssertionError("six episodes should violate the per-batch limit")
 
 
 def test_background_worker_processes_completed_exchange_after_notification(tmp_path):
@@ -537,12 +624,13 @@ def test_background_worker_processes_completed_exchange_after_notification(tmp_p
                 json.dumps(
                     {
                         "facts": [],
-                        "episode": {
-                            "summary": "用户完成了计划讨论并确定执行方向",
-                            "importance": 0.9,
-                            "completed": True,
-                            "future_value": "后续执行时需要回顾已经确定的方向",
-                        },
+                        "episodes": [
+                            {
+                                "summary": "用户在2026年9月完成了计划讨论并确定执行方向",
+                                "importance": 0.9,
+                                "future_value": "后续执行时需要回顾已经确定的方向",
+                            }
+                        ],
                     },
                     ensure_ascii=False,
                 )

@@ -6,7 +6,7 @@ import re
 import unicodedata
 from typing import Any
 
-from .models import ConsolidationResult, FactCandidate
+from .models import ConsolidationResult, EpisodeCandidate, FactCandidate
 
 
 class MemoryValidationError(ValueError):
@@ -86,16 +86,25 @@ def _future_value(value: Any) -> str:
 
 
 def parse_consolidation_result(
-    raw: str, *, max_facts: int = 10, min_importance: float = 0.8
+    raw: str,
+    *,
+    max_facts: int = 10,
+    min_importance: float = 0.8,
+    max_episodes: int = 5,
+    episode_min_importance: float = 0.6,
 ) -> ConsolidationResult:
     if not 0 <= min_importance <= 1:
         raise ValueError("min_importance must be between 0 and 1")
+    if not 0 <= max_episodes <= 5:
+        raise ValueError("max_episodes must be between 0 and 5")
+    if not 0 <= episode_min_importance <= 1:
+        raise ValueError("episode_min_importance must be between 0 and 1")
     try:
         value = json.loads(raw)
     except json.JSONDecodeError as error:
         raise MemoryValidationError("schema_invalid", "consolidation output must be one JSON object") from error
-    if not isinstance(value, dict) or set(value) != {"facts", "episode"}:
-        raise MemoryValidationError("schema_invalid", "output keys must be exactly facts and episode")
+    if not isinstance(value, dict) or set(value) != {"facts", "episodes"}:
+        raise MemoryValidationError("schema_invalid", "output keys must be exactly facts and episodes")
     facts_value = value["facts"]
     if not isinstance(facts_value, list) or len(facts_value) > max_facts:
         raise MemoryValidationError("schema_invalid", f"facts must contain at most {max_facts} items")
@@ -116,15 +125,18 @@ def parse_consolidation_result(
         _future_value(item["future_value"])
         if importance >= min_importance and item["durability"] == "long_term":
             facts.append(FactCandidate(subject, content, importance))
-    episode_value = value["episode"]
-    if episode_value is None:
-        episode = None
-    elif isinstance(episode_value, dict):
-        required = {"summary", "importance", "completed", "future_value"}
-        if set(episode_value) != required:
+    episodes_value = value["episodes"]
+    if not isinstance(episodes_value, list) or len(episodes_value) > max_episodes:
+        raise MemoryValidationError(
+            "schema_invalid", f"episodes must contain at most {max_episodes} items"
+        )
+    episodes: list[EpisodeCandidate] = []
+    for episode_value in episodes_value:
+        required = {"summary", "importance", "future_value"}
+        if not isinstance(episode_value, dict) or set(episode_value) != required:
             raise MemoryValidationError(
                 "schema_invalid",
-                "episode must contain only summary, importance, completed, and future_value",
+                "each episode must contain only summary, importance, and future_value",
             )
         summary = episode_value["summary"]
         if not isinstance(summary, str):
@@ -135,17 +147,7 @@ def parse_consolidation_result(
         if contains_credential(summary):
             raise MemoryValidationError("sensitive_content", "credentials cannot be stored in an episode")
         importance = _importance(episode_value["importance"])
-        if not isinstance(episode_value["completed"], bool):
-            raise MemoryValidationError("schema_invalid", "episode completed must be a boolean")
         _future_value(episode_value["future_value"])
-        episode = (
-            summary
-            if importance >= min_importance and episode_value["completed"]
-            else None
-        )
-        episode_importance = importance if episode is not None else 0.0
-    else:
-        raise MemoryValidationError("schema_invalid", "episode must be an object or null")
-    if episode_value is None:
-        episode_importance = 0.0
-    return ConsolidationResult(tuple(facts), episode, episode_importance)
+        if importance >= episode_min_importance:
+            episodes.append(EpisodeCandidate(summary, importance))
+    return ConsolidationResult(tuple(facts), tuple(episodes))

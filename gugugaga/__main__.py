@@ -254,7 +254,7 @@ def build_runtime(
             pi_reserve_tokens=context_config.pi_reserve_tokens,
             pi_keep_recent_tokens=context_config.pi_keep_recent_tokens,
         )
-    counter_registry = TokenCounterRegistry()
+    counter_registry = TokenCounterRegistry(model=settings.model)
     if token_counter is not None:
         counter_registry.register(token_counter)
     coordinator = SessionContextCoordinator(
@@ -280,6 +280,10 @@ def build_runtime(
         lease_seconds=settings.memory_consolidation_lease_seconds,
         max_facts=settings.memory_consolidation_max_facts,
         min_importance=settings.memory_consolidation_min_importance,
+        max_episodes=settings.memory_consolidation_max_episodes,
+        episode_min_importance=(
+            settings.memory_consolidation_episode_min_importance
+        ),
         evidence_hot_exchanges=settings.memory_evidence_hot_exchanges,
         recall_token_budget=settings.memory_recall_token_budget,
         intent_gate_enabled=settings.memory_intent_gate_enabled,
@@ -345,8 +349,8 @@ def create_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--token-counter-id",
-        default="gugugaga_estimator_v1",
-        help="Registered request token counter",
+        default="gugugaga_model_estimator",
+        help="Registered request token counter (default: model-aware estimator)",
     )
     parser.add_argument("--hermes-threshold-ratio", type=float, default=0.50)
     parser.add_argument("--hermes-target-ratio", type=float, default=0.20)
@@ -380,7 +384,9 @@ def handle_command(command: str, app: GugugagaApp) -> tuple[bool, str]:
             f"(source={context_status['source']}, locked={context_status['locked']})\n"
             f"Context counter: {context_status['token_counter_id']} "
             f"{context_status['token_counter_version']} / "
-            f"{context_status['context_window_tokens']} tokens\n"
+            f"{context_status['context_window_tokens']} tokens "
+            f"(model={context_status.get('token_counter_model') or 'custom'}, "
+            f"profile={context_status.get('token_counter_profile') or 'custom'})\n"
             f"Successful compactions: {context_status['successful_compactions']}\n"
             f"Last context result: {last}\n"
             f"Reactive recovery used: {context_status['recovery_used']}\n"

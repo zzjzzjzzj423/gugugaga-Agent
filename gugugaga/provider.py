@@ -174,8 +174,19 @@ def is_context_length_error(error: Exception) -> bool:
 
 
 class SiliconFlowProvider(ChatProvider):
-    def __init__(self, settings: Settings, client: Any | None = None):
+    def __init__(
+        self,
+        settings: Settings,
+        client: Any | None = None,
+        *,
+        enable_thinking: bool | None = None,
+        temperature: float | None = None,
+    ):
+        if temperature is not None and not 0.0 <= temperature <= 2.0:
+            raise ValueError("temperature must be between 0 and 2")
         self.settings = settings
+        self.enable_thinking = enable_thinking
+        self.temperature = temperature
         self.client = client or OpenAI(
             api_key=settings.api_key,
             base_url=settings.base_url,
@@ -194,12 +205,21 @@ class SiliconFlowProvider(ChatProvider):
         last_error: Exception | None = None
         for attempt in range(4):
             try:
+                request: dict[str, Any] = {
+                    "model": model or self.settings.model,
+                    "messages": to_openai_messages(messages, system),
+                    "tools": [to_openai_tool(spec) for spec in tools] or None,
+                    "max_tokens": max_tokens,
+                    "stream": False,
+                }
+                if self.enable_thinking is not None:
+                    request["extra_body"] = {
+                        "enable_thinking": self.enable_thinking,
+                    }
+                if self.temperature is not None:
+                    request["temperature"] = self.temperature
                 response = self.client.chat.completions.create(
-                    model=model or self.settings.model,
-                    messages=to_openai_messages(messages, system),
-                    tools=[to_openai_tool(spec) for spec in tools] or None,
-                    max_tokens=max_tokens,
-                    stream=False,
+                    **request,
                 )
                 choice = response.choices[0]
                 message = choice.message

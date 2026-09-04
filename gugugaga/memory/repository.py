@@ -81,6 +81,64 @@ class MemoryRepository:
         if name not in MemoryRepository._columns(connection, table):
             connection.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
 
+    @staticmethod
+    def _allow_multiple_episodes_per_batch(connection: sqlite3.Connection) -> None:
+        """Migrate the v1 one-episode-per-batch uniqueness constraint in place."""
+        has_batch_unique_index = False
+        for index in connection.execute("PRAGMA index_list(episodes)").fetchall():
+            if not int(index[2]):
+                continue
+            index_name = str(index[1]).replace('"', '""')
+            columns = [
+                str(row[2])
+                for row in connection.execute(
+                    f'PRAGMA index_info("{index_name}")'
+                ).fetchall()
+            ]
+            if columns == ["source_batch_id"]:
+                has_batch_unique_index = True
+                break
+        if has_batch_unique_index:
+            connection.execute("DROP TABLE IF EXISTS episodes_v2")
+            connection.execute(
+                """
+                CREATE TABLE episodes_v2 (
+                    id TEXT PRIMARY KEY,
+                    summary TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('active', 'forgotten')),
+                    source_batch_id TEXT NOT NULL,
+                    period_start TEXT NOT NULL,
+                    period_end TEXT NOT NULL,
+                    dedupe_key TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL,
+                    forgotten_at TEXT NULL,
+                    importance REAL NOT NULL DEFAULT 1.0,
+                    last_accessed_at TEXT NULL,
+                    access_count INTEGER NOT NULL DEFAULT 0,
+                    helpful_count INTEGER NOT NULL DEFAULT 0,
+                    irrelevant_count INTEGER NOT NULL DEFAULT 0,
+                    valid_until TEXT NULL,
+                    index_status TEXT NOT NULL DEFAULT 'pending',
+                    embedding_version TEXT NULL
+                )
+                """
+            )
+            columns = (
+                "id, summary, status, source_batch_id, period_start, period_end, "
+                "dedupe_key, created_at, forgotten_at, importance, last_accessed_at, "
+                "access_count, helpful_count, irrelevant_count, valid_until, "
+                "index_status, embedding_version"
+            )
+            connection.execute(
+                f"INSERT INTO episodes_v2 ({columns}) SELECT {columns} FROM episodes"
+            )
+            connection.execute("DROP TABLE episodes")
+            connection.execute("ALTER TABLE episodes_v2 RENAME TO episodes")
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_episodes_source_batch "
+            "ON episodes(source_batch_id)"
+        )
+
     def _initialize(self) -> None:
         with self._lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -146,7 +204,7 @@ class MemoryRepository:
                         id TEXT PRIMARY KEY,
                         summary TEXT NOT NULL,
                         status TEXT NOT NULL CHECK(status IN ('active', 'forgotten')),
-                        source_batch_id TEXT NOT NULL UNIQUE,
+                        source_batch_id TEXT NOT NULL,
                         period_start TEXT NOT NULL,
                         period_end TEXT NOT NULL,
                         dedupe_key TEXT NOT NULL UNIQUE,
@@ -214,6 +272,7 @@ class MemoryRepository:
                     "embedding_version TEXT NULL",
                 ):
                     self._add_column(connection, "episodes", definition)
+                self._allow_multiple_episodes_per_batch(connection)
                 connection.executescript(
                     """
                     CREATE TABLE IF NOT EXISTS memory_sources (
@@ -408,7 +467,7 @@ class MemoryRepository:
                     INSERT INTO memory_fts(memory_key, kind, subject, text, occurred_at)
                     SELECT 'chat:' || id, 'chat', role, content,
                            COALESCE(completed_at, created_at)
-                    FROM chat_log WHERE is_final=1 AND retrieval_state='hot'
+                    FROM chat_log WHERE is_final=1
                     """
                 )
                 connection.execute(
@@ -557,9 +616,6 @@ class MemoryRepository:
                 connection.execute(
                     "UPDATE chat_log SET retrieval_state='cold' WHERE id=?",
                     (memory_id,),
-                )
-                connection.execute(
-                    "DELETE FROM memory_fts WHERE memory_key=?", (key,)
                 )
                 connection.execute(
                     "DELETE FROM memory_embeddings WHERE memory_key=?", (key,)
@@ -943,11 +999,12 @@ class MemoryRepository:
                     added += 1
                 else:
                     duplicate += 1
-            episode_added = 0
-            if result.episode:
+            episodes_added = 0
+            for episode_index, episode in enumerate(result.episodes):
                 episode_id = f"episode_{uuid.uuid4().hex}"
                 period_start = batch.exchanges[0].completed_at
                 period_end = batch.exchanges[-1].completed_at
+                dedupe_key = f"{batch.id}:{episode_index}"
                 connection.execute(
                     """
                     INSERT OR IGNORE INTO episodes
@@ -957,16 +1014,19 @@ class MemoryRepository:
                     """,
                     (
                         episode_id,
-                        result.episode,
+                        episode.summary,
                         batch.id,
                         period_start,
                         period_end,
-                        batch.id,
+                        dedupe_key,
                         utc_now(),
-                        result.episode_importance,
+                        episode.importance,
                     ),
                 )
-                episode_added = connection.execute("SELECT changes()").fetchone()[0]
+                episode_added = int(
+                    connection.execute("SELECT changes()").fetchone()[0]
+                )
+                episodes_added += episode_added
                 if episode_added:
                     self._link_sources(
                         connection,
@@ -1016,7 +1076,7 @@ class MemoryRepository:
             return {
                 "facts_added": added,
                 "facts_duplicate": duplicate,
-                "episodes_added": int(episode_added),
+                "episodes_added": episodes_added,
             }
 
     def release_failed_batch(
@@ -1310,13 +1370,11 @@ class MemoryRepository:
                        0 AS irrelevant_count, NULL AS valid_until, turn_id
                 FROM chat_log AS entry
                 WHERE entry.id=? AND entry.is_final=1
-                  AND entry.retrieval_state='hot'
                   AND EXISTS (
                       SELECT 1 FROM chat_log AS companion
                       WHERE companion.session_id=entry.session_id
                         AND companion.turn_id=entry.turn_id
                         AND companion.is_final=1
-                        AND companion.retrieval_state='hot'
                         AND companion.role<>entry.role
                   )
                 """,
@@ -1355,7 +1413,7 @@ class MemoryRepository:
                     OR EXISTS(SELECT 1 FROM episodes WHERE status='active')
                     OR EXISTS(
                         SELECT 1 FROM chat_log
-                        WHERE is_final=1 AND retrieval_state='hot'
+                        WHERE is_final=1
                         GROUP BY session_id, turn_id
                         HAVING COUNT(DISTINCT role) >= 2
                         LIMIT 1
@@ -1504,7 +1562,7 @@ class MemoryRepository:
                     SELECT id, role, content,
                            COALESCE(completed_at, created_at) AS occurred_at
                     FROM chat_log
-                    WHERE turn_id=? AND is_final=1 AND retrieval_state='hot'
+                    WHERE turn_id=? AND is_final=1
                     ORDER BY id
                     """,
                     (turn_id,),

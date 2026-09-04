@@ -6,6 +6,127 @@ from datetime import datetime, timezone
 from typing import Any, Iterable
 
 
+_EVIDENCE_QUERY = re.compile(
+    r"\b(?:quote|quoted|exact(?:ly)?|verbatim)\b|"
+    r"\bwhat\s+(?:did|does)\s+.+?\s+say\b|"
+    r"原话|逐字|怎么说|说了什么|具体措辞",
+    re.IGNORECASE,
+)
+_EPISODE_QUERY = re.compile(
+    r"\bwhen\b|\bwhat\s+happened\b|\bwhere\s+did\b|"
+    r"\bwhat\s+did\s+.+?\s+do\b|\b(?:went|happened|attended|visited|travelled|traveled)\b|"
+    r"\b(?:plan|plans|planning|planned)\b|"
+    r"何时|什么时候|哪天|发生了什么|发生|去了哪里|去过|参加了|做了什么",
+    re.IGNORECASE,
+)
+_FACT_QUERY = re.compile(
+    r"\bwho\b|\bwhat\s+(?:is|are|was|were)\b|\b(?:is|are|prefer|prefers|preferred)\b|"
+    r"是谁|是什么|喜欢|偏好|身份|职业",
+    re.IGNORECASE,
+)
+_DID_QUERY = re.compile(r"\b(?:did|done)\b|做过|做了", re.IGNORECASE)
+_MIXED_QUERY = re.compile(
+    r"\b(?:would|likely|probably|interested)\b|更可能|可能会|是否会|感兴趣",
+    re.IGNORECASE,
+)
+
+_ROUTE_QUOTAS = {
+    "fact": {"fact": 3, "episode": 1, "chat": 1},
+    "episode": {"fact": 0, "episode": 3, "chat": 2},
+    "evidence": {"fact": 1, "episode": 1, "chat": 3},
+    "mixed": {"fact": 2, "episode": 1, "chat": 2},
+}
+_ROUTE_FALLBACKS = {
+    "fact": ("chat", "episode", "fact"),
+    "episode": ("chat", "fact", "episode"),
+    "evidence": ("episode", "fact", "chat"),
+}
+
+
+def classify_memory_query(query: str) -> str:
+    """Choose the memory layer that best matches the question's evidence need."""
+    value = str(query or "").strip()
+    if _EVIDENCE_QUERY.search(value):
+        return "evidence"
+    if _MIXED_QUERY.search(value):
+        return "mixed"
+    if _EPISODE_QUERY.search(value):
+        return "episode"
+    if _FACT_QUERY.search(value):
+        return "fact"
+    if _DID_QUERY.search(value):
+        return "episode"
+    return "mixed"
+
+
+def _scaled_route_quotas(route: str, limit: int) -> dict[str, int]:
+    base = _ROUTE_QUOTAS.get(route, _ROUTE_QUOTAS["mixed"])
+    if limit == 5:
+        return dict(base)
+    raw = {kind: count * limit / 5.0 for kind, count in base.items()}
+    quotas = {kind: int(value) for kind, value in raw.items()}
+    remaining = limit - sum(quotas.values())
+    order = {kind: index for index, kind in enumerate(base)}
+    fractions = sorted(
+        base,
+        key=lambda kind: (raw[kind] - quotas[kind], -order[kind]),
+        reverse=True,
+    )
+    for kind in fractions[:remaining]:
+        quotas[kind] += 1
+    return quotas
+
+
+def select_routed_candidates(
+    candidates: Iterable[dict[str, Any]], *, route: str, limit: int
+) -> list[dict[str, Any]]:
+    """Prefer one memory layer while filling gaps from its evidence fallbacks."""
+    values = list(candidates)
+    ceiling = max(0, int(limit))
+    if ceiling == 0:
+        return []
+    effective_route = route if route in _ROUTE_QUOTAS else "mixed"
+    quotas = _scaled_route_quotas(effective_route, ceiling)
+    buckets = {
+        kind: [candidate for candidate in values if candidate.get("kind") == kind]
+        for kind in ("fact", "episode", "chat")
+    }
+    selected: list[dict[str, Any]] = []
+    selected_keys: set[str] = set()
+    offsets = {kind: 0 for kind in buckets}
+
+    def take(kind: str, count: int) -> None:
+        bucket = buckets[kind]
+        while count > 0 and offsets[kind] < len(bucket):
+            candidate = bucket[offsets[kind]]
+            offsets[kind] += 1
+            memory_key = str(candidate.get("memory_key") or "")
+            if not memory_key or memory_key in selected_keys:
+                continue
+            selected.append(candidate)
+            selected_keys.add(memory_key)
+            count -= 1
+
+    for kind, quota in quotas.items():
+        take(kind, quota)
+
+    if len(selected) < ceiling and effective_route == "mixed":
+        for candidate in values:
+            memory_key = str(candidate.get("memory_key") or "")
+            if not memory_key or memory_key in selected_keys:
+                continue
+            selected.append(candidate)
+            selected_keys.add(memory_key)
+            if len(selected) >= ceiling:
+                break
+    elif len(selected) < ceiling:
+        for kind in _ROUTE_FALLBACKS[effective_route]:
+            take(kind, ceiling - len(selected))
+            if len(selected) >= ceiling:
+                break
+    return selected[:ceiling]
+
+
 def _tokens(value: str) -> set[str]:
     return set(re.findall(r"[a-z0-9_]{2,}|[\u3400-\u9fff]", value.casefold()))
 

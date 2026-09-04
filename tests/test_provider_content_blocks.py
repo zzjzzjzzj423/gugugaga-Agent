@@ -202,3 +202,31 @@ def test_internal_context_metadata_is_not_sent_to_openai(tmp_path):
         "role": "user",
         "content": "hello",
     }
+
+
+def test_create_can_disable_provider_thinking_mode(tmp_path):
+    completion = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                finish_reason="stop",
+                message=SimpleNamespace(content='{"ok":true}', tool_calls=[]),
+            )
+        ]
+    )
+    client = ScriptedOpenAIClient(completion)
+    provider = SiliconFlowProvider(
+        settings(tmp_path),
+        client=client,
+        enable_thinking=False,
+        temperature=0,
+    )
+
+    provider.create(
+        system="Return JSON.",
+        messages=[{"role": "user", "content": "status"}],
+        tools=[],
+        max_tokens=20,
+    )
+
+    assert client.requests[0]["extra_body"] == {"enable_thinking": False}
+    assert client.requests[0]["temperature"] == 0
