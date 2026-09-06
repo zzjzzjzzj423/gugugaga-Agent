@@ -17,6 +17,7 @@ from .retrieval import (
     rerank_candidates,
     rrf_fuse,
     select_routed_candidates,
+    trace_candidates,
 )
 from .validation import (
     MemoryValidationError,
@@ -636,8 +637,45 @@ class MemoryService:
         """Compatibility wrapper for callers that only need rendered memory."""
         return self.recall_for_turn(query).content
 
-    def recall_for_turn(self, query: str) -> RecallResult:
+    def recall_for_turn(
+        self, query: str, *, trace: dict[str, Any] | None = None
+    ) -> RecallResult:
         """Run Pre-Gate, hybrid retrieval, reranking, and Post-Gate once."""
+        if trace is not None:
+            trace.clear()
+            trace.update({
+                "schema_version": 1,
+                "query": str(query or "").strip(),
+                "config": {
+                    "evidence_hot_exchanges": self.evidence_hot_exchanges,
+                    "embedding_model": self.embedding_model,
+                    "candidate_limit": self.retrieval_candidate_limit,
+                    "final_limit": self.retrieval_final_limit,
+                    "min_score": self.retrieval_min_score,
+                    "recall_token_budget": self.recall_token_budget,
+                },
+                "gate": {},
+                "stages": {},
+            })
+
+        def finish(result: RecallResult) -> RecallResult:
+            if trace is not None:
+                trace["final"] = {
+                    "decision": result.decision,
+                    "reason": result.reason,
+                    "strategy": result.strategy,
+                    "route": result.route,
+                    "route_source": result.route_source,
+                    "route_confidence": result.route_confidence,
+                    "hit_count": result.hit_count,
+                    "kinds": list(result.kinds),
+                    "memory_keys": list(result.memory_keys),
+                    "items": [item.as_dict() for item in result.items],
+                    "candidates": trace["stages"].get("render", {}).get("candidates", []),
+                    "content": result.content,
+                }
+            return result
+
         if not self.enabled or self.recall_token_budget <= 0:
             result = RecallResult(reason="memory_disabled")
             notify(
@@ -651,7 +689,7 @@ class MemoryService:
                     "kinds": [],
                 },
             )
-            return result
+            return finish(result)
         cleaned_query = str(query or "").strip()
         if not cleaned_query:
             result = RecallResult(reason="empty_query")
@@ -666,7 +704,7 @@ class MemoryService:
                     "kinds": [],
                 },
             )
-            return result
+            return finish(result)
         route = classify_memory_query(cleaned_query)
         route_source = "rule"
         route_confidence: float | None = None
@@ -683,7 +721,7 @@ class MemoryService:
                     "kinds": [],
                 },
             )
-            return result
+            return finish(result)
         direct_reference = bool(_DIRECT_MEMORY_REFERENCE.search(cleaned_query))
         if direct_reference:
             route_source = "hard_rule"
@@ -708,6 +746,13 @@ class MemoryService:
                 cleaned_query,
                 fallback_route=route,
             )
+            if trace is not None:
+                trace["gate"] = {
+                    "should_retrieve": should_retrieve,
+                    "route": route,
+                    "route_source": route_source,
+                    "route_confidence": route_confidence,
+                }
             if not should_retrieve:
                 result = RecallResult(
                     reason="intent_gate_skip",
@@ -726,12 +771,22 @@ class MemoryService:
                         "kinds": [],
                     },
                 )
-                return result
+                return finish(result)
+        if trace is not None:
+            trace["gate"] = {
+                "should_retrieve": True,
+                "direct_reference": direct_reference,
+                "route": route,
+                "route_source": route_source,
+                "route_confidence": route_confidence,
+            }
         try:
             bm25 = self.repository.bm25_candidates(
                 cleaned_query,
                 limit=self.retrieval_candidate_limit,
             )
+            if trace is not None:
+                trace["stages"]["bm25"] = {"candidates": trace_candidates(bm25)}
             vector: list[dict[str, Any]] = []
             if self.embedding_model:
                 try:
@@ -745,6 +800,8 @@ class MemoryService:
                                 model=self.embedding_model,
                             )
                 except Exception as error:
+                    if trace is not None:
+                        trace["vector_error"] = str(error)[:120] or "embedding_failed"
                     notify(
                         "memory",
                         {
@@ -753,8 +810,14 @@ class MemoryService:
                             "error_code": str(error)[:120] or "embedding_failed",
                         },
                     )
+            if trace is not None:
+                trace["stages"]["vector"] = {"candidates": trace_candidates(vector)}
             fused = rrf_fuse(bm25, vector)
+            if trace is not None:
+                trace["stages"]["rrf"] = {"candidates": trace_candidates(fused)}
             fused = self.repository.expand_chat_candidates(fused)
+            if trace is not None:
+                trace["stages"]["expanded"] = {"candidates": trace_candidates(fused)}
             strategy = (
                 "hybrid" if bm25 and vector else "vector" if vector else "bm25" if bm25 else "none"
             )
@@ -774,15 +837,19 @@ class MemoryService:
                     )
                 ]
                 strategy = "direct_recent"
+                if trace is not None:
+                    trace["stages"]["recent_fallback"] = {"candidates": trace_candidates(fused)}
             ranked = rerank_candidates(
                 fused,
                 limit=max(self.retrieval_final_limit, len(fused)),
                 min_score=self.retrieval_min_score,
+                trace=trace["stages"].setdefault("rerank", {}) if trace is not None else None,
             )
             selected = select_routed_candidates(
                 ranked,
                 route=route,
                 limit=self.retrieval_final_limit,
+                trace=trace["stages"].setdefault("route", {}) if trace is not None else None,
             )
             if not selected:
                 result = RecallResult(reason="no_relevant_memory")
@@ -797,15 +864,35 @@ class MemoryService:
                         "kinds": [],
                     },
                 )
-                return result
+                return finish(result)
             # Render only complete candidates when possible. The character
             # ceiling is deterministic because tokenization is outside this boundary.
             character_budget = self.recall_token_budget * 4
             rendered = render_candidates(selected)
+            if trace is not None:
+                trace["stages"]["render"] = {
+                    "character_budget": character_budget,
+                    "before_characters": len(rendered),
+                    "removed": [],
+                }
             while len(selected) > 1 and len(rendered) > character_budget:
-                selected.pop()
+                removed = selected.pop()
+                if trace is not None:
+                    trace["stages"]["render"]["removed"].append({
+                        "candidate": trace_candidates([removed], start_rank=len(selected) + 1)[0],
+                        "reason": "character_budget",
+                    })
                 rendered = render_candidates(selected)
+            if trace is not None:
+                trace["stages"]["render"].update({
+                    "candidates": trace_candidates(selected),
+                    "before_slice_characters": len(rendered),
+                    "truncated": len(rendered) > character_budget,
+                    "truncated_characters": max(0, len(rendered) - character_budget),
+                })
             rendered = rendered[:character_budget]
+            if trace is not None:
+                trace["stages"]["render"]["content"] = rendered
             kind_names = {"fact": "semantic", "episode": "episodic", "chat": "evidence"}
             kinds = tuple(
                 dict.fromkeys(
@@ -888,8 +975,10 @@ class MemoryService:
                     "route_confidence": result.route_confidence,
                 },
             )
-            return result
-        except Exception:
+            return finish(result)
+        except Exception as error:
+            if trace is not None:
+                trace["error"] = {"type": type(error).__name__, "message": str(error)[:200]}
             notify(
                 "memory",
                 {
@@ -902,7 +991,7 @@ class MemoryService:
                 },
             )
             notify("memory", {"action": "recall", "status": "failed"})
-            return RecallResult(reason="retrieval_failed")
+            return finish(RecallResult(reason="retrieval_failed"))
 
     def update_fact(self, fact_id: str, content: Any) -> SaveNoteResult:
         existing = self.repository.get_memory(fact_id)

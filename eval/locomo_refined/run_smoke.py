@@ -251,6 +251,7 @@ def main(argv: list[str] | None = None) -> int:
         episode_min_importance=(
             settings.memory_consolidation_episode_min_importance
         ),
+        evidence_hot_exchanges=settings.memory_evidence_hot_exchanges,
         recall_token_budget=settings.memory_recall_token_budget,
         embedding_model=settings.memory_embedding_model,
         retrieval_candidate_limit=settings.memory_retrieval_candidate_limit,
@@ -370,6 +371,7 @@ def main(argv: list[str] | None = None) -> int:
                 settings.memory_consolidation_episode_min_importance
             ),
             "max_episodes_per_batch": settings.memory_consolidation_max_episodes,
+            "evidence_hot_exchanges": settings.memory_evidence_hot_exchanges,
             "max_questions": args.max_questions,
             "questions_per_category": args.questions_per_category,
             "include_image_context": not args.exclude_image_context,
