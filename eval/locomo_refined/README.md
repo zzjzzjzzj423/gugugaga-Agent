@@ -1,5 +1,10 @@
 # Gugugaga LoCoMo-Refined smoke benchmark
 
+For the new frozen 200-question Top5/Top10 and budget experiment, follow
+[`TOPK_PROTOCOL.md`](TOPK_PROTOCOL.md). Its dedicated runner performs offline
+replay only and requires an explicit frozen question order; it does not invoke
+the smoke runner's sampling, memory rebuilds, or answer calls.
+
 The frozen 10-conversation, 200-question Memory/No-Memory/Gold-Evidence-Oracle
 evaluation and failure analysis is documented in
 [`REPORT_200_ORACLE.md`](REPORT_200_ORACLE.md).

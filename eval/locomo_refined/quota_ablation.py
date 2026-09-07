@@ -16,11 +16,13 @@ SelectionPolicy = Literal["routed", "no_type_quota"]
 
 
 def replay_selection(
-    source_trace: dict[str, Any], *, policy: SelectionPolicy = "routed"
+    source_trace: dict[str, Any], *, policy: SelectionPolicy = "routed",
+    final_limit: int | None = None, recall_token_budget: int | None = None,
 ) -> dict[str, Any]:
     """Return a new trace using the saved rerank order and original render budget.
 
-    The routed policy must reproduce the saved final content exactly. The
+    With unchanged settings the routed policy must reproduce the saved final
+    content exactly. Overrides change only final selection and rendering. The
     no_type_quota policy takes the first K already-reranked candidates; it leaves
     rerank deduplication and subject diversity intact. No gold evidence is used.
     """
@@ -28,12 +30,27 @@ def replay_selection(
         raise ValueError(f"unsupported selection policy: {policy}")
     trace = deepcopy(source_trace)
     config = trace["config"]
-    limit = int(config["final_limit"])
-    token_budget = int(config["recall_token_budget"])
+    original_limit = int(config["final_limit"])
+    original_budget = int(config["recall_token_budget"])
+    limit = original_limit if final_limit is None else final_limit
+    token_budget = original_budget if recall_token_budget is None else recall_token_budget
+    if type(limit) is not int or type(token_budget) is not int:
+        raise ValueError("limit and token budget must be integers")
     if limit < 1 or token_budget < 1:
         raise ValueError("selection replay requires positive limit and token budget")
+    if limit > int(config.get("candidate_limit", 20)):
+        raise ValueError("final limit must not exceed candidate limit")
+    config.update(final_limit=limit, recall_token_budget=token_budget)
+    # A closed pre-gate has no rerank pool. Preserve the original skip instead
+    # of inventing candidates or calling the router again.
+    if "rerank" not in trace["stages"]:
+        if trace["final"]["decision"] == "skip" and not trace["final"]["content"]:
+            if trace.get("error") or trace.get("vector_error"):
+                raise ValueError("cannot replay a failed retrieval")
+            return trace
+        raise ValueError("frozen trace is missing rerank candidates")
     ranked = trace["stages"]["rerank"]["candidates"]
-    route = trace["final"]["route"]
+    route = trace.get("gate", {}).get("route", trace["final"]["route"])
     route_trace: dict[str, Any] = {"selection_policy": policy}
     if policy == "routed":
         selected = select_routed_candidates(
@@ -106,6 +123,7 @@ def replay_selection(
         "candidates": trace_candidates(selected),
         "content": content,
     })
-    if policy == "routed" and content != source_trace["final"]["content"]:
+    if (policy == "routed" and limit == original_limit and token_budget == original_budget
+            and content != source_trace["final"]["content"]):
         raise ValueError("routed selection does not reproduce the frozen final content")
     return trace

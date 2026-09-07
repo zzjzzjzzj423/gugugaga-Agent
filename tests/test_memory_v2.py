@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from collections import Counter
+
+import pytest
 
 from gugugaga.__main__ import build_runtime, handle_command
 from gugugaga.config import Settings
@@ -502,6 +505,63 @@ def test_successful_consolidation_reconciles_evidence_hot_window(tmp_path):
     assert status["evidence_hot"] == 1
     assert status["evidence_cold"] == 1
     assert status["evidence_hot_limit"] == 1
+
+    # Reopening an old workspace under the new default must restore cold
+    # evidence and replace its pending vector deletion with an upsert.
+    service.close()
+    restored = MemoryService(
+        tmp_path / "state.db", ScriptedProvider(), start_worker=False
+    )
+    try:
+        assert restored.status()["evidence_hot"] == 2
+        assert restored.status()["evidence_cold"] == 0
+        with sqlite3.connect(tmp_path / "state.db") as connection:
+            jobs = connection.execute(
+                "SELECT operation, status FROM memory_index_outbox WHERE memory_kind='chat'"
+            ).fetchall()
+        assert jobs == [("upsert", "pending")] * 4
+    finally:
+        restored.close()
+
+
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        ("Who is Alex?", {"fact": 6, "episode": 2, "chat": 2}),
+        ("When did Alex travel?", {"episode": 6, "chat": 4}),
+        ("Quote Alex verbatim", {"fact": 2, "episode": 2, "chat": 6}),
+        ("What would Alex likely enjoy?", {"fact": 4, "episode": 2, "chat": 4}),
+    ],
+)
+def test_default_recall_injects_top_ten_with_scaled_route_quotas(tmp_path, monkeypatch, query, expected):
+    service = MemoryService(
+        tmp_path / "state.db", ScriptedProvider(),
+        intent_gate_enabled=False, start_worker=False,
+    )
+    candidates = [
+        {
+            "memory_key": f"{kind}:{index}",
+            "kind": kind,
+            "subject": f"subject-{index}",
+            "text": f"{kind} detail unique{index}",
+            "occurred_at": "2026-09-01T00:00:00+00:00",
+            "importance": 1.0,
+        }
+        for kind, count in (("fact", 6), ("episode", 6), ("chat", 8))
+        for index in range(count)
+    ]
+    monkeypatch.setattr(
+        service.repository, "bm25_candidates",
+        lambda query, *, limit: candidates[:limit],
+    )
+    try:
+        result = service.recall_for_turn(query)
+        assert result.should_inject
+        assert result.hit_count == 10
+        assert Counter(item.kind for item in result.items) == expected
+        assert result.content.endswith("</untrusted_memory>")
+    finally:
+        service.close()
 
 
 def test_consolidation_redacts_credentials_before_provider(tmp_path):

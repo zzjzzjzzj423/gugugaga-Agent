@@ -72,7 +72,7 @@ Main Agent 在 Team System 中使用固定协议身份 `lead`。`Lead`、`Leader
 flowchart TB
     subgraph TURN["Main Agent · Foreground Turn"]
         direction LR
-        I(["用户输入"]) --> R["Memory<br/>Retrieval"]
+        I(["用户输入"]) --> R["Memory Retrieval<br/>混合检索 · Top 10 · 预算 2000"]
         R --> C["Working<br/>Context"]
         C --> G{"Compression<br/>Gate"}
         G --> A["LLM Agent"]
@@ -84,7 +84,7 @@ flowchart TB
         direction LR
         E[("Conversation<br/>Evidence")]
         MC["Consolidation<br/>与生命周期"]
-        LM[("Semantic · Episodic<br/>Hot Evidence · Index")]
+        LM[("Semantic · Episodic · Evidence<br/>FTS 全部原文 · Vector 热窗口 10000")]
         E --> MC --> LM
     end
 
@@ -363,7 +363,20 @@ CC、Hermes 和 Pi 的自动触发都使用同一个近似 Token 计数器。该
 不等价于模型官方 tokenizer；需要精确计数时，可通过 `TokenCounterRegistry`
 注册 Provider 对应的 tokenizer 实现。
 
+执行过程中的策略对比可使用 [Context Benchmark](eval/context_bench/README.md)：
+它在独立工作副本中运行相同的本地编码任务，记录逐轮验收、Token 用量、耗时、
+压缩和重复操作候选，区分离线流程演练与真实模型实验。当前示例用于验证流程，
+正式比较前需校准任务长度，确保实际触发要研究的压缩路径。
+公开任务可使用 [Terminal-Bench 2.1 入口](eval/context_bench/TERMINAL_BENCH.md)，
+通过 Harbor 在隔离容器执行，并由官方评分器验收。
+
 ## Memory 架构
+
+默认检索配置采用当前冻结 200 题实验中表现最好的 R1 组合：Fact/Episode + 原文混合检索、现有类型配额、Top 10、召回预算 2000，BM25/Vector 各取 Top 20。原文热窗口从 30 扩大到 10000 个已整合 Exchange，覆盖当前实验全部历史原文；超过该窗口仍会转 Cold，并非无限保留向量。启用向量检索需配置 `BAAI/bge-m3`。
+
+实验使用 `Qwen/Qwen3.6-35B-A3B`；同批新 Top 5 基线与 Top 10 的 Token F1 为 34.79 / 38.57，回答输入 Token 增加 76.96%。Top 10 的预算从 2000 提至 16000 未改变本批最终上下文，因此默认预算保持 2000。参见[冻结实验报告](eval/locomo_refined/runs/topk-answers-20260906-step4/REPORT.md)；该结果仅针对这批数据，不等同于其他模型或用户数据的保证。
+
+启动时会将窗口内已有 Cold Evidence 恢复为 Hot，并排队补建缺失向量；后台索引完成后获得相应语义检索覆盖。显式环境变量仍可覆盖默认窗口与 Top K。
 
 ### 4. 召回、RRF 与反馈闭环
 
@@ -371,23 +384,34 @@ CC、Hermes 和 Pi 的自动触发都使用同一个近似 Token 计数器。该
 %%{init: {"theme":"base","themeVariables":{"fontFamily":"Inter, Segoe UI, Microsoft YaHei","lineColor":"#94A3B8","clusterBkg":"#F8FAFC","clusterBorder":"#E2E8F0"}}}%%
 flowchart TB
     Q(["用户输入"]) --> P{"Hard Pre-Gate"}
-    P -->|"空输入 / 寒暄 / 关闭"| SKIP["跳过召回"]
-    P -->|"直接引用历史"| H["Hybrid Recall"]
-    P -->|"其他输入"| IG{"LLM Intent Gate"}
+    P -->|"关闭 / 预算 0 / 空输入 / 寒暄"| SKIP["跳过召回"]
+    P -->|"直接引用历史 · 规则路由"| H["Hybrid Recall"]
+    P -->|"其他输入"| IG{"LLM Intent & Route Gate"}
     IG -->|"高置信度 skip"| SKIP
-    IG -->|"retrieve + route"| H
-    IG -->|"低置信度 / fail-open<br/>规则路由兜底"| H
+    IG -->|"retrieve + route<br/>异常时规则兜底"| H
 
-    C[("Active Facts<br/>Active Episodes<br/>Hot Evidence")] --> H
-    CE[("Cold Evidence<br/>lexical fallback")] --> B
-    H --> B["FTS5 · BM25"]
-    H --> V["Vector · optional"]
-    B --> R["RRF Fusion"]
-    V --> R
-    R --> RR["手写重排<br/>相关性 · 重要度 · 反馈 · 时间 · 频率"]
-    RR --> S["去重 · 多样性<br/>路由配额 · Top K · Token Budget"]
-    S --> WC["Working Context"]
-    S --> RI[("Recall Impression")]
+    subgraph SEARCH["候选检索与证据展开"]
+        C[("Active Facts · Episodes<br/>Hot 原文：最近 10000 个已整合 Exchange<br/>未整合原文也保持 Hot")]
+        CE[("Cold 原文<br/>超出热窗口的已整合 Exchange")]
+        B["FTS5 / BM25<br/>Top 20"]
+        V["Vector · Top 20<br/>当前配置 bge-m3"]
+        C --> B
+        C --> V
+        CE -->|"仅词法检索"| B
+        B --> R["RRF 名次融合"]
+        V --> R
+        R --> X["按 Exchange 合并原文命中<br/>展开 user / assistant 双方消息"]
+    end
+    H --> B
+    H --> V
+
+    X --> RR["手写重排<br/>相关性 · 重要度 · 反馈 · 时间 · 频率"]
+    RR --> D["最低分 0.20<br/>词面 / 语义去重 · subject 多样性"]
+    D --> S["按路由配额选 Top 10<br/>Fact / Episode / Evidence / Mixed"]
+    H -.->|"传递 route"| S
+    S --> BUD["预算 2000 × 4 = 8000 字符<br/>先从末尾删整条，单条仍超限才截断"]
+    BUD --> WC["untrusted_memory<br/>注入 Working Context · 最多 10 条"]
+    BUD --> RI[("实际注入结果<br/>Recall Impression")]
     RI -->|"Web 👍 / 👎<br/>仅 Fact / Episode"| FB["反馈计数"]
     FB -.->|"影响后续重排"| RR
 
@@ -397,12 +421,15 @@ flowchart TB
     classDef memory fill:#FFF7ED,stroke:#FB923C,color:#9A3412,stroke-width:1.5px;
     classDef success fill:#ECFDF5,stroke:#34D399,color:#065F46,stroke-width:1.5px;
 
-    class Q input;
+    class Q,SKIP input;
     class P,IG decision;
-    class H,B,V,R,RR,S process;
-    class C,RI memory;
+    class H,B,V,R,X,RR,D,S,BUD process;
+    class C,CE,RI memory;
     class WC,FB success;
+    style SEARCH fill:#FAFAFF,stroke:#C7D2FE,stroke-width:1px
 ```
+
+图中 Top 10 是预算裁剪前的条数上限，最终注入可能不足 10 条。可选 `trace` 会记录 Gate、BM25、Vector、RRF、Exchange 展开、重排、配额与预算阶段的候选、分数及移除原因，用于定位证据在哪一步丢失。
 
 召回语料包含 active Fact、active Episode 和 Conversation Evidence。Hot Evidence 同时进入 FTS 与向量索引；Cold Evidence 仍保留在 FTS 中作为低成本原文兜底，但从向量索引移除。
 
@@ -429,7 +456,7 @@ final_score = 0.70 × relevance
 feedback = (helpful + 1) / (helpful + irrelevant + 2)
 ```
 
-最终结果还要经过最低分、词面/向量语义去重和同 subject 多样性，再根据 Gate 给出的路由分配 Top 5：Fact 为 `3 Fact + 1 Episode + 1 Evidence`，Episode 为 `3 Episode + 2 Evidence`，Evidence 为 `1 Fact + 1 Episode + 3 Evidence`，Mixed 为 `2 Fact + 1 Episode + 2 Evidence`。某层候选不足时从其他已通过相关性阈值的候选补位，之后再执行 Token Budget 限制并以 `<untrusted_memory>` 注入 Working Context。
+最终结果还要经过最低分、词面/向量语义去重和同 subject 多样性，再根据 Gate 给出的路由分配默认 Top 10：Fact 为 `6 Fact + 2 Episode + 2 Evidence`，Episode 为 `6 Episode + 4 Evidence`，Evidence 为 `2 Fact + 2 Episode + 6 Evidence`，Mixed 为 `4 Fact + 2 Episode + 4 Evidence`。修改 Top K 时按原 Top 5 比例缩放配额。某层候选不足时从其他已通过相关性阈值的候选补位，之后按 `Token Budget × 4` 的字符上限执行预算限制：超限时从选择结果末尾整条删除，剩余单条仍超限才截断；再以 `<untrusted_memory>` 注入 Working Context。
 
 Web 会为实际注入的结果保存 Recall Impression，记录查询、来源排名、RRF 相关性、最终分数和位置。用户只能对这次真实召回中的 active Fact/Episode 点 👍 或 👎；Conversation Evidence 不开放反馈。反馈可幂等重放，也可以从 helpful 切换为 irrelevant，计数在同一事务中增减，并影响下一次重排。这一约束可防止前端伪造任意 Memory ID 来污染训练信号。
 
@@ -438,25 +465,29 @@ Web 会为实际注入的结果保存 Recall Impression，记录查询、来源�
 ```mermaid
 %%{init: {"theme":"base","themeVariables":{"fontFamily":"Inter, Segoe UI, Microsoft YaHei","lineColor":"#94A3B8","clusterBkg":"#F8FAFC","clusterBorder":"#E2E8F0"}}}%%
 flowchart TB
-    E[("完整 Exchange<br/>Hot + Pending")] --> C["原子 Claim + Lease<br/>默认 6 个 Exchange"]
+    E[("完整 Exchange<br/>Hot + Pending")] --> C["原子 Claim + Lease<br/>默认每批 6 个 Exchange"]
     C --> D["凭据遮蔽"]
     D --> L["Consolidation LLM"]
     L --> V{"严格 JSON<br/>长期价值校验"}
-
-    V -->|"成功"| TX["SQLite Transaction"]
-    TX --> M[("Facts · Episodes 0–5<br/>Sources · Audit")]
-    TX --> LC["Evidence Lifecycle"]
-    LC --> HOT["最近 N 个已整合 Exchange<br/>Hot · 可召回"]
-    LC --> COLD[("更早 Exchange<br/>Cold · FTS 兜底")]
+    V -->|"成功"| TX["SQLite 事务提交<br/>记忆 · 来源 · 审计 · 整合状态"]
+    TX --> M[("Facts 0–10 · Episodes 0–5")]
+    TX --> LC["Evidence 生命周期校准"]
+    START["服务启动<br/>按当前热窗口校准历史记录"] --> LC
+    LC -->|"窗口内 Cold 恢复 Hot"| HOT[("Hot 原文<br/>最近 10000 个已整合 Exchange<br/>未整合 / 未完整原文保持 Hot")]
+    LC -->|"超出窗口且已整合"| COLD[("Cold 原文<br/>保留原文和 FTS · 删除向量")]
 
     V -->|"失败 / 超时"| RP["Retry Pending<br/>60s → 300s → 1800s → 7200s → 86400s"]
     RP -.-> C
 
-    M --> FTS["FTS5 · 同步"]
+    E -->|"原文先进入检索"| FTS["FTS5 · 同步<br/>Facts / Episodes / Hot + Cold 原文"]
+    E -->|"原文向量入队"| OUT["Vector Outbox · 异步任务"]
+    M --> FTS
+    M -->|"upsert"| OUT
     HOT --> FTS
+    HOT -->|"恢复时重新排队建向量"| OUT
     COLD --> FTS
-    M --> OUT["Vector Outbox · 异步"]
-    HOT --> OUT
+    COLD -->|"delete"| OUT
+    OUT --> IDX[("向量索引 · 当前配置 bge-m3<br/>Active Facts / Episodes / Hot 原文")]
 
     classDef source fill:#FFF7ED,stroke:#FB923C,color:#9A3412,stroke-width:1.5px;
     classDef process fill:#EEF2FF,stroke:#818CF8,color:#312E81,stroke-width:1.5px;
@@ -465,9 +496,9 @@ flowchart TB
     classDef failure fill:#FEF2F2,stroke:#F87171,color:#991B1B,stroke-width:1.5px;
 
     class E,M,COLD source;
-    class C,D,L,LC,FTS,OUT process;
+    class C,D,L,START,LC,FTS,OUT process;
     class V decision;
-    class TX,HOT success;
+    class TX,HOT,IDX success;
     class RP failure;
 ```
 
@@ -475,7 +506,7 @@ flowchart TB
 
 送入模型前先遮蔽凭据。Consolidation LLM 只能输出受约束 JSON；验证层限制最大 Fact 数量、最低重要度和允许保存的长期信息类型，当前功能请求、调试状态、工具输出、临时模型选择等不会自动变成长期用户偏好。
 
-成功时，Fact/Episode、来源关系、审计记录、Batch 状态和 Exchange 状态在 SQLite 事务中提交。随后 Evidence Lifecycle 保留最近 N 个已整合 Exchange 为 Hot（默认 30），更早的转为 Cold。未整合或未完整的 Evidence 始终保持 Hot，避免在成功沉淀前失去原始证据。
+成功时，Fact/Episode、来源关系、审计记录、Batch 状态和 Exchange 状态在 SQLite 事务中提交。随后 Evidence Lifecycle 保留最近 N 个已整合 Exchange 为 Hot（默认 10000），更早的转为 Cold。未整合或未完整的 Evidence 始终保持 Hot，避免在成功沉淀前失去原始证据。
 
 FTS5 通过数据库路径同步更新；可重建的向量索引通过 Outbox 异步更新，按 5 秒、30 秒、300 秒最多重试 3 次。Consolidation 失败或超时不会丢弃 Exchange，而是回到 Retry Pending，按 60 秒、300 秒、1800 秒、7200 秒、86400 秒退避。Web 中的 `Retry pending · N` 表示当前仍有等待重试或等待凑批的 pending 记录，不代表主对话已经失败。
 
@@ -525,8 +556,9 @@ Web 可以在未配置模型时启动。点击左下角配置按钮填写主模�
 
 ```powershell
 $env:SILICONFLOW_API_KEY = "your-key"
-$env:SILICONFLOW_MODEL = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
-$env:GUGUGAGA_MEMORY_CONSOLIDATION_MODEL = "Qwen/Qwen3-8B"
+$env:SILICONFLOW_MODEL = "Qwen/Qwen3.6-35B-A3B"
+$env:GUGUGAGA_MEMORY_CONSOLIDATION_MODEL = "Qwen/Qwen3.6-35B-A3B"
+$env:GUGUGAGA_MEMORY_INTENT_GATE_MODEL = "Qwen/Qwen3.6-35B-A3B"
 $env:GUGUGAGA_MEMORY_EMBEDDING_MODEL = "BAAI/bge-m3"
 $env:TAVILY_API_KEY = "tvly-your-key"
 
@@ -602,14 +634,14 @@ $workspaceDir = "C:\path\to\your-workspace"
 | `GUGUGAGA_MEMORY_CONSOLIDATION_MIN_IMPORTANCE` | `0.8` | Fact 最低重要度 |
 | `GUGUGAGA_MEMORY_CONSOLIDATION_MAX_EPISODES` | `5` | 单批最大 Episode 候选数 |
 | `GUGUGAGA_MEMORY_CONSOLIDATION_EPISODE_MIN_IMPORTANCE` | `0.6` | Episode 独立最低重要度 |
-| `GUGUGAGA_MEMORY_EVIDENCE_HOT_EXCHANGES` | `30` | 保留向量索引的最近已整合 Exchange 数量；更早 Evidence 仍支持词法召回 |
+| `GUGUGAGA_MEMORY_EVIDENCE_HOT_EXCHANGES` | `10000` | 保留向量索引的最近已整合 Exchange 数量；更早 Evidence 仍支持词法召回 |
 | `GUGUGAGA_MEMORY_RECALL_TOKENS` | `2000` | 单次召回 Token 预算 |
 | `GUGUGAGA_MEMORY_INTENT_GATE_ENABLED` | `true` | 是否启用召回前 LLM Intent Gate |
 | `GUGUGAGA_MEMORY_INTENT_GATE_MODEL` | 整理模型/主模型 | Intent Gate 专用模型 |
 | `GUGUGAGA_MEMORY_INTENT_GATE_TIMEOUT` | `5` | Intent Gate 超时（秒） |
 | `GUGUGAGA_MEMORY_EMBEDDING_MODEL` | — | 可选记忆向量模型 |
 | `GUGUGAGA_MEMORY_RETRIEVAL_CANDIDATES` | `20` | 每路候选数量 |
-| `GUGUGAGA_MEMORY_RETRIEVAL_TOP_K` | `5` | 最终最多注入单元数 |
+| `GUGUGAGA_MEMORY_RETRIEVAL_TOP_K` | `10` | 最终最多注入单元数 |
 | `GUGUGAGA_MEMORY_RETRIEVAL_MIN_SCORE` | `0.20` | 重排最低分阈值 |
 
 ## 本地数据

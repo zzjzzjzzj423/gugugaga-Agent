@@ -563,7 +563,7 @@ class MemoryRepository:
                 ),
             )
 
-    def reconcile_evidence_lifecycle(self, *, hot_exchanges: int = 30) -> dict[str, int]:
+    def reconcile_evidence_lifecycle(self, *, hot_exchanges: int = 10_000) -> dict[str, int]:
         """Keep recent consolidated Exchanges searchable and archive older evidence."""
         limit = int(hot_exchanges)
         if not 0 <= limit <= 10_000:

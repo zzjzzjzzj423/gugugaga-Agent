@@ -966,7 +966,7 @@ class DashboardApplication:
         self.configuration = WebConfiguration(self.workspace)
         self.configuration.apply_environment()
         evidence_hot_exchanges = int(
-            os.getenv("GUGUGAGA_MEMORY_EVIDENCE_HOT_EXCHANGES", "30")
+            os.getenv("GUGUGAGA_MEMORY_EVIDENCE_HOT_EXCHANGES", "10000")
         )
         if not 0 <= evidence_hot_exchanges <= 10_000:
             raise ValueError(
