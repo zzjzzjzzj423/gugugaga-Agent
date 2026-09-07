@@ -2,8 +2,182 @@ from __future__ import annotations
 
 import math
 import re
+from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any, Iterable
+
+
+_EVIDENCE_QUERY = re.compile(
+    r"\b(?:quote|quoted|exact(?:ly)?|verbatim)\b|"
+    r"\bwhat\s+(?:did|does)\s+.+?\s+say\b|"
+    r"原话|逐字|怎么说|说了什么|具体措辞",
+    re.IGNORECASE,
+)
+_EPISODE_QUERY = re.compile(
+    r"\bwhen\b|\bwhat\s+happened\b|\bwhere\s+did\b|"
+    r"\bwhat\s+did\s+.+?\s+do\b|\b(?:went|happened|attended|visited|travelled|traveled)\b|"
+    r"\b(?:plan|plans|planning|planned)\b|"
+    r"何时|什么时候|哪天|发生了什么|发生|去了哪里|去过|参加了|做了什么",
+    re.IGNORECASE,
+)
+_FACT_QUERY = re.compile(
+    r"\bwho\b|\bwhat\s+(?:is|are|was|were)\b|\b(?:is|are|prefer|prefers|preferred)\b|"
+    r"是谁|是什么|喜欢|偏好|身份|职业",
+    re.IGNORECASE,
+)
+_DID_QUERY = re.compile(r"\b(?:did|done)\b|做过|做了", re.IGNORECASE)
+_MIXED_QUERY = re.compile(
+    r"\b(?:would|likely|probably|interested)\b|更可能|可能会|是否会|感兴趣",
+    re.IGNORECASE,
+)
+
+_ROUTE_QUOTAS = {
+    "fact": {"fact": 3, "episode": 1, "chat": 1},
+    "episode": {"fact": 0, "episode": 3, "chat": 2},
+    "evidence": {"fact": 1, "episode": 1, "chat": 3},
+    "mixed": {"fact": 2, "episode": 1, "chat": 2},
+}
+_ROUTE_FALLBACKS = {
+    "fact": ("chat", "episode", "fact"),
+    "episode": ("chat", "fact", "episode"),
+    "evidence": ("episode", "fact", "chat"),
+}
+
+
+def trace_candidates(
+    candidates: Iterable[dict[str, Any]], *, start_rank: int = 1
+) -> list[dict[str, Any]]:
+    """Snapshot diagnostic candidates without retaining their large vectors."""
+    return [
+        {
+            **deepcopy({
+                key: value for key, value in candidate.items()
+                if key != "embedding_vector"
+            }),
+            "rank": rank,
+        }
+        for rank, candidate in enumerate(candidates, start=start_rank)
+    ]
+
+
+def classify_memory_query(query: str) -> str:
+    """Choose the memory layer that best matches the question's evidence need."""
+    value = str(query or "").strip()
+    if _EVIDENCE_QUERY.search(value):
+        return "evidence"
+    if _MIXED_QUERY.search(value):
+        return "mixed"
+    if _EPISODE_QUERY.search(value):
+        return "episode"
+    if _FACT_QUERY.search(value):
+        return "fact"
+    if _DID_QUERY.search(value):
+        return "episode"
+    return "mixed"
+
+
+def _scaled_route_quotas(route: str, limit: int) -> dict[str, int]:
+    base = _ROUTE_QUOTAS.get(route, _ROUTE_QUOTAS["mixed"])
+    if limit == 5:
+        return dict(base)
+    raw = {kind: count * limit / 5.0 for kind, count in base.items()}
+    quotas = {kind: int(value) for kind, value in raw.items()}
+    remaining = limit - sum(quotas.values())
+    order = {kind: index for index, kind in enumerate(base)}
+    fractions = sorted(
+        base,
+        key=lambda kind: (raw[kind] - quotas[kind], -order[kind]),
+        reverse=True,
+    )
+    for kind in fractions[:remaining]:
+        quotas[kind] += 1
+    return quotas
+
+
+def select_routed_candidates(
+    candidates: Iterable[dict[str, Any]],
+    *,
+    route: str,
+    limit: int,
+    trace: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Prefer one memory layer while filling gaps from its evidence fallbacks."""
+    values = list(candidates)
+    ceiling = max(0, int(limit))
+    if trace is not None:
+        trace.update({"route": route, "limit": ceiling, "selections": []})
+    if ceiling == 0:
+        if trace is not None:
+            trace.update({
+                "candidates": [],
+                "removed": [
+                    {"candidate": item, "reason": "limit"}
+                    for item in trace_candidates(values)
+                ],
+            })
+        return []
+    effective_route = route if route in _ROUTE_QUOTAS else "mixed"
+    quotas = _scaled_route_quotas(effective_route, ceiling)
+    if trace is not None:
+        trace.update({"effective_route": effective_route, "quotas": dict(quotas)})
+    buckets = {
+        kind: [candidate for candidate in values if candidate.get("kind") == kind]
+        for kind in ("fact", "episode", "chat")
+    }
+    selected: list[dict[str, Any]] = []
+    selected_keys: set[str] = set()
+    offsets = {kind: 0 for kind in buckets}
+
+    def take(kind: str, count: int, reason: str) -> None:
+        bucket = buckets[kind]
+        while count > 0 and offsets[kind] < len(bucket):
+            candidate = bucket[offsets[kind]]
+            offsets[kind] += 1
+            memory_key = str(candidate.get("memory_key") or "")
+            if not memory_key or memory_key in selected_keys:
+                continue
+            selected.append(candidate)
+            selected_keys.add(memory_key)
+            if trace is not None:
+                trace["selections"].append({"memory_key": memory_key, "reason": reason})
+            count -= 1
+
+    for kind, quota in quotas.items():
+        take(kind, quota, "route_quota")
+
+    if len(selected) < ceiling and effective_route == "mixed":
+        for candidate in values:
+            memory_key = str(candidate.get("memory_key") or "")
+            if not memory_key or memory_key in selected_keys:
+                continue
+            selected.append(candidate)
+            selected_keys.add(memory_key)
+            if trace is not None:
+                trace["selections"].append({"memory_key": memory_key, "reason": "fallback"})
+            if len(selected) >= ceiling:
+                break
+    elif len(selected) < ceiling:
+        for kind in _ROUTE_FALLBACKS[effective_route]:
+            take(kind, ceiling - len(selected), "fallback")
+            if len(selected) >= ceiling:
+                break
+    result = selected[:ceiling]
+    if trace is not None:
+        trace["candidates"] = trace_candidates(result)
+        selected_ids = {id(candidate) for candidate in result}
+        trace["removed"] = [
+            {
+                "candidate": item,
+                "reason": (
+                    "missing_key" if not candidate.get("memory_key") else
+                    "duplicate_key" if str(candidate["memory_key"]) in selected_keys else
+                    "route_quota_or_limit"
+                ),
+            }
+            for candidate, item in zip(values, trace_candidates(values))
+            if id(candidate) not in selected_ids
+        ]
+    return result
 
 
 def _tokens(value: str) -> set[str]:
@@ -94,11 +268,20 @@ def rerank_candidates(
     limit: int,
     min_score: float,
     now: datetime | None = None,
+    trace: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Apply bounded recommendation-style features, then semantic deduplication."""
     clock = now or datetime.now(timezone.utc)
+    if trace is not None:
+        trace.update({
+            "limit": limit,
+            "min_score": min_score,
+            "now": clock.isoformat(),
+            "removed": [],
+            "deferred": [],
+        })
     scored: list[dict[str, Any]] = []
-    for candidate in candidates:
+    for input_rank, candidate in enumerate(candidates, start=1):
         helpful = max(0, int(candidate.get("helpful_count") or 0))
         irrelevant = max(0, int(candidate.get("irrelevant_count") or 0))
         feedback_score = (helpful + 1) / (helpful + irrelevant + 2)
@@ -112,19 +295,30 @@ def rerank_candidates(
             + 0.07 * _recency_score(candidate, clock)
             + 0.05 * frequency_score
         )
+        scored_candidate = {
+            **candidate,
+            "feedback_score": feedback_score,
+            "frequency_score": frequency_score,
+            "final_score": final_score,
+        }
         if final_score < min_score:
+            if trace is not None:
+                trace["removed"].append({
+                    "candidate": trace_candidates([scored_candidate], start_rank=input_rank)[0],
+                    "reason": "min_score",
+                    "rank_basis": "input",
+                })
             continue
-        scored.append(
-            {
-                **candidate,
-                "feedback_score": feedback_score,
-                "frequency_score": frequency_score,
-                "final_score": final_score,
-            }
-        )
+        scored.append(scored_candidate)
     scored.sort(
         key=lambda item: (float(item["final_score"]), str(item["occurred_at"])),
         reverse=True,
+    )
+    if trace is not None:
+        trace["scored"] = trace_candidates(scored)
+    ranked_positions = (
+        {id(item): rank for rank, item in enumerate(scored, start=1)}
+        if trace is not None else {}
     )
     selected: list[dict[str, Any]] = []
     deferred: list[dict[str, Any]] = []
@@ -155,6 +349,16 @@ def rerank_candidates(
                 >= 0.86
             )
             if lexical_duplicate or semantic_duplicate:
+                if trace is not None:
+                    trace["removed"].append({
+                        "candidate": trace_candidates(
+                            [candidate], start_rank=ranked_positions[id(candidate)]
+                        )[0],
+                        "reason": "lexical_duplicate" if lexical_duplicate else "semantic_duplicate",
+                        "duplicate_of": str(existing["memory_key"]),
+                        "lexical_duplicate": lexical_duplicate,
+                        "semantic_duplicate": semantic_duplicate,
+                    })
                 return True
         return False
 
@@ -165,6 +369,11 @@ def rerank_candidates(
             subject = str(candidate.get("subject") or "")
             if fact_subject_counts.get(subject, 0) >= 2:
                 deferred.append(candidate)
+                if trace is not None:
+                    trace["deferred"].append({
+                        "memory_key": str(candidate["memory_key"]),
+                        "reason": "fact_subject_diversity",
+                    })
                 continue
             fact_subject_counts[subject] = fact_subject_counts.get(subject, 0) + 1
         selected.append(candidate)
@@ -176,6 +385,15 @@ def rerank_candidates(
                 selected.append(candidate)
             if len(selected) >= limit:
                 break
+    if trace is not None:
+        trace["candidates"] = trace_candidates(selected)
+        accounted_keys = {str(item["memory_key"]) for item in selected}
+        accounted_keys.update(str(item["candidate"]["memory_key"]) for item in trace["removed"])
+        trace["removed"].extend(
+            {"candidate": item, "reason": "limit"}
+            for item in trace_candidates(scored)
+            if str(item["memory_key"]) not in accounted_keys
+        )
     return selected
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+import re
 import threading
 import time
 import uuid
@@ -13,7 +14,6 @@ from typing import Any, Callable, Protocol
 
 from . import config
 from .context import (
-    estimate_size,
     micro_compact,
     snip_compact,
     tool_result_budget,
@@ -84,7 +84,7 @@ class SessionContextConfig:
     mode: ContextMode = ContextMode.CC
     source: str = "default"
     context_window_tokens: int = 131_072
-    token_counter_id: str = "gugugaga_estimator_v1"
+    token_counter_id: str = "gugugaga_model_estimator"
     token_counter_version: str = "v1"
     hermes_threshold_ratio: float = 0.50
     hermes_target_ratio: float = 0.20
@@ -98,7 +98,7 @@ class SessionContextConfig:
         *,
         source: str | None = None,
         context_window_tokens: int = 131_072,
-        token_counter_id: str = "gugugaga_estimator_v1",
+        token_counter_id: str = "gugugaga_model_estimator",
         token_counter_version: str = "v1",
         hermes_threshold_ratio: float = 0.50,
         hermes_target_ratio: float = 0.20,
@@ -206,10 +206,129 @@ class ConservativeTokenEstimator:
         )
 
 
+@dataclass(frozen=True)
+class TokenEstimationProfile:
+    id: str
+    ascii_chars_per_token: float
+    cjk_tokens_per_char: float
+    other_tokens_per_char: float
+
+
+_TOKEN_PROFILES: tuple[tuple[tuple[str, ...], TokenEstimationProfile], ...] = (
+    (("qwen",), TokenEstimationProfile("qwen", 3.3, 0.9, 1.4)),
+    (("deepseek",), TokenEstimationProfile("deepseek", 3.2, 1.0, 1.5)),
+    (("glm",), TokenEstimationProfile("glm", 3.0, 1.0, 1.5)),
+    (("gpt", "o1", "o3", "o4"), TokenEstimationProfile("openai", 4.0, 1.0, 1.4)),
+    (("claude",), TokenEstimationProfile("claude", 3.8, 1.1, 1.5)),
+    (("llama",), TokenEstimationProfile("llama", 3.6, 1.4, 1.8)),
+    (("mistral", "mixtral"), TokenEstimationProfile("mistral", 3.7, 1.5, 1.8)),
+    (("gemma",), TokenEstimationProfile("gemma", 3.5, 1.4, 1.7)),
+)
+_FALLBACK_TOKEN_PROFILE = TokenEstimationProfile("fallback", 3.5, 1.25, 1.7)
+_ASCII_WORD_RE = re.compile(r"[A-Za-z0-9_]+")
+
+
+def token_profile_for_model(model: str | None) -> TokenEstimationProfile:
+    normalized = str(model or "").strip().lower()
+    for markers, profile in _TOKEN_PROFILES:
+        if any(marker in normalized for marker in markers):
+            return profile
+    return _FALLBACK_TOKEN_PROFILE
+
+
+class ModelAwareTokenEstimator:
+    """Deterministic model-family estimate when an exact tokenizer is unavailable.
+
+    The estimate is expressed in approximate tokens, not UTF-8 bytes. A real
+    provider tokenizer can still be registered through ``TokenCounterRegistry``.
+    """
+
+    id = "gugugaga_model_estimator"
+    version = "v1"
+
+    def __init__(self, model: str | None = None):
+        self.model = str(model or "").strip() or "unknown"
+        self.profile = token_profile_for_model(model)
+        self.profile_id = self.profile.id
+
+    @staticmethod
+    def _is_cjk(character: str) -> bool:
+        codepoint = ord(character)
+        return (
+            0x3400 <= codepoint <= 0x4DBF
+            or 0x4E00 <= codepoint <= 0x9FFF
+            or 0xF900 <= codepoint <= 0xFAFF
+            or 0x3040 <= codepoint <= 0x30FF
+            or 0xAC00 <= codepoint <= 0xD7AF
+        )
+
+    def _count_text(self, text: str) -> int:
+        if not text:
+            return 0
+        word_characters = sum(len(match.group(0)) for match in _ASCII_WORD_RE.finditer(text))
+        whitespace = 0
+        ascii_punctuation = 0
+        cjk = 0
+        other = 0
+        for character in text:
+            if character.isascii() and (character.isalnum() or character == "_"):
+                continue
+            if character.isspace():
+                whitespace += 1
+            elif character.isascii():
+                ascii_punctuation += 1
+            elif self._is_cjk(character):
+                cjk += 1
+            else:
+                other += 1
+        estimate = (
+            word_characters / self.profile.ascii_chars_per_token
+            + whitespace / 6.0
+            + ascii_punctuation / 2.0
+            + cjk * self.profile.cjk_tokens_per_char
+            + other * self.profile.other_tokens_per_char
+        )
+        return max(1, math.ceil(estimate))
+
+    @staticmethod
+    def _render(value: Any) -> str:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+
+    def count_messages(self, messages: list[dict[str, Any]]) -> int:
+        if not messages:
+            return 0
+        rendered = self._render(strip_internal_metadata(messages))
+        return self._count_text(rendered) + 4 * len(messages)
+
+    def count_request(
+        self,
+        system: str,
+        tools: list[Any],
+        messages: list[dict[str, Any]],
+    ) -> int:
+        tool_tokens = self._count_text(self._render(tools)) if tools else 0
+        return self._count_text(system) + tool_tokens + self.count_messages(messages) + 16
+
+
 class TokenCounterRegistry:
-    def __init__(self, counters: list[TokenCounter] | None = None):
+    def __init__(
+        self,
+        counters: list[TokenCounter] | None = None,
+        *,
+        model: str | None = None,
+    ):
         self._counters: dict[tuple[str, str], TokenCounter] = {}
-        for counter in counters or [ConservativeTokenEstimator()]:
+        defaults: list[TokenCounter] = [
+            ConservativeTokenEstimator(),
+            ModelAwareTokenEstimator(model),
+        ]
+        for counter in defaults if counters is None else counters:
             self.register(counter)
 
     def register(self, counter: TokenCounter) -> None:
@@ -447,7 +566,7 @@ class SessionContextCoordinator:
         session_id: str | None = None,
     ):
         self.config = session_config or SessionContextConfig.parse()
-        self.registry = counter_registry or TokenCounterRegistry()
+        self.registry = counter_registry or TokenCounterRegistry(model=config.MODEL)
         self.counter = self.registry.require(
             self.config.token_counter_id, self.config.token_counter_version
         )
@@ -538,6 +657,8 @@ class SessionContextCoordinator:
                 "recovery_used": self.state.recovery_used,
                 "token_counter_id": self.config.token_counter_id,
                 "token_counter_version": self.config.token_counter_version,
+                "token_counter_model": getattr(self.counter, "model", None),
+                "token_counter_profile": getattr(self.counter, "profile_id", None),
                 "context_window_tokens": self.config.context_window_tokens,
                 "pi_entry_count": len(self.state.pi_entries),
             }
@@ -831,7 +952,14 @@ class SessionContextCoordinator:
         candidate = snip_compact(candidate)
         candidate = micro_compact(candidate)
         transcript = None
-        should_summarize = force or estimate_size(candidate) > config.CONTEXT_LIMIT
+        candidate_tokens = self.counter.count_request(
+            request.system, request.tools, candidate
+        )
+        cc_trigger = min(
+            config.CONTEXT_LIMIT,
+            max(1, math.floor(self.config.context_window_tokens * 0.80)),
+        )
+        should_summarize = force or candidate_tokens > cc_trigger
         if should_summarize:
             if len(candidate) <= 1 and force:
                 result = CompressionResult(
@@ -996,15 +1124,25 @@ class SessionContextCoordinator:
         )
         return copy.deepcopy(raw[index:]), index
 
-    def _pi_cut(self, tail: list[dict[str, Any]]) -> int | None:
+    def _pi_cut(
+        self,
+        tail: list[dict[str, Any]],
+        *,
+        keep_recent_tokens: int | None = None,
+    ) -> int | None:
         if len(tail) < 2:
             return None
+        keep_budget = (
+            self.config.pi_keep_recent_tokens
+            if keep_recent_tokens is None
+            else keep_recent_tokens
+        )
         accumulated = 0
         candidate = len(tail) - 1
         for index in range(len(tail) - 1, -1, -1):
             accumulated += self.counter.count_messages([tail[index]])
             candidate = index
-            if accumulated >= self.config.pi_keep_recent_tokens:
+            if accumulated >= keep_budget:
                 break
         turn_candidates = [
             index
@@ -1014,7 +1152,7 @@ class SessionContextCoordinator:
         if turn_candidates:
             turn_start = turn_candidates[0]
             retained_turn_tokens = self.counter.count_messages(tail[turn_start:])
-            if retained_turn_tokens <= self.config.pi_keep_recent_tokens:
+            if retained_turn_tokens <= keep_budget:
                 return turn_start
             split_candidate = _move_to_legal_cut(
                 tail, candidate, backwards=True
@@ -1080,6 +1218,9 @@ class SessionContextCoordinator:
             return projection
         tail, raw_offset = self._pi_raw_tail(raw)
         cut = self._pi_cut(tail)
+        if force and (cut is None or cut <= 0):
+            forced_keep_budget = max(1, self.counter.count_messages(tail) // 2)
+            cut = self._pi_cut(tail, keep_recent_tokens=forced_keep_budget)
         if cut is None or cut <= 0 or cut >= len(tail):
             result = CompressionResult(
                 "skipped", "NO_COMPRESSIBLE_CONTENT", "Pi could not find a compressible legal prefix."

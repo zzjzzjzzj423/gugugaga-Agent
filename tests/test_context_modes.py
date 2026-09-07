@@ -11,6 +11,7 @@ from gugugaga.context_modes import (
     CompressionReason,
     ContextModeError,
     HERMES_HEADINGS,
+    ModelAwareTokenEstimator,
     PI_HEADINGS,
     RequestContext,
     SessionContextConfig,
@@ -148,6 +149,34 @@ def test_unknown_counter_fails_before_session_use(tmp_path):
     assert unavailable.value.code == "TOKEN_ACCOUNTING_UNAVAILABLE"
 
 
+def test_model_aware_counter_selects_family_profile_and_counts_tokens():
+    qwen = ModelAwareTokenEstimator("Qwen/Qwen3-32B")
+    llama = ModelAwareTokenEstimator("meta-llama/Llama-3.3-70B")
+    fallback = ModelAwareTokenEstimator("vendor/unknown-model")
+
+    assert qwen.profile_id == "qwen"
+    assert llama.profile_id == "llama"
+    assert fallback.profile_id == "fallback"
+    assert qwen.count_messages([{"role": "user", "content": "hello world"}]) > 0
+    assert llama.count_messages([{"role": "user", "content": "你好世界" * 20}]) > qwen.count_messages(
+        [{"role": "user", "content": "你好世界" * 20}]
+    )
+
+
+def test_default_coordinator_reports_model_aware_counter(tmp_path, monkeypatch):
+    monkeypatch.setattr("gugugaga.context_modes.config.MODEL", "deepseek-ai/DeepSeek-V3")
+    session = SessionContextCoordinator(
+        SessionContextConfig.parse(),
+        workspace=tmp_path,
+        transcripts_dir=tmp_path / ".gugugaga" / "transcripts",
+    )
+
+    status = session.status()
+    assert status["token_counter_id"] == "gugugaga_model_estimator"
+    assert status["token_counter_model"] == "deepseek-ai/DeepSeek-V3"
+    assert status["token_counter_profile"] == "deepseek"
+
+
 def test_tool_protocol_and_cut_keep_parallel_group_together():
     messages = [
         {"role": "user", "content": "run both"},
@@ -193,6 +222,20 @@ def test_cc_manual_compaction_keeps_raw_ledger_and_projects_summary(tmp_path):
     assert len(projected) == 1
     assert projected[0]["content"].startswith("[Compacted]")
     assert "message_id" not in projected[0]
+
+
+def test_cc_automatic_summary_uses_registered_token_counter(tmp_path):
+    session = coordinator(tmp_path, context_window_tokens=1_000)
+    messages = [
+        {"role": "user", "content": "a" * 450},
+        {"role": "assistant", "content": "b" * 450},
+    ]
+
+    projected = session.prepare_request(messages, request())
+
+    assert len(projected) == 1
+    assert projected[0]["content"].startswith("[Compacted]")
+    assert session.status()["successful_compactions"] == 1
 
 
 def test_hermes_first_then_later_compaction_shapes(tmp_path):
@@ -257,6 +300,26 @@ def test_pi_split_turn_generates_turn_prefix(tmp_path):
     entry = session.state.pi_entries[0]
     assert entry.is_split_turn
     assert entry.turn_prefix_summary is not None
+
+
+def test_pi_force_compacts_when_history_is_below_keep_recent_budget(tmp_path):
+    session = coordinator(
+        tmp_path,
+        "pi",
+        context_window_tokens=5_000,
+        pi_reserve_tokens=500,
+        pi_keep_recent_tokens=4_000,
+    )
+    messages = [
+        {"role": "user" if index % 2 == 0 else "assistant", "content": "x" * 200}
+        for index in range(8)
+    ]
+    assert session.counter.count_messages(messages) < 4_000
+
+    result = session.manual_compact(messages, request())
+
+    assert result.status == "success"
+    assert session.state.pi_entries
 
 
 def test_summary_failure_does_not_partially_commit(tmp_path):

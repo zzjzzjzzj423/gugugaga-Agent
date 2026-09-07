@@ -29,10 +29,15 @@ class FactCandidate:
 
 
 @dataclass(frozen=True)
+class EpisodeCandidate:
+    summary: str
+    importance: float = 1.0
+
+
+@dataclass(frozen=True)
 class ConsolidationResult:
     facts: tuple[FactCandidate, ...] = field(default_factory=tuple)
-    episode: str | None = None
-    episode_importance: float = 0.0
+    episodes: tuple[EpisodeCandidate, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -107,6 +112,9 @@ class RecallResult:
     memory_keys: tuple[str, ...] = field(default_factory=tuple)
     items: tuple[RecallItem, ...] = field(default_factory=tuple)
     strategy: str = "none"
+    route: str = "mixed"
+    route_source: str = "default"
+    route_confidence: float | None = None
 
     @property
     def should_inject(self) -> bool:

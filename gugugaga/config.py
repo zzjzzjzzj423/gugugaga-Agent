@@ -94,7 +94,7 @@ class Settings:
     context_mode: str = "cc"
     context_mode_source: str = "default"
     context_window_tokens: int = 131_072
-    token_counter_id: str = "gugugaga_estimator_v1"
+    token_counter_id: str = "gugugaga_model_estimator"
     token_counter_version: str = "v1"
     hermes_threshold_ratio: float = 0.50
     hermes_target_ratio: float = 0.20
@@ -109,14 +109,16 @@ class Settings:
     memory_consolidation_lease_seconds: int = 600
     memory_consolidation_max_facts: int = 10
     memory_consolidation_min_importance: float = 0.8
-    memory_evidence_hot_exchanges: int = 30
+    memory_consolidation_max_episodes: int = 5
+    memory_consolidation_episode_min_importance: float = 0.6
+    memory_evidence_hot_exchanges: int = 10_000
     memory_recall_token_budget: int = 2000
     memory_intent_gate_enabled: bool = True
     memory_intent_gate_model: str | None = None
     memory_intent_gate_timeout_seconds: int = 5
     memory_embedding_model: str | None = None
     memory_retrieval_candidate_limit: int = 20
-    memory_retrieval_final_limit: int = 5
+    memory_retrieval_final_limit: int = 10
     memory_retrieval_min_score: float = 0.20
 
     @classmethod
@@ -151,15 +153,23 @@ class Settings:
         min_importance = float(
             os.getenv("GUGUGAGA_MEMORY_CONSOLIDATION_MIN_IMPORTANCE", "0.8")
         )
+        max_episodes = int(
+            os.getenv("GUGUGAGA_MEMORY_CONSOLIDATION_MAX_EPISODES", "5")
+        )
+        episode_min_importance = float(
+            os.getenv(
+                "GUGUGAGA_MEMORY_CONSOLIDATION_EPISODE_MIN_IMPORTANCE", "0.6"
+            )
+        )
         evidence_hot_exchanges = int(
-            os.getenv("GUGUGAGA_MEMORY_EVIDENCE_HOT_EXCHANGES", "30")
+            os.getenv("GUGUGAGA_MEMORY_EVIDENCE_HOT_EXCHANGES", "10000")
         )
         recall_budget = int(os.getenv("GUGUGAGA_MEMORY_RECALL_TOKENS", "2000"))
         intent_gate_timeout = int(
             os.getenv("GUGUGAGA_MEMORY_INTENT_GATE_TIMEOUT", "5")
         )
         candidate_limit = int(os.getenv("GUGUGAGA_MEMORY_RETRIEVAL_CANDIDATES", "20"))
-        final_limit = int(os.getenv("GUGUGAGA_MEMORY_RETRIEVAL_TOP_K", "5"))
+        final_limit = int(os.getenv("GUGUGAGA_MEMORY_RETRIEVAL_TOP_K", "10"))
         min_score = float(os.getenv("GUGUGAGA_MEMORY_RETRIEVAL_MIN_SCORE", "0.20"))
         if not 1 <= threshold <= 100:
             raise ValueError("GUGUGAGA_MEMORY_CONSOLIDATION_EXCHANGES must be 1-100")
@@ -172,6 +182,14 @@ class Settings:
         if not 0 <= min_importance <= 1:
             raise ValueError(
                 "GUGUGAGA_MEMORY_CONSOLIDATION_MIN_IMPORTANCE must be 0-1"
+            )
+        if not 0 <= max_episodes <= 5:
+            raise ValueError(
+                "GUGUGAGA_MEMORY_CONSOLIDATION_MAX_EPISODES must be 0-5"
+            )
+        if not 0 <= episode_min_importance <= 1:
+            raise ValueError(
+                "GUGUGAGA_MEMORY_CONSOLIDATION_EPISODE_MIN_IMPORTANCE must be 0-1"
             )
         if not 0 <= evidence_hot_exchanges <= 10_000:
             raise ValueError(
@@ -219,6 +237,8 @@ class Settings:
             memory_consolidation_lease_seconds=lease_seconds,
             memory_consolidation_max_facts=max_facts,
             memory_consolidation_min_importance=min_importance,
+            memory_consolidation_max_episodes=max_episodes,
+            memory_consolidation_episode_min_importance=episode_min_importance,
             memory_evidence_hot_exchanges=evidence_hot_exchanges,
             memory_recall_token_budget=recall_budget,
             memory_intent_gate_enabled=_env_bool(

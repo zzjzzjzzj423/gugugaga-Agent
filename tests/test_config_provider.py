@@ -12,6 +12,9 @@ def test_settings_builds_state_paths(tmp_path, monkeypatch):
     monkeypatch.setenv("SILICONFLOW_API_KEY", "test-key")
     monkeypatch.setenv("SILICONFLOW_MODEL", "test-model")
     monkeypatch.delenv("GUGUGAGA_MEMORY_CONSOLIDATION_TIMEOUT", raising=False)
+    monkeypatch.delenv("GUGUGAGA_MEMORY_EVIDENCE_HOT_EXCHANGES", raising=False)
+    monkeypatch.delenv("GUGUGAGA_MEMORY_RETRIEVAL_TOP_K", raising=False)
+    monkeypatch.delenv("GUGUGAGA_MEMORY_RECALL_TOKENS", raising=False)
 
     settings = Settings.from_env(tmp_path)
 
@@ -20,7 +23,9 @@ def test_settings_builds_state_paths(tmp_path, monkeypatch):
     assert settings.tasks_dir.exists()
     assert settings.mailboxes_dir.exists()
     assert settings.memory_consolidation_timeout_seconds == 90
-    assert settings.memory_evidence_hot_exchanges == 30
+    assert settings.memory_evidence_hot_exchanges == 10_000
+    assert settings.memory_retrieval_final_limit == 10
+    assert settings.memory_recall_token_budget == 2000
     assert settings.memory_intent_gate_enabled is True
     assert settings.memory_intent_gate_model is None
     assert settings.memory_intent_gate_timeout_seconds == 5
