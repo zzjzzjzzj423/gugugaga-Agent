@@ -1,0 +1,151 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="1576" viewBox="0 0 1280 1576" role="img" aria-labelledby="title desc">
+  <title id="title">长期记忆整合：原文、批次与记忆如何流转</title>
+  <desc id="desc">每轮对话先保存到 chat_log，完整后标为 pending，并同步登记全文索引和向量待办。后台凑够六个可领取的完整 Exchange，在事务中将原文改为 processing 并创建 processing 批次，提交领取事务后才调用模型。校验通过且租约有效时，在一个事务里写入 Fact、Episode、来源、审计和检索待办，并将原文与批次一起标为 consolidated。调用或校验失败时，旧批次变 failed，原文回 pending，等待退避重试；Worker 崩溃时，由后续 Worker 回收过期租约。下一次领取创建新批次。向量通过 Outbox 异步建立，失败单独重试，不撤销已提交的记忆。</desc>
+  <defs>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M1 1 8 5 1 9" fill="none" stroke="#377DDD" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M1 1 8 5 1 9" fill="none" stroke="#168979" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></marker>
+    <marker id="arrow-amber" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M1 1 8 5 1 9" fill="none" stroke="#C38A32" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></marker>
+    <marker id="arrow-purple" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M1 1 8 5 1 9" fill="none" stroke="#7562D8" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></marker>
+    <filter id="shadow" x="-10%" y="-15%" width="120%" height="135%"><feDropShadow dx="0" dy="4" stdDeviation="7" flood-color="#17243D" flood-opacity="0.045"/></filter>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif; }
+      .title { font-size: 23px; font-weight: 650; fill: #17243D; }
+      .body { font-size: 18px; fill: #56667F; }
+      .small { font-size: 16px; fill: #6B7890; }
+      .code { font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', monospace; font-size: 17px; fill: #344861; }
+      .line { fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+      .label { font-size: 16px; font-weight: 550; }
+      .step { font-size: 16px; font-weight: 700; fill: #377DDD; }
+    </style>
+  </defs>
+
+  <rect width="1280" height="1576" rx="24" fill="#F8FAFC"/>
+  <rect x="48" y="32" width="4" height="36" rx="2" fill="#377DDD"/>
+  <text x="68" y="60" font-size="32" font-weight="700" fill="#17243D">六轮对话，怎样变成长期记忆？</text>
+  <text x="68" y="96" class="body">沿蓝线看领取，沿绿线看成功；右侧两条分支解释失败与崩溃如何恢复。</text>
+  <text x="1232" y="57" text-anchor="end" font-size="13" font-weight="600" letter-spacing="1.5" fill="#6B7890">MEMORY CONSOLIDATION</text>
+
+  <rect x="48" y="122" width="1184" height="46" rx="12" fill="#EAF0F8"/>
+  <text x="68" y="151" font-size="18" fill="#344861"><tspan font-weight="700">先分清：</tspan>chat_log 管每条原文的进度；consolidation_batches 管一次任务的进度。原文始终保留。</text>
+
+  <!-- Each completed exchange is durable before a batch exists. -->
+  <rect x="110" y="200" width="660" height="106" rx="18" fill="#FFFFFF" stroke="#CADCF6" filter="url(#shadow)"/>
+  <rect x="132" y="219" width="34" height="32" rx="10" fill="#EDF4FF"/>
+  <text x="149" y="241" text-anchor="middle" class="step">01</text>
+  <text x="180" y="244" class="title">每轮完成，原文进入待整合状态</text>
+  <text x="134" y="281" class="code">chat_log · consolidation_status = pending</text>
+
+  <path d="M770 253H882" class="line" stroke="#377DDD" marker-end="url(#arrow-blue)"/>
+  <text x="826" y="238" text-anchor="middle" class="label" fill="#377DDD">写入即触发</text>
+  <rect x="882" y="200" width="350" height="106" rx="18" fill="#EDF4FF" stroke="#CADCF6"/>
+  <text x="904" y="233" font-size="20" font-weight="650" fill="#245DAD">原文先进入检索</text>
+  <text x="904" y="262" class="small">memory_fts：同步可检索</text>
+  <text x="904" y="287" class="small">向量待办：登记到 Outbox</text>
+
+  <!-- A pending message is not a pending batch. -->
+  <path d="M440 306V338" class="line" stroke="#377DDD" marker-end="url(#arrow-blue)"/>
+  <path d="M440 338 606 392 440 446 274 392Z" fill="#EDF4FF" stroke="#AFCDF4" stroke-width="1.6"/>
+  <text x="440" y="386" text-anchor="middle" font-size="21" font-weight="650" fill="#245DAD">够 6 个完整 Exchange？</text>
+  <text x="440" y="414" text-anchor="middle" class="small">pending 且重试时间已到</text>
+  <path d="M274 392H220" class="line" stroke="#377DDD" marker-end="url(#arrow-blue)"/>
+  <text x="247" y="380" text-anchor="middle" class="label" fill="#377DDD">否</text>
+  <rect x="48" y="349" width="172" height="86" rx="16" fill="#FFFFFF" stroke="#DFE6F0"/>
+  <text x="134" y="382" text-anchor="middle" font-size="20" font-weight="650" fill="#344861">暂不领取</text>
+  <text x="134" y="409" text-anchor="middle" class="small">后续轮询再检查</text>
+  <path d="M440 446V476" class="line" stroke="#377DDD" marker-end="url(#arrow-blue)"/>
+  <text x="458" y="466" class="label" fill="#377DDD">是</text>
+
+  <!-- Claim is one short transaction; model execution happens after commit. -->
+  <rect x="110" y="476" width="660" height="164" rx="18" fill="#FFFFFF" stroke="#CADCF6" filter="url(#shadow)"/>
+  <rect x="132" y="495" width="34" height="32" rx="10" fill="#EDF4FF"/>
+  <text x="149" y="517" text-anchor="middle" class="step">02</text>
+  <text x="180" y="520" class="title">原子领取最早的 6 轮</text>
+  <text x="746" y="517" text-anchor="end" class="small">BEGIN IMMEDIATE</text>
+  <text x="134" y="558" class="code">chat_log → processing + batch_id</text>
+  <text x="134" y="586" class="code">consolidation_batches → 新建 processing 记录</text>
+  <text x="134" y="619" class="body">尝试次数 +1 · 租约 600 秒 · 两张表在同一事务提交</text>
+
+  <path d="M770 550H882" class="line" stroke="#7562D8" stroke-dasharray="5 5" marker-end="url(#arrow-purple)"/>
+  <text x="826" y="533" text-anchor="middle" class="label" fill="#7562D8">领取后中断</text>
+  <rect x="882" y="476" width="350" height="164" rx="18" fill="#F0EDFC" stroke="#DCD6F5"/>
+  <text x="904" y="513" font-size="22" font-weight="650" fill="#6250C2">分支 B · Worker 崩溃</text>
+  <text x="904" y="550" class="body">记录暂时保持 processing</text>
+  <text x="904" y="579" class="body">租约到期后，由后续 Worker</text>
+  <text x="904" y="608" class="body">扫描并回收这批对话</text>
+
+  <path d="M440 640V680" class="line" stroke="#377DDD" marker-end="url(#arrow-blue)"/>
+  <text x="459" y="666" class="small">先提交领取事务，再调用模型</text>
+  <rect x="110" y="680" width="660" height="112" rx="18" fill="#FFFFFF" stroke="#CADCF6" filter="url(#shadow)"/>
+  <rect x="132" y="700" width="34" height="32" rx="10" fill="#EDF4FF"/>
+  <text x="149" y="722" text-anchor="middle" class="step">03</text>
+  <text x="180" y="725" class="title">遮蔽输入凭据 → LLM 提取 → 校验与过滤</text>
+  <text x="134" y="766" class="body">原文不改写；Fact 最多 10 条，Episode 最多 5 条</text>
+
+  <path d="M440 792V830" class="line" stroke="#377DDD" marker-end="url(#arrow-blue)"/>
+  <path d="M440 830 606 882 440 934 274 882Z" fill="#EAF6F2" stroke="#A8D4C9" stroke-width="1.6"/>
+  <text x="440" y="877" text-anchor="middle" font-size="21" font-weight="650" fill="#137A6C">输出通过校验？</text>
+  <text x="440" y="903" text-anchor="middle" class="small">合法空结果也算通过</text>
+
+  <path d="M606 882H882" class="line" stroke="#C38A32" marker-end="url(#arrow-amber)"/>
+  <text x="741" y="866" text-anchor="middle" class="label" fill="#AC7625">否，或调用失败 / 超时</text>
+  <rect x="882" y="814" width="350" height="128" rx="18" fill="#FFF5E6" stroke="#EFD7B2"/>
+  <text x="904" y="851" font-size="22" font-weight="650" fill="#A36F20">分支 A · 整合失败</text>
+  <text x="904" y="887" class="body">保留全部原文，记录错误</text>
+  <text x="904" y="916" class="body">设置下一次可重试的时间</text>
+  <path d="M1057 942V1026" class="line" stroke="#C38A32" marker-end="url(#arrow-amber)"/>
+  <text x="1076" y="986" class="label" fill="#AC7625">写回重试状态</text>
+
+  <!-- Both failure paths release source rows, while retaining the failed batch. -->
+  <path d="M1232 558H1248V1070H1232" class="line" stroke="#7562D8" marker-end="url(#arrow-purple)"/>
+  <rect x="882" y="1026" width="350" height="196" rx="18" fill="#FFFFFF" stroke="#EFD7B2" filter="url(#shadow)"/>
+  <text x="904" y="1063" font-size="22" font-weight="650" fill="#A36F20">原文回队列，旧批次留档</text>
+  <text x="904" y="1102" class="code">chat_log → pending</text>
+  <text x="904" y="1133" font-size="17" fill="#344861">consolidation_batches → failed</text>
+  <path d="M904 1150H1210" stroke="#EDF0F6"/>
+  <text x="904" y="1178" class="small">A：退避重试，首次等待 60 秒</text>
+  <text x="904" y="1203" class="small">B：租约回收后可重新参与领取</text>
+  <path d="M1232 1168H1264V392H606" class="line" stroke="#C38A32" stroke-dasharray="6 6" marker-end="url(#arrow-amber)"/>
+  <text x="864" y="378" text-anchor="middle" class="label" fill="#AC7625">下次轮询：重新凑批，领取时创建新批次</text>
+
+  <!-- The successful write is atomic; embeddings are not produced in this transaction. -->
+  <path d="M440 934V984" class="line" stroke="#168979" marker-end="url(#arrow-green)"/>
+  <text x="459" y="963" class="label" fill="#168979">通过</text>
+  <rect x="110" y="984" width="660" height="248" rx="18" fill="#FFFFFF" stroke="#A8D4C9" filter="url(#shadow)"/>
+  <rect x="132" y="1003" width="34" height="32" rx="10" fill="#EAF6F2"/>
+  <text x="149" y="1025" text-anchor="middle" font-size="16" font-weight="700" fill="#168979">04</text>
+  <text x="180" y="1028" class="title">成功提交：一个事务，一起落库</text>
+  <text x="134" y="1060" class="small">先确认租约有效、原文仍属于当前批次，再执行以下写入</text>
+  <rect x="134" y="1077" width="290" height="42" rx="10" fill="#EAF6F2"/>
+  <text x="151" y="1104" font-size="18" fill="#137A6C">facts / episodes · 记忆内容</text>
+  <rect x="442" y="1077" width="304" height="42" rx="10" fill="#EAF6F2"/>
+  <text x="459" y="1104" font-size="18" fill="#137A6C">memory_sources · 来源关联</text>
+  <rect x="134" y="1129" width="290" height="42" rx="10" fill="#EAF6F2"/>
+  <text x="151" y="1156" font-size="18" fill="#137A6C">memory_audit · 操作记录</text>
+  <rect x="442" y="1129" width="304" height="42" rx="10" fill="#EAF6F2"/>
+  <text x="459" y="1156" font-size="18" fill="#137A6C">触发器 · FTS + Outbox</text>
+  <text x="134" y="1206" font-size="18" font-weight="600" fill="#137A6C">chat_log 与 consolidation_batches 一起 → consolidated</text>
+  <path d="M770 1012H830V1091H882" class="line" stroke="#C38A32" stroke-dasharray="5 5" marker-end="url(#arrow-amber)"/>
+  <text x="826" y="994" text-anchor="middle" font-size="14" fill="#AC7625">提交失败</text>
+
+  <path d="M440 1232V1272" class="line" stroke="#168979" marker-end="url(#arrow-green)"/>
+  <rect x="110" y="1272" width="660" height="72" rx="16" fill="#EAF6F2" stroke="#C9E3DD"/>
+  <text x="134" y="1303" font-size="20" font-weight="650" fill="#137A6C">提交后，再整理原文的 Hot / Cold 状态</text>
+  <text x="134" y="1328" class="small">最近 10000 个已整合 Exchange 保持 Hot；Cold 仍保留原文和 FTS</text>
+  <text x="896" y="1289" font-size="18" font-weight="650" fill="#344861">记住这组区别</text>
+  <text x="896" y="1318" class="body">pending 在原文表，批次表没有 pending。</text>
+  <text x="896" y="1343" class="small">失败的是一次任务，留下的是可重试的原文。</text>
+
+  <!-- A separate post-commit task queue, processed by the same background Worker. -->
+  <rect x="48" y="1390" width="1184" height="132" rx="18" fill="#EEF1F7"/>
+  <text x="72" y="1422" font-size="20" font-weight="650" fill="#344861">异步建向量 · 原文与摘要共用一套待办</text>
+  <text x="1208" y="1422" text-anchor="end" class="small">同一后台 Worker 后续处理，失败单独重试</text>
+  <rect x="72" y="1442" width="314" height="56" rx="12" fill="#FFFFFF" stroke="#D9E1ED"/>
+  <text x="229" y="1476" text-anchor="middle" class="code">memory_index_outbox</text>
+  <path d="M386 1470H458" class="line" stroke="#377DDD" marker-end="url(#arrow-blue)"/>
+  <rect x="458" y="1442" width="310" height="56" rx="12" fill="#FFFFFF" stroke="#D9E1ED"/>
+  <text x="613" y="1476" text-anchor="middle" font-size="19" fill="#344861">Embedding · bge-m3</text>
+  <path d="M768 1470H840" class="line" stroke="#377DDD" marker-end="url(#arrow-blue)"/>
+  <rect x="840" y="1442" width="368" height="56" rx="12" fill="#FFFFFF" stroke="#D9E1ED"/>
+  <text x="1024" y="1476" text-anchor="middle" class="code">memory_embeddings</text>
+  <text x="48" y="1552" class="small">原文先存 · 批次负责调度 · 记忆另表保存 · 状态原子提交 · 向量失败不会撤销已提交记忆</text>
+</svg>
