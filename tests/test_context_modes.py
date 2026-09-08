@@ -47,9 +47,10 @@ def structured(headings):
 
 
 def summary_callback(system, prompt, max_tokens):
-    assert max_tokens == 2_000
     if "Pi Markdown" in system:
+        assert 0 < max_tokens <= 2_000
         return structured(PI_HEADINGS)
+    assert max_tokens == 2_000
     if "Hermes Markdown" in system:
         return structured(HERMES_HEADINGS)
     return "Goal, constraints, completed work, and next step."

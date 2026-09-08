@@ -48,6 +48,7 @@ def isolated_team_state(tmp_path, monkeypatch):
         teams.active_teammates.clear()
         teams._teammate_states.clear()
         teams._teammate_stop_events.clear()
+        teams._teammate_profile_restart_pending.clear()
     if hasattr(teams, "pending_requests"):
         teams.pending_requests.clear()
     if hasattr(teams, "MessageBus"):
@@ -61,11 +62,361 @@ def isolated_team_state(tmp_path, monkeypatch):
         teams.active_teammates.clear()
         teams._teammate_states.clear()
         teams._teammate_stop_events.clear()
+        teams._teammate_profile_restart_pending.clear()
     if hasattr(teams, "pending_requests"):
         teams.pending_requests.clear()
     if hasattr(teams, "set_team_provider"):
         teams.set_team_provider(None)
     config.configure_workspace(original_workspace)
+
+
+def match_task(task, *members):
+    current = tasks.load_task(task.id)
+    return tasks.set_task_candidates(
+        task.id, list(members), "Matched task requirements to member capabilities",
+        expected_revision=current.matching_revision,
+    )
+
+
+def register_idle_teammate(name):
+    teams._persist_teammate_profile(name, "developer", "Implement and test APIs")
+    teams.active_teammates[name] = True
+    teams._teammate_states[name] = {
+        "name": name, "status": "idle", "online": True,
+        "current_task_id": None, "dispatch_available": True,
+    }
+
+
+def test_runtime_claim_enforces_candidates_busy_state_and_manual_override():
+    for name in ("alice", "bob", "outsider"):
+        register_idle_teammate(name)
+    teams.update_team_settings(True)
+    task = match_task(tasks.create_task("API work"), "alice", "bob")
+    assert "not a candidate" in teams.claim_task_for_teammate(task.id, "outsider")
+    teams._teammate_states["alice"]["dispatch_available"] = False
+    teams._teammate_states["bob"]["dispatch_available"] = False
+    assert "not idle" in teams.claim_task_for_teammate(task.id, "alice")
+    assert "not idle" in teams.claim_task_for_teammate(task.id, "bob")
+    assert tasks.load_task(task.id).owner is None
+
+    teams.assign_task_to_teammate(task.id, "outsider")
+    teams._teammate_states["alice"]["dispatch_available"] = True
+    assert "assigned to outsider" in teams.claim_task_for_teammate(task.id, "alice")
+    assert teams.claim_task_for_teammate(task.id, "outsider").startswith("Claimed")
+    assert tasks.load_task(task.id).owner == "outsider"
+
+
+def test_manual_override_clears_previous_runtime_reservation():
+    for name in ("alice", "bob"):
+        register_idle_teammate(name)
+    task = tasks.create_task("manual override")
+    teams.assign_task_to_teammate(task.id, "alice")
+    teams.assign_task_to_teammate(task.id, "bob")
+    assert teams._teammate_states["alice"]["current_task_id"] is None
+    assert "assigned to bob" in teams.claim_task_for_teammate(task.id, "alice")
+    assert teams.claim_task_for_teammate(task.id, "bob").startswith("Claimed")
+
+
+def test_runtime_claim_candidates_compete_atomically():
+    for name in ("alice", "bob"):
+        register_idle_teammate(name)
+    teams.update_team_settings(True)
+    task = match_task(tasks.create_task("one owner"), "alice", "bob")
+    barrier = threading.Barrier(3)
+    results = []
+
+    def claim(name):
+        barrier.wait()
+        results.append(teams.claim_task_for_teammate(task.id, name))
+
+    workers = [threading.Thread(target=claim, args=(name,)) for name in ("alice", "bob")]
+    for worker in workers:
+        worker.start()
+    barrier.wait()
+    for worker in workers:
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+    assert sum(result.startswith("Claimed") for result in results) == 1
+    claimed = tasks.load_task(task.id)
+    assert claimed.owner in {"alice", "bob"}
+    assert claimed.assignee is None
+
+
+def test_model_claim_can_follow_completion_but_cannot_take_a_second_active_task(monkeypatch):
+    teams._persist_teammate_profile("alice", "developer", "Implement API tasks")
+    first = match_task(tasks.create_task("first"), "alice")
+    second = match_task(tasks.create_task("second"), "alice")
+    outputs = []
+
+    class ClaimProvider:
+        calls = 0
+
+        def create(self, messages, system, tools, max_tokens, model=None):
+            self.calls += 1
+            if self.calls > 1:
+                outputs.extend(messages[-1]["content"])
+            if self.calls == 1:
+                return ProviderResponse(content=[
+                    ToolUseBlock(id="claim_first", name="claim_task", input={"task_id": first.id}),
+                    ToolUseBlock(id="claim_busy", name="claim_task", input={"task_id": second.id}),
+                    ToolUseBlock(id="complete_first", name="complete_task", input={"task_id": first.id}),
+                    ToolUseBlock(id="claim_second", name="claim_task", input={"task_id": second.id}),
+                    ToolUseBlock(id="complete_second", name="complete_task", input={"task_id": second.id}),
+                ], stop_reason="tool_use")
+            return ProviderResponse(content=[TextBlock(text="Both completed sequentially")], stop_reason="end_turn")
+
+    teams.set_team_provider(ClaimProvider())
+    teams.update_team_settings(True)
+    monkeypatch.setattr(teams, "IDLE_POLL_INTERVAL", 0.005)
+    monkeypatch.setattr(teams, "IDLE_TIMEOUT", 0.03)
+    teams.spawn_teammate_thread("alice", "developer", "Implement API tasks", persist_profile=False)
+    deadline = time.monotonic() + 1
+    while "alice" in teams.active_teammates and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert tasks.load_task(first.id).status == "completed"
+    assert tasks.load_task(second.id).status == "completed"
+    by_id = {item["tool_use_id"]: item["content"] for item in outputs}
+    assert by_id["claim_first"].startswith("Claimed")
+    assert not by_id["claim_busy"].startswith("Claimed")
+    assert by_id["claim_second"].startswith("Claimed")
+
+
+def test_matching_context_is_read_only_and_runtime_marks_profile_reload_unavailable():
+    register_idle_teammate("alice")
+    task = match_task(tasks.create_task("API"), "alice")
+    before = task.matching_revision
+    for _ in range(3):
+        assert teams.task_candidates_context()["tasks"][0]["matching_revision"] == before
+        assert teams.scan_unclaimed_tasks("alice")[0]["id"] == task.id
+    assert tasks.pending_matching_requests() == []
+    teams._teammate_profile_restart_pending.add("alice")
+    assert teams.list_teammate_states()[0]["dispatch_available"] is False
+
+
+def test_matching_inbox_coalesces_changes_and_preserves_newer_revision_on_ack():
+    teams._persist_teammate_profile("alice", "developer", "Implement APIs", ["read_file", "bash"])
+    first = tasks.create_task("API")
+    second = tasks.create_task("Schema")
+    tasks.update_task(first.id, description="Updated API contract")
+    batch = teams.claim_lead_inbox()
+    messages = [item for item in batch.messages if item["type"] == "assignment_match_requested"]
+    assert len(messages) == 1
+    assert len(messages[0]["metadata"]["tasks"]) == 2
+    assert messages[0]["metadata"]["members"][0]["prompt"] == "Implement APIs"
+    assert "bash" in messages[0]["metadata"]["members"][0]["allowed_tools"]
+    tasks.update_task(first.id, description="A newer contract arrived during matching")
+    match_task(second, "alice")
+    assert teams.ack_lead_inbox(batch) is True
+    remaining = tasks.pending_matching_requests()
+    assert [item["id"] for item in remaining] == [first.id]
+    assert remaining[0]["matching_revision"] > messages[0]["metadata"]["matching_revisions"][first.id]
+
+    retried = teams.claim_lead_inbox()
+    teams.nack_lead_inbox(retried, "provider failed")
+    assert tasks.pending_matching_requests()[0]["id"] == first.id
+    assert tasks.load_task(second.id).matching_notified_revision > 0
+
+
+def test_unresolved_matching_is_not_acknowledged_but_regular_mail_is_consumed():
+    task = tasks.create_task("Needs candidates")
+    teams.BUS.send("alice", "lead", "Completed other work", "result")
+    batch = teams.claim_lead_inbox()
+    assert len(batch.messages) == 2
+    assert teams.ack_lead_inbox(batch) is False
+    assert [item["id"] for item in tasks.pending_matching_requests()] == [task.id]
+    assert tasks.load_task(task.id).matching_notified_revision == 0
+    retry = teams.claim_lead_inbox()
+    assert [item["type"] for item in retry.messages] == ["assignment_match_requested"]
+
+    match_task(task)
+    assert teams.ack_lead_inbox(retry) is True
+    assert tasks.pending_matching_requests() == []
+
+
+def test_matching_ack_accepts_tasks_taken_over_or_deleted():
+    manual = tasks.create_task("Manual takeover")
+    removed = tasks.create_task("Removed task")
+    batch = teams.claim_lead_inbox()
+    tasks.assign_task(manual.id, "alice")
+    tasks.delete_task(removed.id)
+    assert teams.ack_lead_inbox(batch) is True
+    assert tasks.pending_matching_requests() == []
+
+
+def test_check_inbox_matching_notice_includes_requirements_and_member_capabilities():
+    teams._persist_teammate_profile("alice", "developer", "Special API instructions")
+    task = tasks.create_task("API", description="Precise acceptance criteria")
+    rendered = teams.run_check_inbox()
+    assert task.id in rendered
+    assert "Precise acceptance criteria" in rendered
+    assert "Special API instructions" in rendered
+    assert "matching_revisions" in rendered
+    assert [item["id"] for item in tasks.pending_matching_requests()] == [task.id]
+
+
+def test_profile_changes_invalidate_only_unclaimed_nonmanual_candidates():
+    teams._persist_teammate_profile("alice", "developer", "Implement APIs")
+    pending = match_task(tasks.create_task("pending"), "alice")
+    manual = tasks.create_task("manual")
+    tasks.assign_task(manual.id, "bob")
+    active = match_task(tasks.create_task("active"), "alice")
+    assert tasks.claim_task(active.id, "alice").startswith("Claimed")
+    teams.update_teammate_profile("alice", role="designer", prompt="Draw icons", allowed_tools=["read_file"])
+    updated = tasks.load_task(pending.id)
+    assert updated.matching_status != "matched"
+    assert updated.matching_revision > pending.matching_revision
+    assert tasks.load_task(manual.id).assignee == "bob"
+    assert tasks.load_task(active.id).owner == "alice"
+    assert tasks.load_task(active.id).matching_revision == active.matching_revision
+    assert "stale" in teams.run_set_task_candidates(
+        pending.id, ["alice"], "Old API capability", pending.matching_revision,
+    ).lower()
+    assert "unknown candidate" in teams.run_set_task_candidates(
+        pending.id, ["missing"], "Unknown member", updated.matching_revision,
+    )
+
+
+def test_profile_reload_preserves_pending_manual_dispatch_and_then_claims(monkeypatch):
+    received = threading.Event()
+
+    class SummaryProvider:
+        def create(self, messages, system, tools, max_tokens, model=None):
+            received.set()
+            return ProviderResponse(content=[TextBlock(text="Assigned task received")], stop_reason="end_turn")
+
+    task = tasks.create_task("Manually reserved")
+    teams.set_team_provider(SummaryProvider())
+    monkeypatch.setattr(teams, "IDLE_POLL_INTERVAL", 0.005)
+    teams.run_spawn_teammate("alice", "developer", "Original instructions")
+    try:
+        deadline = time.monotonic() + 1
+        while teams._teammate_states["alice"]["status"] != "idle" and time.monotonic() < deadline:
+            time.sleep(0.005)
+        with teams._teammate_lock:
+            teams.assign_task_to_teammate(task.id, "alice")
+            updated = teams.update_teammate_profile("alice", prompt="Updated instructions")
+            assert updated["apply_state"] == "restarting"
+            assert tasks.load_task(task.id).status == "pending"
+            assert tasks.load_task(task.id).assignee == "alice"
+        assert received.wait(timeout=1)
+        assert tasks.load_task(task.id).owner == "alice"
+        assert teams._teammate_states["alice"]["configuration_updated_at"] == updated["updated_at"]
+        assert teams.get_team_settings()["auto_claim_enabled"] is False
+    finally:
+        teams.stop_all_teammates(timeout=1)
+
+
+@pytest.mark.parametrize("auto_claim", [False, True])
+def test_new_member_triggers_matching_and_only_autoclaims_when_enabled(monkeypatch, auto_claim):
+    class SummaryProvider:
+        def create(self, messages, system, tools, max_tokens, model=None):
+            return ProviderResponse(content=[TextBlock(text="Task received")], stop_reason="end_turn")
+
+    task = match_task(tasks.create_task("Implement API"))
+    teams.set_team_provider(SummaryProvider())
+    teams.update_team_settings(auto_claim)
+    monkeypatch.setattr(teams, "IDLE_POLL_INTERVAL", 0.005)
+    teams.run_spawn_teammate("alice", "developer", "Implement APIs")
+    try:
+        batch = teams.claim_lead_inbox()
+        request = next(item for item in batch.messages if item["type"] == "assignment_match_requested")
+        revision = request["metadata"]["matching_revisions"][task.id]
+        assert revision > task.matching_revision
+        result = teams.run_set_task_candidates(task.id, ["alice"], "Developer can implement APIs", revision)
+        assert not result.startswith("Error:")
+        teams.ack_lead_inbox(batch)
+        if auto_claim:
+            deadline = time.monotonic() + 1
+            while tasks.load_task(task.id).owner is None and time.monotonic() < deadline:
+                time.sleep(0.005)
+            assert tasks.load_task(task.id).owner == "alice"
+        else:
+            time.sleep(0.03)
+            assert tasks.load_task(task.id).status == "pending"
+            assert tasks.load_task(task.id).owner is None
+    finally:
+        teams.stop_all_teammates(timeout=1)
+
+
+def test_mismatch_releases_task_and_blocks_remaining_tools_in_batch(monkeypatch):
+    task = tasks.create_task("Requires unavailable expertise")
+
+    class MismatchProvider:
+        def create(self, messages, system, tools, max_tokens, model=None):
+            return ProviderResponse(
+                content=[
+                    ToolUseBlock(id="mismatch", name="report_task_mismatch", input={
+                        "task_id": task.id, "reason": "Required tool is unavailable",
+                        "work_summary": "Reviewed the API contract",
+                    }),
+                    ToolUseBlock(id="write_after_release", name="write_file", input={
+                        "path": "must-not-write.txt", "content": "stale task work",
+                    }),
+                ], stop_reason="tool_use",
+            )
+
+    teams.set_team_provider(MismatchProvider())
+    monkeypatch.setattr(teams, "IDLE_POLL_INTERVAL", 0.005)
+    teams.run_spawn_teammate("alice", "developer", "Implement API")
+    try:
+        deadline = time.monotonic() + 1
+        while teams._teammate_states["alice"]["status"] != "idle" and time.monotonic() < deadline:
+            time.sleep(0.005)
+        teams.assign_task_to_teammate(task.id, "alice")
+        while not tasks.load_task(task.id).mismatch_reports and time.monotonic() < deadline:
+            time.sleep(0.005)
+        returned = tasks.load_task(task.id)
+        assert returned.owner is None and returned.assignee is None
+        assert returned.matching_status == "rematch_required"
+        assert returned.mismatch_reports[0]["work_summary"] == "Reviewed the API contract"
+        assert not (config.WORKDIR / "must-not-write.txt").exists()
+        assert not teams.claim_task_for_teammate(task.id, "alice").startswith("Claimed")
+    finally:
+        teams.stop_all_teammates(timeout=1)
+
+
+def test_legacy_agent_cannot_resume_mutations_from_a_message_after_mismatch(monkeypatch):
+    task = tasks.create_task("Unsupported task")
+    teams._persist_teammate_profile("alice", "developer", "Implement APIs")
+    tasks.assign_task(task.id, "alice")
+    outputs = []
+
+    class LegacyMismatchProvider:
+        calls = 0
+
+        def create(self, messages, system, tools, max_tokens, model=None):
+            self.calls += 1
+            if self.calls == 1:
+                return ProviderResponse(content=[
+                    ToolUseBlock(id="claim", name="claim_task", input={"task_id": task.id}),
+                    ToolUseBlock(id="mismatch", name="report_task_mismatch", input={
+                        "task_id": task.id, "reason": "Tool unavailable",
+                    }),
+                ], stop_reason="tool_use")
+            if self.calls == 2:
+                return ProviderResponse(content=[ToolUseBlock(
+                    id="stale_write", name="write_file", input={
+                        "path": "stale-after-message.txt", "content": "unassigned",
+                    },
+                )], stop_reason="tool_use")
+            outputs.extend(messages[-1]["content"])
+            return ProviderResponse(content=[TextBlock(text="Waiting for reassignment")], stop_reason="end_turn")
+
+    teams.set_team_provider(LegacyMismatchProvider())
+    monkeypatch.setattr(teams, "IDLE_POLL_INTERVAL", 0.005)
+    teams.spawn_teammate_thread("alice", "developer", "Implement APIs", persist_profile=False)
+    try:
+        deadline = time.monotonic() + 1
+        while not tasks.load_task(task.id).mismatch_reports and time.monotonic() < deadline:
+            time.sleep(0.005)
+        teams.BUS.send("lead", "alice", "An ordinary message after relinquishing")
+        while not outputs and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert any("no active assigned task" in item["content"] for item in outputs)
+        assert not (config.WORKDIR / "stale-after-message.txt").exists()
+        assert tasks.load_task(task.id).owner is None
+    finally:
+        teams.stop_all_teammates(timeout=1)
 
 
 def test_message_bus_delivers_each_mailbox_in_fifo_order_once():
@@ -473,6 +824,8 @@ def test_auto_claim_injects_full_task_description(monkeypatch):
         "api",
         description="Implement the complete API contract and its edge cases.",
     )
+    register_idle_teammate("alice")
+    match_task(task, "alice")
     messages = []
     work_state = {}
     monkeypatch.setattr(teams, "IDLE_TIMEOUT", 0.1)
@@ -884,13 +1237,15 @@ def test_model_claim_is_denied_without_assignment_when_auto_claim_is_off(
             )
 
     task = tasks.create_task("must be assigned")
+    teams._persist_teammate_profile("guard-alice", "developer", "Try to claim the task")
+    match_task(task, "guard-alice")
     provider = ClaimingProvider(task.id)
     teams.set_team_provider(provider)
     monkeypatch.setattr(teams, "IDLE_POLL_INTERVAL", 0.01)
     monkeypatch.setattr(teams, "IDLE_TIMEOUT", 0.02)
 
     assert teams.spawn_teammate_thread(
-        "guard-alice", "developer", "Try to claim the task"
+        "guard-alice", "developer", "Try to claim the task", persist_profile=False,
     ).startswith("Teammate")
     deadline = time.monotonic() + 1
     while "guard-alice" in teams.active_teammates and time.monotonic() < deadline:
@@ -905,6 +1260,7 @@ def test_model_claim_is_denied_without_assignment_when_auto_claim_is_off(
 
 def test_task_completion_enforces_claim_owner():
     task = tasks.create_task("owned")
+    match_task(task, "alice")
     assert tasks.claim_task(task.id, "alice").startswith("Claimed")
 
     assert tasks.complete_task(task.id, owner="bob") == (
@@ -950,9 +1306,11 @@ def test_teammate_reports_each_completed_burst_without_idle_delay(monkeypatch):
 def test_two_agents_atomically_claim_only_one_unblocked_task():
     require_source_team_api()
     dependency = tasks.create_task("schema")
+    match_task(dependency, "lead")
     assert tasks.claim_task(dependency.id, "lead").startswith("Claimed")
     assert tasks.complete_task(dependency.id, owner="lead").startswith("Completed")
     candidate = tasks.create_task("api", blockedBy=[dependency.id])
+    match_task(candidate, "alice", "bob")
     assert [item["id"] for item in teams.scan_unclaimed_tasks()] == [candidate.id]
 
     barrier = threading.Barrier(3)

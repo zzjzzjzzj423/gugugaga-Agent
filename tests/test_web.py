@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from gugugaga import tasks, teams
+from gugugaga import tasks, teams, web
 from gugugaga.memory import RecallItem, RecallResult
 from gugugaga.models import ToolCall
 from gugugaga.observability import Observer
@@ -624,10 +624,105 @@ def test_store_exposes_task_board_and_scheduled_jobs():
         }
         pending = next(item for item in payload["tasks"] if item["id"] == first_id)
         assert pending["ready"] is True
+        assert pending["dependencies_ready"] is True
+        assert pending["candidate_members"] == []
+        assert pending["matching_status"] == "pending"
+        assert pending["waiting_reason"]["code"] == "unmatched"
         assert pending["dependencies"] == [
             {"id": second_id, "status": "completed"}
         ]
         assert payload["scheduled_tasks"][0]["next_run"] is not None
+        del store
+        gc.collect()
+
+
+def test_task_board_explains_candidates_manual_ownership_and_waiting(monkeypatch):
+    with TemporaryDirectory(prefix=".web-matching-test-", dir=Path.cwd()) as directory:
+        root = Path(directory)
+        monkeypatch.setattr(web.config, "WORKDIR", root)
+        tasks_dir = root / ".tasks"
+        tasks_dir.mkdir()
+        agent_states = [
+            {"name": "alice", "online": True, "status": "running", "current_task_id": "task_1780000010_0010"},
+            {"name": "bob", "online": False, "status": "stopped", "current_task_id": None},
+            {"name": "carol", "online": True, "status": "idle", "current_task_id": "task_1780000006_0006"},
+        ]
+        monkeypatch.setattr(web, "list_teammate_states", lambda: agent_states)
+        settings = {"auto_claim_enabled": True}
+        monkeypatch.setattr(web, "get_team_settings", lambda: settings)
+        definitions = [
+            {},
+            {"matching_status": "matched", "candidate_members": [], "assignment_reason": "需要数据库经验，现有成员不具备"},
+            {"matching_status": "matched", "candidate_members": ["alice", "bob"], "assignment_reason": "具备后端工具"},
+            {"matching_status": "matched", "candidate_members": ["alice"], "blockedBy": ["task_1780000000_0000"]},
+            {"matching_status": "rematch_required", "mismatch_reports": [{"agent": "alice", "reason": "缺少数据库工具", "work_summary": "已记录接口定义", "created_at": 10}]},
+            {"matching_status": "pending", "candidate_members": ["alice"], "assignee": "carol"},
+            {"assignee": "bob"},
+            {"assignee": "alice"},
+            {"matching_status": "matched", "candidate_members": ["carol"]},
+            {"status": "in_progress", "owner": "alice", "matching_status": "matched", "candidate_members": ["alice"]},
+        ]
+        ids = []
+        for number, definition in enumerate(definitions, start=1):
+            task_id = f"task_17800000{number:02d}_{number:04d}"
+            ids.append(task_id)
+            raw = {
+                "id": task_id, "subject": f"Task {number}", "description": "", "status": "pending",
+                "owner": None, "blockedBy": [], "matching_revision": 2, **definition,
+            }
+            (tasks_dir / f"{task_id}.json").write_text(json.dumps(raw), encoding="utf-8")
+        store = DashboardStore(root)
+        by_id = {item["id"]: item for item in store.task_system()["tasks"]}
+        expected = ["unmatched", "unmatched", "candidates_unavailable", "dependencies", "rematch_required", "assigned", "assignee_unavailable", "assignee_unavailable", "candidates_unavailable", None]
+        for task_id, code in zip(ids, expected):
+            waiting = by_id[task_id]["waiting_reason"]
+            assert (waiting["code"] if waiting else None) == code
+        assert by_id[ids[1]]["assignment_reason"] == "需要数据库经验，现有成员不具备"
+        assert by_id[ids[4]]["mismatch_reports"][0]["work_summary"] == "已记录接口定义"
+        assert by_id[ids[5]]["manual_assignee"] == "carol"
+        assert by_id[ids[5]]["owner"] is None
+        assert by_id[ids[5]]["candidate_members"] == ["alice"]
+        assert by_id[ids[9]]["manual_assignee"] is None
+        assert by_id[ids[9]]["owner"] == "alice"
+        assert by_id[ids[3]]["dependencies_ready"] is False
+        assert by_id[ids[2]]["ready"] is True
+        settings["auto_claim_enabled"] = False
+        disabled = {item["id"]: item for item in store.task_system()["tasks"]}
+        assert disabled[ids[2]]["waiting_reason"]["code"] == "manual_assignment_required"
+        assert disabled[ids[5]]["waiting_reason"]["code"] == "assigned"
+        assert disabled[ids[9]]["waiting_reason"] is None
+        settings["auto_claim_enabled"] = True
+        agent_states[2]["current_task_id"] = None
+        ready = {item["id"]: item for item in store.task_system()["tasks"]}
+        assert ready[ids[8]]["waiting_reason"] is None
+        agent_states[2].update(status="running", dispatch_available=True)
+        model_ready = {item["id"]: item for item in store.task_system()["tasks"]}
+        assert model_ready[ids[8]]["waiting_reason"] is None
+        agent_states[2]["dispatch_available"] = False
+        restarting = {item["id"]: item for item in store.task_system()["tasks"]}
+        assert restarting[ids[8]]["waiting_reason"]["code"] == "candidates_unavailable"
+        del store
+        gc.collect()
+
+
+def test_offline_task_board_does_not_use_another_workspaces_team(monkeypatch):
+    with TemporaryDirectory(prefix=".web-offline-board-", dir=Path.cwd()) as directory:
+        root = Path(directory)
+        task_id = "task_1780000001_0001"
+        (root / ".tasks").mkdir()
+        (root / ".tasks" / f"{task_id}.json").write_text(json.dumps({
+            "id": task_id, "subject": "Offline task", "status": "pending",
+            "candidate_members": ["alice"], "matching_status": "matched",
+        }), encoding="utf-8")
+        monkeypatch.setattr(web.config, "WORKDIR", root / "other-workspace")
+        def unrelated_runtime():
+            raise AssertionError("offline board must not read global team state")
+        monkeypatch.setattr(web, "list_teammate_states", unrelated_runtime)
+        monkeypatch.setattr(web, "get_team_settings", unrelated_runtime)
+        store = DashboardStore(root)
+        assert store.task_system()["tasks"][0]["waiting_reason"]["code"] == "manual_assignment_required"
+        (root / ".gugugaga" / "team-settings.json").write_text(json.dumps({"auto_claim_enabled": True}), encoding="utf-8")
+        assert store.task_system()["tasks"][0]["waiting_reason"]["code"] == "candidates_unavailable"
         del store
         gc.collect()
 
@@ -662,14 +757,25 @@ def test_team_settings_assignment_and_offline_guard():
         assert assigned["assignee"] == "alice"
         assert assigned["owner"] is None
         assert application.team_agents()["items"][0]["current_task_id"] == task.id
+        board_task = next(item for item in application.store.task_system()["tasks"] if item["id"] == task.id)
+        assert board_task["candidate_members"] == []
+        assert board_task["manual_assignee"] == "alice"
+        assert "assigned to alice" in tasks.claim_task(task.id, "other")
         assert application.unassign_task(task.id)["assignee"] is None
+        tasks.set_task_candidates(task.id, ["agent"], "Agent can execute this task", expected_revision=tasks.load_task(task.id).matching_revision)
         assert tasks.claim_task(task.id, "agent").startswith("Claimed")
         released = application.release_task(task.id)
         assert released["status"] == "pending"
         assert released["owner"] is None
 
         active = tasks.create_task("active teammate work")
+        tasks.assign_task(active.id, "alice")
         assert tasks.claim_task(active.id, "alice").startswith("Claimed")
+        try:
+            application.update_task(active.id, {"description": "Change direction"})
+            raise AssertionError("claimed tasks require the existing intervention flow")
+        except ValueError as error:
+            assert "intervention" in str(error)
         teams._teammate_states["alice"]["current_task_id"] = active.id
         try:
             application.release_task(active.id)
@@ -808,6 +914,16 @@ def test_task_page_contains_team_and_subagent_controls():
     assert "loadTeamAgents" not in script
     assert "/api/subagents/history" in script
     assert "event.agent_type !== 'main'" in script
+    assert "查看全部成员" in script
+    assert "非候选成员" in script
+    assert "task.candidate_members" in script
+    assert "task.assignment_reason" in script
+    assert "task.manual_assignee" in script
+    assert "实际 Owner" in script
+    assert "task.waiting_reason.message" in script
+    assert "task_matching_requested" in script
+    assert "task_matching_updated" in script
+    assert "scheduleTaskRefresh" in script
     assert ".innerHTML" not in script
 
 
@@ -876,6 +992,31 @@ def test_http_server_serves_console_and_api():
                 assert payload["counts"]["total"] == 0
                 assert payload["scheduled_tasks"] == []
             deletable = tasks.create_task("delete through API")
+            tasks.set_task_candidates(
+                deletable.id, ["alice"], "Initial task match",
+                expected_revision=deletable.matching_revision,
+            )
+            request = Request(
+                f"{base}/api/tasks/{deletable.id}",
+                data=json.dumps({"subject": "Changed requirements", "description": "Needs database tools", "blockedBy": []}).encode(),
+                headers={"Content-Type": "application/json"}, method="PUT",
+            )
+            with urlopen(request, timeout=3) as response:
+                updated = json.loads(response.read())
+                assert updated["subject"] == "Changed requirements"
+                assert updated["description"] == "Needs database tools"
+                assert updated["matching_status"] == "pending"
+                assert updated["matching_revision"] > deletable.matching_revision
+            request = Request(
+                f"{base}/api/tasks/{deletable.id}",
+                data=json.dumps({"owner": "alice"}).encode(),
+                headers={"Content-Type": "application/json"}, method="PUT",
+            )
+            try:
+                urlopen(request, timeout=3)
+                raise AssertionError("task edits must not bypass ownership rules")
+            except HTTPError as error:
+                assert error.code == 400
             request = Request(
                 f"{base}/api/tasks/{deletable.id}",
                 method="DELETE",
@@ -932,7 +1073,7 @@ def test_http_server_serves_console_and_api():
                 assert detail["configuration"]["role"] == "reviewer"
                 assert detail["configuration"]["prompt"] == "Review only"
                 assert detail["configuration"]["restart_required"] is False
-                assert len(detail["configuration"]["tool_catalog"]) == 14
+                assert len(detail["configuration"]["tool_catalog"]) == len(teams.TEAM_CORE_TOOLS) + len(teams.TEAM_OPTIONAL_TOOLS)
             with urlopen(f"{base}/api/team/communications", timeout=3) as response:
                 assert json.loads(response.read())["items"] == []
             with urlopen(f"{base}/api/subagents", timeout=3) as response:

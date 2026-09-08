@@ -13,7 +13,7 @@ gugugaga 是一个面向单用户、本地 Workspace 的 Agent Runtime。它把 
 |---|---|---|
 | Main Agent | 可用 | 多轮 Tool Calling、规划协调、权限控制、会话恢复和运行事件记录 |
 | Web Console | 可用 | Agent Runtime Graph、Task 看板、Team Graph、Memory、Database、历史对话和本地配置 |
-| Task System | 可用 | 持久化任务、依赖、手动分配、自动领取、队列和安全删除 |
+| Task System | 可用 | Lead 候选匹配、人工覆盖、原子领取、依赖、队列、不匹配重分配和等待原因解释 |
 | Team Agent | 可用 | 长期成员、多成员并行、Mailbox 通信、停止/重启/删除、创建后编辑角色/Prompt/工具 |
 | Subagent | 可用 | 当前 Turn 内并发、权限审批、取消、超时、实时事件和历史摘要 |
 | Mailbox | 可用 | 普通消息唤醒空闲 Agent、claim/ack/nack、遗留 inflight 恢复和 dead-letter |
@@ -38,8 +38,10 @@ flowchart LR
     MB -->|"唤醒 / 投递"| T["Team Agents<br/>长期协作成员"]
     T -->|"发送 / 回复"| MB
 
-    M --> TS[("Task System")]
-    TS -->|"分配 / 原子领取"| T
+    M -->|"维护候选与理由"| TS[("Task System")]
+    U -->|"人工指定"| TS
+    TS -->|"候选资格 / 人工预留"| T
+    T -->|"原子领取 / 完成"| TS
 
     M --> G["Workspace Guard"]
     S --> G
@@ -116,8 +118,8 @@ flowchart TB
 flowchart TB
     subgraph TASKS["Task Concurrency"]
         direction LR
-        TR["多个 Agent<br/>竞争领取"] --> TL["进程内 RLock<br/>+ 跨进程 .state.lock"]
-        TL --> TV{"状态 · 依赖<br/>Assignee · Owner 校验"}
+        TR["空闲轮询 / 模型 claim_task"] --> TL["成员锁 → 任务 RLock<br/>→ 跨进程 .state.lock"]
+        TL --> TV{"状态 · 依赖 · 占用 · 开关<br/>候选资格 / 人工指定"}
         TV -->|"通过"| TO["原子领取<br/>一任务一 Owner"]
         TV -->|"冲突"| TX["拒绝领取"]
     end
@@ -177,7 +179,7 @@ Main Agent 当前注册 30 个内置工具；启用显式记忆后还会增加 `
 - Workspace：`bash`、`read_file`、`write_file`、`edit_file`、`glob`
 - 规划与上下文：`todo_write`、`load_skill`、`compact`、`web_search`
 - Subagent：`spawn_subagent`、`check_subagent`、`wait_subagents`、`cancel_subagent`、`review_subagent_permission`
-- Task：`create_task`、`list_tasks`、`get_task`、`claim_task`、`complete_task`
+- Task：`create_task`、`list_tasks`、`get_task`、`update_task`、`list_task_candidates_context`、`set_task_candidates`、`claim_task`、`complete_task`
 - Cron：`schedule_cron`、`list_crons`、`cancel_cron`
 - Team：`spawn_teammate`、`send_message`、`stop_teammate`、`restart_teammate`、`check_inbox`、`request_shutdown`、`request_plan`、`review_plan`
 
@@ -185,13 +187,14 @@ Main Agent 当前注册 30 个内置工具；启用显式记忆后还会增加 `
 
 Subagent 的工具固定为：`bash`、`read_file`、`write_file`、`edit_file`、`glob`、`web_search`。它不能创建 Team Agent、领取 Task 或直接操作 Mailbox。
 
-Team Agent 的五个协作核心工具始终启用且在界面中锁定：
+Team Agent 的六个协作核心工具始终启用且在界面中锁定：
 
 - `send_message`
 - `list_tasks`
 - `get_task`
 - `claim_task`
 - `complete_task`
+- `report_task_mismatch`
 
 以下九个工具可以在 Team Agent 详情中自由开关：
 
@@ -221,7 +224,7 @@ Agent Overview 只显示 Main Agent 当前 Turn 的真实运行事件：输入�
 
 ![Task System](docs/images/task-system.png)
 
-任务看板按 pending、in progress 和 completed 分栏，显示依赖、Assignee、Owner 与更新时间。Workspace 的“Team 自动领取”开关决定由空闲成员竞争领取，还是由用户手动预留给指定成员。手动分配只是写入 Assignee，真正开始执行时仍需经过原子 claim。
+任务看板按 pending、in progress 和 completed 分栏，分别显示候选成员、分配理由、人工指定、实际 Owner 与等待原因。分配列表默认显示候选，可切换“查看全部成员”指定候选外成员。手动分配只写入 Assignee，真正开始执行时仍需经过原子 claim。
 
 ### Team Agent Graph 与邮件传递
 
@@ -242,28 +245,185 @@ Team Agent Graph 把 Lead 与长期成员画成节点。消息发送时，信封
 - 可选工具列表；
 - 恢复为初始角色、初始 Prompt 和默认工具。
 
-配置会持久化到 Workspace。运行中的成员保存配置后会进入安全重载流程，使新角色、Prompt 和工具集合用于后续执行；stopped 成员会在下一次启动时加载新配置。五个核心协作工具始终保留，避免编辑后产生无法领取任务或无法汇报结果的“失联 Agent”。
+配置会持久化到 Workspace。运行中的成员保存配置后会进入安全重载流程，使新角色、Prompt 和工具集合用于后续执行；stopped 成员会在下一次启动时加载新配置。六个核心协作工具始终保留，避免编辑后产生无法领取任务或无法汇报结果的“失联 Agent”。
 
 ## Task System 与 Team Agent
+
+### 分配流程架构
+
+Lead 根据任务要求和成员能力维护候选范围；用户可以指定具体成员；Task System 在原子领取时确定实际 Owner。自动轮询和模型调用共用同一个领取入口。
+
+![任务分配架构：Lead 维护候选，用户明确指定，Agent 原子领取](docs/images/task-assignment-architecture.svg)
+
+<details>
+<summary>查看可编辑的 Mermaid 架构源码</summary>
+
+```mermaid
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"Inter, Segoe UI, Microsoft YaHei","lineColor":"#97A6BB","primaryTextColor":"#17243D","clusterBkg":"#F8FAFC","clusterBorder":"#DFE6F0"},"flowchart":{"curve":"basis","nodeSpacing":30,"rankSpacing":42}}}%%
+flowchart TB
+    CHANGE["任务创建 / 要求变化<br/>成员创建 / 配置变化 / 不匹配退出"]
+    EVENTS["任务 JSON 中的待匹配事件<br/>合并原因 · 递增 matching_revision"]
+    LEAD["Lead 匹配<br/>任务要求 × 角色 / Prompt / 工具"]
+    SAVE{"set_task_candidates<br/>版本仍有效且任务可重新匹配？"}
+    STORE[("Task System<br/>候选 · 理由 · 人工指定 · Owner")]
+    USER["用户分配界面<br/>默认候选 / 查看全部成员"]
+    MANUAL["人工预留 assignee<br/>检查依赖与成员占用"]
+    POLL["空闲 Agent 轮询<br/>只读候选 / 指定结果"]
+    TOOL["Agent 模型调用 claim_task"]
+    CLAIM["统一原子 claim<br/>重读任务并检查全部领取条件"]
+    OWNER["写入 owner<br/>进入 in_progress"]
+    BOARD["看板解释<br/>候选 · 理由 · 人工指定 · Owner · 等待原因"]
+
+    CHANGE -->|"仅未领取、未人工指定的任务"| EVENTS
+    EVENTS -->|"合并通知，等待 Lead 可处理"| LEAD
+    LEAD --> SAVE
+    SAVE -->|"通过：保存候选与理由"| STORE
+    SAVE -->|"版本过期：读取最新上下文"| LEAD
+    SAVE -->|"已领取或已人工指定：保留归属"| STORE
+    USER --> MANUAL --> STORE
+    STORE --> POLL
+    POLL --> CLAIM
+    TOOL --> CLAIM
+    STORE -.->|"锁内重新读取"| CLAIM
+    CLAIM -->|"校验通过"| OWNER
+    CLAIM -->|"拒绝本次领取，显示当前状态"| BOARD
+    OWNER --> STORE
+    STORE --> BOARD
+
+    classDef context fill:#F0EDF9,stroke:#E3DDF5,color:#6958B2,rx:12,ry:12;
+    classDef lead fill:#7562D8,stroke:#7562D8,color:#FFFFFF,rx:14,ry:14;
+    classDef store fill:#FFFFFF,stroke:#DFE6F0,color:#17243D,rx:12,ry:12;
+    classDef manual fill:#EDF4FF,stroke:#D9E6FC,color:#377DDD,rx:12,ry:12;
+    classDef execute fill:#EAF6F3,stroke:#D4EAE4,color:#147B6D,rx:12,ry:12;
+    class CHANGE,EVENTS,SAVE context;
+    class LEAD lead;
+    class STORE,BOARD store;
+    class USER,MANUAL manual;
+    class POLL,TOOL,CLAIM,OWNER execute;
+```
+
+</details>
+
+匹配和执行分别由事件与领取规则驱动。候选更新只保存资格，不直接启动成员；自动领取关闭时仍可更新候选，执行继续等待人工指定。没有候选、匹配尚未完成或候选都忙时，任务不会开放给其他成员。
+
+| 数据 | 含义 | 更新方 |
+|---|---|---|
+| `candidate_members` | 允许自动领取的成员列表；匹配完成且为空时表示没有合适成员 | Lead，通过版本校验后保存 |
+| `assignment_reason` | 根据任务要求、成员角色、Prompt 和工具做出匹配的理由 | Lead；无人适合时也必须给出理由 |
+| `assignee` | 用户指定的成员，优先于候选范围；尚不代表已经开始执行 | 人工分配或现有用户队列/干预流程 |
+| `owner` | 已经成功领取任务的实际执行者 | 原子 claim；完成时保留以记录归属 |
+| `matching_status` | `pending` 待匹配、`matched` 已匹配、`rematch_required` 不匹配退出后待重新分配 | 任务事件、Lead 匹配与不匹配报告 |
+| `matching_revision` / `matching_notified_revision` | 当前匹配版本与已确认通知版本，用于拒绝过期结果、合并和恢复通知 | Task System 与 Lead 收件箱处理 |
+| `mismatch_reports` | 原成员、不匹配原因、已有工作摘要与时间 | 当前 Owner 报告，Task System 追加保存 |
 
 ### 分配与领取
 
 Workspace 有一个 Team 自动领取总开关：
 
 - **关闭**：用户只能把 ready Task 手动预留给一个在线、空闲的 Team Agent。
-- **开启**：空闲 Team Agent 可以竞争领取依赖已经完成的 pending Task。
+- **开启**：空闲 Team Agent 只能竞争领取自己在候选名单内、匹配已完成且依赖已完成的 pending Task。人工指定的任务只有指定成员可以领取。
 
-Task System 是工作归属的唯一权威来源。创建 Team Agent 只代表成员上线，不代表它已经获得任务。
+旧任务缺少候选字段时保持待匹配，不默认允许所有成员领取；已有人工指定与执行归属继续保留。
+
+Task System 是工作归属的唯一权威来源。创建 Team Agent 会触发候选重新匹配，不代表已经分配任务；关闭自动领取时，创建成员或更新候选都不会自行启动任务。
 
 多个 Agent 同时领取时，系统按以下顺序处理：
 
-1. 使用进程内 `RLock` 和跨进程 `.tasks/.state.lock` 包住完整状态转换；
+1. 运行时先获取成员锁，再使用任务 `RLock` 和跨进程 `.tasks/.state.lock` 包住完整状态转换；
 2. 在锁内重新读取 Task，而不是相信轮询时看到的旧快照；
-3. 校验 Task 仍是 pending、没有 Owner、Assignee 与领取者一致、所有依赖已完成；
-4. 校验领取者当前没有其他 `in_progress` Task；
-5. 同时写入 Owner、Assignee 和 `in_progress` 状态，再原子保存 JSON。
+3. 校验 Task 仍是 pending、没有 Owner、所有依赖已完成；人工指定时验证指定者，否则验证匹配状态与候选资格；
+4. 校验领取者在线、可领取、没有其他 `in_progress` Task，且自动领取已开启或有人工指定；
+5. 写入 Owner 和 `in_progress` 状态，再原子保存 JSON。自动领取不改写 Assignee。
 
 因此多个 Agent 可以同时“发现”一个候选任务，但只能有一个成功成为 Owner。后到者会看到状态或 Owner 已改变并收到拒绝结果。完成任务时再次校验 Owner，其他 Agent 无法代替实际 Owner 标记完成。
+
+人工指定可以超出候选范围，其他候选成员也不能抢走已指定任务。看板默认显示候选成员，可切换“查看全部成员”，范围外成员标注“非候选成员”；忙碌或离线成员不可选。人工指定同样受依赖、在线状态和任务占用检查约束。
+
+运行时把“正在响应模型消息”和“已占用执行任务”分开记录。`dispatch_available` 表示成员是否可以接受任务；停止、重启、等待配置重载或持有执行任务的成员不可领取。模型主动领取与空闲轮询都要经过这个校验。
+
+### 候选更新与不匹配退出
+
+任务创建、未执行任务要求变化、成员创建或角色/Prompt/工具变化，以及不匹配退出，会触发 Lead 重新匹配。第一版对成员变化检查所有未领取、未被人工指定的任务，由 Lead 判断相关性。正在执行的任务保留归属，人工预留也不会被自动改派；运行中调整方向继续使用现有干预流程。
+
+重新匹配时可以保留上次候选和理由供查看，但 `matching_status` 会使旧名单暂时失去自动领取效力，直到 Lead 保存当前版本的匹配结果。
+
+| 触发事件 | 匹配处理 |
+|---|---|
+| 新任务创建 | 保存待匹配状态并通知 Lead |
+| 未领取、未人工指定任务的要求变化 | 递增该任务版本，等待 Lead 重新匹配 |
+| 新成员创建 | 重新评估可匹配任务，包括此前候选为空的任务 |
+| 成员角色、Prompt 或工具变化 | 使可匹配任务的旧匹配结果失效，由 Lead 加入或移除成员 |
+| 成员删除 | 重新评估可匹配任务，清理过期候选关系 |
+| 当前 Owner 报告不匹配 | 保存原因和工作摘要，释放归属并通知 Lead |
+| 成员忙闲、在线状态变化或空闲轮询 | 只重新检查能否领取，不调用 Lead 重做能力匹配 |
+
+待匹配事件和版本随任务 JSON 持久保存，多次变化合并为一次 Lead 通知。Lead 使用 `list_task_candidates_context` 查看任务版本和成员配置，通过 `set_task_candidates` 写入名单与理由；过期版本会被拒绝，须读取新上下文。空闲轮询只读取匹配结果，不调用 Lead。匹配完成后不会因任务仍在等待而反复通知；Lead 未完成匹配时保留事件，复用收件箱失败退避后重试。
+
+Lead 收件箱把这些持久事件合成为 `assignment_match_requested` 消息。任务内容变化发生在匹配期间时，旧版本结果不能覆盖新状态，旧通知的确认也不能清除新版本事件。仅查看通知、模型失败或未保存匹配结果，都不会把同版本的待匹配工作确认完成；重启后仍能发现尚未处理的事件。
+
+成员可调用 `report_task_mismatch(task_id, reason, work_summary)` 报告职责或能力不匹配。任务保留原因、已有工作摘要和干预记录，清空 Owner 与人工指定，回到 pending 并标记等待重新分配。Lead 完成匹配前不能再次自动领取。普通执行失败的自动重试不属于此流程。
+
+![任务状态流转：候选匹配、人工预留、执行完成与不匹配重新分配](docs/images/task-assignment-lifecycle.svg)
+
+<details>
+<summary>查看可编辑的 Mermaid 状态源码</summary>
+
+```mermaid
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"Inter, Segoe UI, Microsoft YaHei","primaryColor":"#FFFFFF","primaryTextColor":"#17243D","primaryBorderColor":"#DFE6F0","lineColor":"#97A6BB","tertiaryColor":"#F8FAFC"}}}%%
+stateDiagram-v2
+    direction LR
+    state "待匹配（pending / pending）" as Matching
+    state "已匹配，等待领取（pending / matched）" as Ready
+    state "人工预留（pending，assignee 已指定）" as Reserved
+    state "执行中（in_progress，owner 已确定）" as Running
+    state "等待重新分配（pending / rematch_required）" as Rematching
+    state "已完成（completed，保留 owner）" as Done
+
+    [*] --> Matching: 创建任务
+    Matching --> Ready: Lead 保存候选与理由
+    Ready --> Matching: 要求或成员配置变化
+    Ready --> Running: 自动领取开启且原子校验通过
+    Matching --> Reserved: 用户明确指定
+    Ready --> Reserved: 用户明确指定
+    Reserved --> Running: 指定成员通过原子校验
+    Reserved --> Matching: 一般任务取消指定
+    Reserved --> Rematching: 不匹配任务取消指定
+    Running --> Rematching: Owner 报告不匹配并释放归属
+    Rematching --> Ready: Lead 完成重新匹配
+    Rematching --> Reserved: 用户明确覆盖指定
+    Running --> Done: Owner 完成任务
+
+    classDef match fill:#F0EDF9,stroke:#DCD6F5,color:#6958B2
+    classDef manual fill:#EDF4FF,stroke:#CADCF6,color:#377DDD
+    classDef execute fill:#EAF6F3,stroke:#C9E3DD,color:#147B6D
+    classDef rematch fill:#FCF3E5,stroke:#EDDCC1,color:#9C6927
+    class Matching,Ready match
+    class Reserved manual
+    class Running,Done execute
+    class Rematching rematch
+```
+
+</details>
+
+图中的 `pending / matched` 分别表示任务状态和匹配状态。匹配完成可以得到空候选列表，也可能仍有未完成依赖；只有领取条件全部满足才会进入执行中。用户停止、转向及错误归属释放继续使用现有干预流程，图中仅展示候选分配的主路径。
+
+### 看板上的等待原因
+
+看板从任务、团队设置和成员状态生成等待解释，不触发模型匹配。候选名单、分配理由、人工指定和实际 Owner 分别展示。
+
+人工指定任务优先检查依赖和指定成员状态；其他任务按不匹配报告、匹配状态、依赖、自动领取开关、候选可用性的顺序给出主要等待原因。自动领取条件全部通过时，`waiting_reason` 为 `null`。
+
+| 等待原因 | 下一步条件 |
+|---|---|
+| 尚未确定候选成员 | Lead 完成当前版本匹配 |
+| 尚无合适的候选成员 | 要求或团队能力发生变化后重新匹配，或用户手动指定 |
+| 依赖未完成 | 所有依赖任务完成 |
+| 候选成员都忙或不在线 | 候选成员恢复可领取状态，领取范围保持不变 |
+| 报告不匹配，等待重新分配 | Lead 完成重新匹配，或用户明确覆盖指定 |
+| 自动领取已关闭，等待人工指定 | 用户选择执行成员 |
+| 人工指定成员忙碌或不在线 | 指定成员恢复可领取状态，或用户更改指定 |
+
+任务要求可通过 Lead 的 `update_task` 或 `PUT /api/tasks/{id}` 更新；这些入口拒绝直接修改正在执行的任务。实现入口集中在 `tasks.py`（持久化与原子状态转换）、`teams.py`（Lead 事件、成员运行时与统一领取）、`tools.py`（模型工具）和 `web.py` / `web_assets/app.js`（分配界面与解释）。
 
 ### 生命周期
 
@@ -462,53 +622,41 @@ Web 会为实际注入的结果保存 Recall Impression，记录查询、来源�
 
 ### 5. Consolidation 与 Evidence 生命周期
 
-```mermaid
-%%{init: {"theme":"base","themeVariables":{"fontFamily":"Inter, Segoe UI, Microsoft YaHei","lineColor":"#94A3B8","clusterBkg":"#F8FAFC","clusterBorder":"#E2E8F0"}}}%%
-flowchart TB
-    E[("完整 Exchange<br/>Hot + Pending")] --> C["原子 Claim + Lease<br/>默认每批 6 个 Exchange"]
-    C --> D["凭据遮蔽"]
-    D --> L["Consolidation LLM"]
-    L --> V{"严格 JSON<br/>长期价值校验"}
-    V -->|"成功"| TX["SQLite 事务提交<br/>记忆 · 来源 · 审计 · 整合状态"]
-    TX --> M[("Facts 0–10 · Episodes 0–5")]
-    TX --> LC["Evidence 生命周期校准"]
-    START["服务启动<br/>按当前热窗口校准历史记录"] --> LC
-    LC -->|"窗口内 Cold 恢复 Hot"| HOT[("Hot 原文<br/>最近 10000 个已整合 Exchange<br/>未整合 / 未完整原文保持 Hot")]
-    LC -->|"超出窗口且已整合"| COLD[("Cold 原文<br/>保留原文和 FTS · 删除向量")]
+**先分清三件事：原文一直保存在 `chat_log`；一次整合任务记录在 `consolidation_batches`；提取出的记忆另外写入 `facts` / `episodes`。** 整合会新增记忆、更新处理状态，不会把原文“搬走”。
 
-    V -->|"失败 / 超时"| RP["Retry Pending<br/>60s → 300s → 1800s → 7200s → 86400s"]
-    RP -.-> C
+![长期记忆整合分支流程图：原文落库、六轮领取、模型提取、原子提交、失败重试与崩溃回收](docs/images/memory-consolidation-flow.svg)
 
-    E -->|"原文先进入检索"| FTS["FTS5 · 同步<br/>Facts / Episodes / Hot + Cold 原文"]
-    E -->|"原文向量入队"| OUT["Vector Outbox · 异步任务"]
-    M --> FTS
-    M -->|"upsert"| OUT
-    HOT --> FTS
-    HOT -->|"恢复时重新排队建向量"| OUT
-    COLD --> FTS
-    COLD -->|"delete"| OUT
-    OUT --> IDX[("向量索引 · 当前配置 bge-m3<br/>Active Facts / Episodes / Hot 原文")]
+**图里的表分别做什么？**
 
-    classDef source fill:#FFF7ED,stroke:#FB923C,color:#9A3412,stroke-width:1.5px;
-    classDef process fill:#EEF2FF,stroke:#818CF8,color:#312E81,stroke-width:1.5px;
-    classDef decision fill:#FEFCE8,stroke:#EAB308,color:#713F12,stroke-width:1.5px;
-    classDef success fill:#ECFDF5,stroke:#34D399,color:#065F46,stroke-width:1.5px;
-    classDef failure fill:#FEF2F2,stroke:#F87171,color:#991B1B,stroke-width:1.5px;
+| 表 | 保存什么 | 在整合中的作用 |
+| --- | --- | --- |
+| `chat_log` | 用户和助手的原文，每条消息一行 | 用 `turn_id` 组成 Exchange；`consolidation_status` 表示这条原文是否已被整理 |
+| `consolidation_batches` | 一次领取任务的批次 ID、来源轮次、租约、尝试次数和错误 | 记录这次任务是 `processing`、`consolidated` 还是 `failed`；**没有 `pending` 状态** |
+| `facts` | 稳定偏好、身份、长期目标等事实 | 保存提取出的长期语义记忆 |
+| `episodes` | 带时间边界的经历、活动、决定或计划 | 保存提取出的事件记忆 |
+| `memory_sources` | 记忆与来源 `turn_id` 的关联 | 从摘要追溯原文；当前关联整个来源批次，不是精确定位某一句话 |
+| `memory_audit` | 保存、整合成功或失败等操作记录 | 用于排查发生了什么 |
+| `memory_fts` | 原文和记忆的全文检索内容，属于 FTS5 虚拟表 | 由触发器同步维护，支持关键词检索 |
+| `memory_index_outbox` | 待执行的向量新增、更新或删除任务 | 让向量索引在提交后异步更新，并单独管理重试 |
+| `memory_embeddings` | 已生成的向量及模型信息 | 供向量检索使用 |
 
-    class E,M,COLD source;
-    class C,D,L,START,LC,FTS,OUT process;
-    class V decision;
-    class TX,HOT,IDX success;
-    class RP failure;
-```
+**沿主线读一遍：**
 
-每个完整 user/assistant Exchange 最初都是 Hot + Pending。后台 Worker 只在凑够默认 6 个完整 Exchange 后领取批次；领取使用 `BEGIN IMMEDIATE`、attempt count 和 lease，避免多个 Worker 整合同一批数据。启动或下次处理时会回收过期 lease。
+1. **原文先存，六轮再整合。** 每条消息先写入 `chat_log`；用户消息起初是 `incomplete`，助手最终回复落库后，同一 `turn_id` 的双方变成 `pending`。一轮 Exchange 是“一条用户消息 + 一条助手消息”，六轮通常对应 12 行原文。原文插入时就同步登记 FTS 和向量待办，不需要等待摘要提取。
+2. **Worker 领取的是原文，顺便创建一张“任务单”。** 后台先回收过期租约，再从 `chat_log` 选最早的、重试时间已到的 6 个完整 `pending` Exchange；不足六轮就等待。在 `BEGIN IMMEDIATE` 事务内，将选中的消息改成 `processing`、绑定 `batch_id`、增加尝试次数，并创建 `processing` 批次记录和默认 600 秒租约。**领取事务提交后才调用模型**，不会持有数据库写锁等待模型返回。
+3. **模型整理，程序校验入库条件。** 先遮蔽送入模型的凭据，保留数据库原文；模型输出受约束 JSON，最多 10 条 Fact、5 条 Episode。提示词要求模型判断长期价值、排除临时请求和调试状态；程序检查结构、凭据、重要度阈值，以及 Fact 的 `durability` 是否为 `long_term`。候选被过滤是正常结果；即使最终没有值得保存的记忆，也可以成功完成这个批次。
+4. **成功时，内容与进度一起提交。** 再检查租约有效、原文仍归当前批次所有，在同一 SQLite 事务中写入记忆、来源和审计，由触发器维护 FTS 和 Outbox，并将 `chat_log.consolidation_status` 与 `consolidation_batches.status` 一起设为 `consolidated`。中途失败则回滚这次事务，避免出现“进度显示完成，记忆却没保存”的半成品。
 
-送入模型前先遮蔽凭据。Consolidation LLM 只能输出受约束 JSON；验证层限制最大 Fact 数量、最低重要度和允许保存的长期信息类型，当前功能请求、调试状态、工具输出、临时模型选择等不会自动变成长期用户偏好。
+**右侧两条异常分支：**
 
-成功时，Fact/Episode、来源关系、审计记录、Batch 状态和 Exchange 状态在 SQLite 事务中提交。随后 Evidence Lifecycle 保留最近 N 个已整合 Exchange 为 Hot（默认 10000），更早的转为 Cold。未整合或未完整的 Evidence 始终保持 Hot，避免在成功沉淀前失去原始证据。
+- **A · 调用失败、超时、校验或提交失败：** 旧批次变为 `failed`；仍属于该批次的原文回到 `pending`，清除批次绑定和租约，写入 `next_retry_at`。整合按 60、300、1800、7200、86400 秒退避，此后保持一天的间隔。到期后重新参与凑批，**下一次领取会创建新批次 ID**，可能与其他符合条件的对话重新组合。
+- **B · Worker 崩溃：** 原文和批次暂时停在 `processing`。租约到期后，由启动或下次处理的 Worker 主动回收：旧批次记为 `failed / lease_expired`，原文回到 `pending`。租约不会自己触发回收；过期任务后来返回的结果，也不能越过提交前的租约与归属检查。
 
-FTS5 通过数据库路径同步更新；可重建的向量索引通过 Outbox 异步更新，按 5 秒、30 秒、300 秒最多重试 3 次。Consolidation 失败或超时不会丢弃 Exchange，而是回到 Retry Pending，按 60 秒、300 秒、1800 秒、7200 秒、86400 秒退避。Web 中的 `Retry pending · N` 表示当前仍有等待重试或等待凑批的 pending 记录，不代表主对话已经失败。
+例如：第 1～6 轮被 `batch_A` 领取，随后模型超时。此时 **`batch_A` 留在批次表里，状态是 `failed`；这 6 轮原文留在 `chat_log`，状态是 `pending`**。重试时间到了，Worker 再领取符合条件的六轮，创建 `batch_B`。因此，“领取 pending 对话”查的是原文表，不是批次表。
+
+**提交后，索引和原文生命周期继续更新。** 同一后台 Worker 后续处理 Outbox，调用当前配置的 `bge-m3` 并写入 `memory_embeddings`；向量失败只重试索引任务，不重新提取摘要，也不撤销已提交记忆。默认最多自动尝试 3 次，前两次失败分别等待 5 秒、30 秒，第 3 次失败后记为 `failed`，等待显式重试。
+
+整合成功后、服务启动时都会校准 Evidence 生命周期：最近 10000 个已整合 Exchange 保持 Hot，更早的转为 Cold；Cold 保留原文和 FTS，删除现有向量并登记 Outbox 删除任务，重新进入热窗口时再排队建向量。未整合或未完整的原文始终保持 Hot。Web 中的 `Retry pending · N` 表示仍有等待重试或等待凑批的 pending 记录，不代表主对话已经失败。
 
 ## 快速开始
 

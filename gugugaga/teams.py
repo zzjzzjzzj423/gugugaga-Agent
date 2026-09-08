@@ -30,6 +30,7 @@ from .provider import is_context_length_error
 from .stateio import atomic_write_text, interprocess_lock
 from .skills import load_skill
 from .tasks import (
+    ack_matching_requests,
     append_task_intervention,
     assign_task,
     can_start,
@@ -40,6 +41,11 @@ from .tasks import (
     interrupt_task,
     list_tasks,
     load_task,
+    pending_matching_requests,
+    report_task_mismatch,
+    request_all_task_rematches,
+    set_task_candidates,
+    update_task,
 )
 from .web_search import run_web_search
 from .workspace import run_bash, run_edit, run_glob, run_read, run_write
@@ -356,6 +362,7 @@ TEAM_CORE_TOOLS = (
     "get_task",
     "claim_task",
     "complete_task",
+    "report_task_mismatch",
 )
 TEAM_OPTIONAL_TOOLS = (
     "read_file",
@@ -382,6 +389,7 @@ _TEAM_TOOL_LABELS = {
     "get_task": ("查看任务详情", "任务系统"),
     "claim_task": ("领取任务", "任务系统"),
     "complete_task": ("完成任务", "任务系统"),
+    "report_task_mismatch": ("报告任务不匹配", "任务系统"),
     "read_file": ("读取文件", "工作区"),
     "glob": ("查找文件", "工作区"),
     "todo_write": ("维护执行计划", "规划"),
@@ -459,7 +467,7 @@ _TEAM_TOOL_DEFINITIONS = {
     },
     "claim_task": {
         "name": "claim_task",
-        "description": "Claim a pending task.",
+        "description": "Claim a ready task only when you are an eligible candidate or its explicit user assignee and have no active task.",
         "input_schema": {
             "type": "object",
             "properties": {"task_id": {"type": "string"}},
@@ -473,6 +481,19 @@ _TEAM_TOOL_DEFINITIONS = {
             "type": "object",
             "properties": {"task_id": {"type": "string"}},
             "required": ["task_id"],
+        },
+    },
+    "report_task_mismatch": {
+        "name": "report_task_mismatch",
+        "description": "Explain a role or capability mismatch and relinquish your current task for Lead rematching, preserving existing work. Do not use for ordinary execution errors.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string"},
+                "reason": {"type": "string"},
+                "work_summary": {"type": "string"},
+            },
+            "required": ["task_id", "reason"],
         },
     },
     "read_file": {
@@ -755,17 +776,23 @@ def update_teammate_profile(
         if len(next_prompt) > 20_000:
             raise ValueError("teammate prompt is too long")
         normalized_tools = _normalize_teammate_tools(next_tools)
-        saved = _persist_teammate_profile(
-            name,
-            next_role,
-            next_prompt,
-            normalized_tools,
-        )
         with _teammate_lock:
+            saved = _persist_teammate_profile(
+                name, next_role, next_prompt, normalized_tools,
+            )
+            if (
+                next_role != current["role"]
+                or next_prompt != current["prompt"]
+                or normalized_tools != current["allowed_tools"]
+            ):
+                request_all_task_rematches(f"Agent {name} configuration changed")
             active = name in active_teammates
             state = _teammate_states.get(name) or {}
             status = str(state.get("status") or "stopped")
-            has_active_task = bool(state.get("current_task_id"))
+            has_active_task = any(
+                task.status == "in_progress" and task.owner == name
+                for task in list_tasks()
+            )
             if active:
                 _teammate_profile_restart_pending.add(name)
                 apply_state = "pending"
@@ -805,7 +832,7 @@ def update_team_settings(auto_claim_enabled: bool) -> dict[str, Any]:
         "updated_at": time.time(),
     }
     path = _team_settings_path()
-    with interprocess_lock(path.with_suffix(".lock")):
+    with _teammate_lock, interprocess_lock(path.with_suffix(".lock")):
         atomic_write_text(
             path, json.dumps(value, ensure_ascii=False, indent=2)
         )
@@ -866,6 +893,12 @@ def list_teammate_states() -> list[dict[str, Any]]:
                     "online": online,
                     "status": status,
                     "current_task_id": current_task_id,
+                    "dispatch_available": (
+                        online and status in {"idle", "running"}
+                        and not active_by_owner.get(name)
+                        and name not in _teammate_profile_restart_pending
+                        and bool(state.get("dispatch_available", not current_task_id))
+                    ),
                 }
             )
     return sorted(values, key=lambda item: item["name"].casefold())
@@ -879,6 +912,7 @@ def assign_task_to_teammate(task_id: str, teammate: str) -> dict[str, Any]:
             raise ValueError(f"teammate '{teammate}' is offline")
         if state.get("status") != "idle":
             raise ValueError(f"teammate '{teammate}' is not idle")
+        previous_assignee = load_task(task_id).assignee
         task = assign_task(task_id, teammate)
         try:
             BUS.send(
@@ -891,10 +925,107 @@ def assign_task_to_teammate(task_id: str, teammate: str) -> dict[str, Any]:
         except Exception:
             from .tasks import unassign_task
 
-            unassign_task(task.id)
+            if previous_assignee:
+                assign_task(task.id, previous_assignee)
+            else:
+                unassign_task(task.id)
             raise
         _set_teammate_state(teammate, current_task_id=task.id)
+        if previous_assignee and previous_assignee != teammate:
+            previous_state = _teammate_states.get(previous_assignee, {})
+            if previous_state.get("current_task_id") == task.id:
+                _set_teammate_state(previous_assignee, current_task_id=None)
     return asdict(task)
+
+
+def claim_task_for_teammate(task_id: str, teammate: str) -> str:
+    """Use one dispatch rule for polling and model tools, under ordered locks."""
+
+    with _teammate_lock:
+        def eligible(task) -> str | None:
+            state = _teammate_states.get(teammate)
+            if teammate not in active_teammates or state is None:
+                return f"Error: teammate '{teammate}' is offline"
+            if (
+                state.get("status") not in {"idle", "running"}
+                or teammate in _teammate_profile_restart_pending
+                or not state.get(
+                    "dispatch_available", not state.get("current_task_id")
+                    or state.get("current_task_id") == task.id,
+                )
+            ):
+                return f"Error: teammate '{teammate}' is not idle"
+            if not get_team_settings()["auto_claim_enabled"] and task.assignee != teammate:
+                return (
+                    "Error: manual assignment required while Team auto-claim "
+                    f"is disabled; task {task_id} is not assigned to {teammate}"
+                )
+            return None
+
+        try:
+            result = claim_task(task_id, teammate, eligibility_check=eligible)
+        except (FileNotFoundError, ValueError) as error:
+            return f"Error: {error}"
+        if result.startswith("Claimed"):
+            _set_teammate_state(
+                teammate, status="running", current_task_id=task_id,
+                dispatch_available=False,
+            )
+        return result
+
+
+def task_candidates_context() -> dict[str, Any]:
+    """Read task versions and full member capabilities for Lead matching."""
+
+    with _teammate_lock:
+        return {
+            "tasks": [asdict(task) for task in list_tasks()
+                      if task.status == "pending" and not task.owner and not task.assignee],
+            "members": list(_load_teammate_profiles().values()),
+        }
+
+
+def run_task_candidates_context() -> str:
+    return json.dumps(task_candidates_context(), ensure_ascii=False, indent=2)
+
+
+def run_set_task_candidates(
+    task_id: str,
+    candidate_members: list[str],
+    assignment_reason: str,
+    expected_revision: int,
+) -> str:
+    try:
+        if not isinstance(candidate_members, list) or any(
+            not isinstance(name, str) for name in candidate_members
+        ):
+            raise ValueError("candidate_members must be an array of member names")
+        with _teammate_lock:
+            profiles = _load_teammate_profiles()
+            missing = set(candidate_members).difference(profiles)
+            if missing:
+                raise ValueError("unknown candidate members: " + ", ".join(sorted(missing)))
+            task = set_task_candidates(
+                task_id, candidate_members, assignment_reason,
+                expected_revision=expected_revision,
+            )
+        notify("task_candidates", {"task_id": task.id, "action": "updated"})
+        return json.dumps(asdict(task), ensure_ascii=False)
+    except (FileNotFoundError, ValueError) as error:
+        return f"Error: {error}"
+
+
+def run_update_task(
+    task_id: str,
+    subject: str | None = None,
+    description: str | None = None,
+    blockedBy: list[str] | None = None,
+) -> str:
+    try:
+        task = update_task(task_id, subject=subject, description=description, blockedBy=blockedBy)
+        return json.dumps(asdict(task), ensure_ascii=False)
+    except (FileNotFoundError, ValueError) as error:
+        return f"Error: {error}"
 
 
 def _submit_team_interaction_unlocked(
@@ -1139,6 +1270,8 @@ def _route_protocol_messages(msgs: list[dict]) -> None:
 
 
 def _lead_inbox_has_pending() -> bool:
+    if pending_matching_requests():
+        return True
     if (config.MAILBOX_DIR / "lead.jsonl").exists():
         return True
     claimed = set(getattr(BUS, "_claimed", {}).values())
@@ -1182,6 +1315,23 @@ def claim_lead_inbox(route_protocol: bool = True) -> InboxBatch:
     # rename leaves the event set for the next delivery.
     _lead_inbox_event.clear()
     batch = BUS.claim_inbox("lead")
+    requests = pending_matching_requests()
+    if requests:
+        versions = {task["id"]: task["matching_revision"] for task in requests}
+        message = {
+            "id": "matching_" + "_".join(f"{key}_{value}" for key, value in sorted(versions.items())),
+            "from": "system",
+            "to": "lead",
+            "type": "assignment_match_requested",
+            "content": "Re-evaluate these unclaimed, non-manually-assigned tasks against member roles, prompts and tools. Persist candidates and reasons using set_task_candidates with each matching_revision, even when no member fits. Read fresh context if a revision is stale.",
+            "metadata": {
+                "matching_revisions": versions,
+                "tasks": requests,
+                "members": list(_load_teammate_profiles().values()),
+            },
+            "ts": time.time(),
+        }
+        batch = InboxBatch(batch.batch_id, batch.agent, (*batch.messages, message), batch.path)
     try:
         if route_protocol:
             _route_protocol_messages(list(batch.messages))
@@ -1206,8 +1356,29 @@ def claim_lead_inbox(route_protocol: bool = True) -> InboxBatch:
     return batch
 
 
-def ack_lead_inbox(batch: InboxBatch) -> None:
+def ack_lead_inbox(batch: InboxBatch) -> bool:
+    """Acknowledge mail, retaining matching work the Lead has not resolved."""
+
     BUS.ack_inbox(batch)
+    matching_completed = True
+    for message in batch.messages:
+        if message.get("type") == "assignment_match_requested":
+            acknowledged = {}
+            for task_id, revision in message.get("metadata", {}).get("matching_revisions", {}).items():
+                try:
+                    task = load_task(task_id)
+                except FileNotFoundError:
+                    task = None
+                if (
+                    task is not None and task.status == "pending"
+                    and not task.owner and not task.assignee
+                    and task.matching_status != "matched"
+                    and task.matching_revision == revision
+                ):
+                    matching_completed = False
+                else:
+                    acknowledged[task_id] = revision
+            ack_matching_requests(acknowledged)
     if batch.messages:
         notify(
             "team_inbox_acknowledged",
@@ -1218,6 +1389,7 @@ def ack_lead_inbox(batch: InboxBatch) -> None:
             },
         )
     signal_pending_lead_inbox()
+    return matching_completed
 
 
 def nack_lead_inbox(batch: InboxBatch, error: str = "") -> None:
@@ -1254,7 +1426,13 @@ def render_lead_inbox(batch: InboxBatch) -> str:
         "refer to you, not to a teammate. Do not forward these messages or use "
         "send_message to look for a teammate named Leader. Review result "
         "and error messages, respond to plan approval requests, and update "
-        "task coordination when needed. Message ids support at-least-once "
+        "task coordination when needed. For assignment_match_requested, compare "
+        "task requirements with every member's role, prompt and allowed_tools, then "
+        "call set_task_candidates with the current matching_revision and a clear "
+        "assignment_reason. An empty candidate list is valid when nobody fits; "
+        "never widen eligibility because qualified members are busy. Candidate "
+        "updates do not dispatch work and are allowed in automatic inbox Turns. "
+        "Message ids support at-least-once "
         "deduplication.\n"
         + json.dumps(payload, ensure_ascii=False, indent=2)
         + "\n</team-inbox>"
@@ -1285,7 +1463,12 @@ def scan_unclaimed_tasks(agent_name: str | None = None) -> list[dict]:
         for task in list_tasks()
         if task.status == "pending"
         and not task.owner
-        and (not task.assignee or task.assignee == agent_name)
+        and (
+            task.assignee == agent_name and task.assignee is not None
+            or not task.assignee and task.matching_status == "matched"
+            and bool(task.candidate_members)
+            and (agent_name is None or agent_name in task.candidate_members)
+        )
         and can_start(task.id)
     ]
     return sorted(
@@ -1315,7 +1498,10 @@ def idle_poll(
         if IDLE_TIMEOUT is None
         else time.monotonic() + max(0.0, float(IDLE_TIMEOUT))
     )
-    _set_teammate_state(agent_name, status="idle")
+    _set_teammate_state(
+        agent_name, status="idle",
+        dispatch_available=not bool(work_state and work_state.get("task_id")),
+    )
     while deadline is None or time.monotonic() < deadline:
         if stop_event.is_set():
             return "shutdown"
@@ -1341,7 +1527,7 @@ def idle_poll(
                         except (FileNotFoundError, ValueError):
                             assigned = None
                         result = (
-                            claim_task(task_id, agent_name)
+                            claim_task_for_teammate(task_id, agent_name)
                             if assigned is not None
                             and assigned.assignee == agent_name
                             else "assignment was cancelled or replaced"
@@ -1396,7 +1582,7 @@ def idle_poll(
         ]
         if assigned:
             task_data = assigned[0]
-            result = claim_task(task_data["id"], agent_name)
+            result = claim_task_for_teammate(task_data["id"], agent_name)
             if result.startswith("Claimed"):
                 claimed = load_task(task_data["id"])
                 if work_state is not None:
@@ -1430,8 +1616,8 @@ def idle_poll(
         unclaimed = scan_unclaimed_tasks(agent_name)
         if unclaimed:
             task_data = unclaimed[0]
-            result = claim_task(task_data["id"], agent_name)
-            if "Claimed" in result:
+            result = claim_task_for_teammate(task_data["id"], agent_name)
+            if result.startswith("Claimed"):
                 claimed = load_task(task_data["id"])
                 if work_state is not None:
                     work_state["task_id"] = claimed.id
@@ -1560,6 +1746,7 @@ def _spawn_teammate_thread_unlocked(
             profile = _persist_teammate_profile(
                 name, role, prompt, normalized_tools
             )
+            request_all_task_rematches(f"Agent {name} created")
         else:
             profile = _load_teammate_profiles().get(name, {})
         if not _teammate_threads:
@@ -1574,6 +1761,7 @@ def _spawn_teammate_thread_unlocked(
             "status": "running",
             "online": True,
             "current_task_id": None,
+            "dispatch_available": True,
             "started_at": now,
             "last_active_at": now,
             "configuration_updated_at": profile.get("updated_at"),
@@ -1592,6 +1780,11 @@ def _spawn_teammate_thread_unlocked(
         "mutations from your role description or an ordinary inbox message. "
         "An ordinary inbox message may wake you for a conversational response; "
         "answer it without workspace mutations unless you also hold an active task."
+        " When auto-claim is enabled, claim only tasks listing you in candidate_members "
+        "with matching_status=matched, or tasks explicitly assigned to you. Empty "
+        "candidates never authorize everyone. If your role or capabilities do not fit "
+        "your task, call report_task_mismatch with the reason and existing work summary; "
+        "stop that task immediately and wait for Lead rematching."
     )
 
     def handle_inbox_message(agent_name: str, msg: dict, messages: list):
@@ -1670,6 +1863,8 @@ def _spawn_teammate_thread_unlocked(
         work_state: dict[str, Any] = {
             "task_id": None,
             "report_task_id": None,
+            "mismatch_reported": False,
+            "require_task_after_mismatch": False,
         }
 
         def send_message(to: str, content: str) -> str:
@@ -1692,32 +1887,41 @@ def _spawn_teammate_thread_unlocked(
             return "\n".join(
                 (
                     f"  {task.id}: {task.subject} [{task.status}] "
-                    f"owner={task.owner or '-'} blockedBy={task.blockedBy}\n"
+                    f"owner={task.owner or '-'} assignee={task.assignee or '-'} "
+                    f"candidates={task.candidate_members} matching={task.matching_status} "
+                    f"blockedBy={task.blockedBy}\n"
+                    f"    Assignment reason: {task.assignment_reason or '(pending matching)'}\n"
                     f"    {task.description or '(no description)'}"
                 )
                 for task in current
             )
 
         def claim_owned_task(task_id: str) -> str:
-            try:
-                candidate = load_task(task_id)
-            except (FileNotFoundError, ValueError) as error:
-                return f"Error: {error}"
-            if (
-                not get_team_settings()["auto_claim_enabled"]
-                and candidate.assignee != name
-            ):
-                return (
-                    "Error: manual assignment required while Team auto-claim "
-                    f"is disabled; task {task_id} is not assigned to {name}"
-                )
-            result = claim_task(task_id, owner=name)
+            result = claim_task_for_teammate(task_id, name)
             if result.startswith("Claimed"):
                 work_state["task_id"] = task_id
             return result
 
+        def report_owned_task_mismatch(
+            task_id: str, reason: str, work_summary: str = "",
+        ) -> str:
+            try:
+                with _teammate_lock:
+                    task = report_task_mismatch(task_id, name, reason, work_summary)
+                    work_state["task_id"] = None
+                    work_state["report_task_id"] = None
+                    work_state["mismatch_reported"] = True
+                    work_state["require_task_after_mismatch"] = True
+                    _set_teammate_state(
+                        name, current_task_id=None, dispatch_available=True,
+                    )
+                notify("task_mismatch", {"task_id": task.id, "name": name, "reason": reason})
+                return f"Released {task.id} due to mismatch; stop this task and wait for Lead rematching."
+            except (FileNotFoundError, ValueError) as error:
+                return f"Error: {error}"
+
         def run_task_mutation(handler: Callable, **arguments) -> str:
-            if await_assignment:
+            if await_assignment or work_state.get("require_task_after_mismatch"):
                 task_id = work_state.get("task_id")
                 try:
                     current = load_task(task_id) if task_id else None
@@ -1753,6 +1957,7 @@ def _spawn_teammate_thread_unlocked(
                 work_state["report_task_id"] = task_id
                 if work_state["task_id"] == task_id:
                     work_state["task_id"] = None
+                _set_teammate_state(name, current_task_id=None, dispatch_available=True)
             return result
 
         teammate_todos: list[dict[str, str]] = []
@@ -1794,6 +1999,7 @@ def _spawn_teammate_thread_unlocked(
             "get_task": get_task_json,
             "claim_task": claim_owned_task,
             "complete_task": complete_owned_task,
+            "report_task_mismatch": report_owned_task_mismatch,
             "submit_plan": lambda plan: _teammate_submit_plan(name, plan),
         }
 
@@ -2084,7 +2290,10 @@ def _spawn_teammate_thread_unlocked(
                             f"正在执行工具 {block.name}",
                         )
                         tool_started = time.monotonic()
-                        if plan_submitted:
+                        if work_state.get("mismatch_reported"):
+                            output = "Tool not executed because the active task was relinquished due to a mismatch."
+                            tool_status = "blocked"
+                        elif plan_submitted:
                             output = (
                                 "Tool not executed because this tool group already "
                                 "submitted a plan for approval."
@@ -2140,6 +2349,10 @@ def _spawn_teammate_thread_unlocked(
                     if should_shutdown:
                         break
                     messages.append({"role": "user", "content": results})
+                    if work_state.get("mismatch_reported"):
+                        work_state["mismatch_reported"] = False
+                        burst_complete = True
+                        break
                     if broker.pending(interaction_target, "redirect", "steer"):
                         inject_interactions({"redirect", "steer"})
                     if protocol_ctx["waiting_plan"]:
@@ -2363,8 +2576,9 @@ def delete_teammate(name: str) -> dict[str, Any]:
                 f"teammate '{name}' still has unfinished tasks: "
                 + ", ".join(bound_tasks)
             )
-        profile_deleted = _delete_teammate_profile(name)
         with _teammate_lock:
+            profile_deleted = _delete_teammate_profile(name)
+            request_all_task_rematches(f"Agent {name} deleted")
             _teammate_profile_restart_pending.discard(name)
             _teammate_states.pop(name, None)
             _teammate_threads.pop(name, None)
@@ -2583,6 +2797,8 @@ def run_check_inbox() -> str:
                 lines.append(
                     f"  [{message['from']}]{tag} {message['content']}"
                 )
+                if message.get("type") == "assignment_match_requested":
+                    lines.append(json.dumps(meta, ensure_ascii=False, indent=2))
             rendered = "\n".join(lines)
     except BaseException as error:
         nack_lead_inbox(batch, str(error))
