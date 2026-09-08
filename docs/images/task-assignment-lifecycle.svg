@@ -1,0 +1,115 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="812" viewBox="0 0 1280 812" role="img" aria-labelledby="title desc">
+  <title id="title">任务分配与重新匹配的状态流转</title>
+  <desc id="desc">任务从待匹配进入已匹配、等待领取；候选可以为空。自动领取条件通过后写入 Owner 并执行，完成后保留 Owner。用户可以从任一未领取状态人工指定成员，优先于候选且不受自动领取开关限制，但仍检查依赖、在线和占用。执行者报告不匹配后，任务记录原因和已有工作摘要，清空 Owner 与 Assignee，等待 Lead 重新匹配，完成之前不能自动领取。</desc>
+  <defs>
+    <marker id="arrow-muted" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M1 1 8 5 1 9" fill="none" stroke="#A2AEC0" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></marker>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M1 1 8 5 1 9" fill="none" stroke="#377DDD" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></marker>
+    <marker id="arrow-amber" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M1 1 8 5 1 9" fill="none" stroke="#CC8D36" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></marker>
+    <marker id="arrow-purple" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M1 1 8 5 1 9" fill="none" stroke="#7562D8" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></marker>
+    <filter id="shadow" x="-10%" y="-15%" width="120%" height="135%"><feDropShadow dx="0" dy="4" stdDeviation="7" flood-color="#17243D" flood-opacity="0.045"/></filter>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif; }
+      .ink { fill: #17243D; }
+      .muted { fill: #6B7890; }
+      .node-title { font-size: 22px; font-weight: 650; fill: #17243D; }
+      .body { font-size: 16px; fill: #6B7890; }
+      .code { font-size: 15px; fill: #6B7890; }
+      .line { fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+      .icon { fill: none; stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
+    </style>
+  </defs>
+
+  <rect width="1280" height="812" rx="24" fill="#F8FAFC"/>
+  <rect x="48" y="32" width="4" height="34" rx="2" fill="#7562D8"/>
+  <text x="68" y="58" font-size="30" font-weight="700" class="ink">任务如何流转</text>
+  <text x="68" y="90" font-size="16" class="muted">候选决定可领取范围，Owner 只在领取成功后产生。</text>
+  <text x="1232" y="55" text-anchor="end" font-size="13" font-weight="600" letter-spacing="1.7" class="muted">TASK LIFECYCLE</text>
+
+  <!-- Manual assignment is available from every unclaimed state. -->
+  <rect x="358" y="124" width="564" height="122" rx="18" fill="#FFFFFF" stroke="#CADCF6" filter="url(#shadow)"/>
+  <rect x="378" y="140" width="32" height="32" rx="10" fill="#EDF4FF"/>
+  <g transform="translate(383 145)" class="icon" stroke="#377DDD"><circle cx="11" cy="6.5" r="3.5"/><path d="M4 19v-2a7 7 0 0 1 14 0v2M16 5h5m-2.5-2.5v5"/></g>
+  <text x="422" y="163" class="node-title">人工预留</text>
+  <rect x="813" y="142" width="87" height="27" rx="13.5" fill="#EDF4FF"/>
+  <text x="856.5" y="160" text-anchor="middle" font-size="13" font-weight="600" fill="#377DDD">用户优先</text>
+  <text x="380" y="196" class="body">任一未领取状态均可指定成员，包括候选范围外成员</text>
+  <text x="380" y="223" class="code">pending · assignee 已指定</text>
+  <path d="M795 247V310" class="line" stroke="#377DDD" marker-end="url(#arrow-blue)"/>
+  <text x="815" y="277" font-size="15" fill="#377DDD">指定成员通过原子校验</text>
+  <text x="815" y="299" font-size="14" class="muted">自动领取关闭时仍可执行</text>
+
+  <text x="48" y="290" font-size="14" font-weight="600" class="muted">自动候选路径</text>
+
+  <!-- Main lifecycle. -->
+  <rect x="48" y="316" width="254" height="160" rx="18" fill="#FFFFFF" stroke="#DFE6F0" filter="url(#shadow)"/>
+  <rect x="68" y="336" width="34" height="34" rx="10" fill="#F0EDFC"/>
+  <g transform="translate(74 342)" class="icon" stroke="#7562D8"><path d="M5 2h9l4 4v14H5zM14 2v5h4M8 11h7M8 15h5"/></g>
+  <text x="114" y="360" class="node-title">待匹配</text>
+  <text x="70" y="403" class="body">等待 Lead 评估候选成员</text>
+  <path d="M70 422H280" stroke="#EDF0F6"/>
+  <text x="70" y="450" class="code">pending / pending</text>
+
+  <rect x="358" y="316" width="254" height="160" rx="18" fill="#FFFFFF" stroke="#DCD6F5" filter="url(#shadow)"/>
+  <rect x="378" y="336" width="34" height="34" rx="10" fill="#F0EDFC"/>
+  <g transform="translate(384 342)" class="icon" stroke="#7562D8"><circle cx="11" cy="6" r="3.5"/><path d="M4 20v-2a7 7 0 0 1 14 0v2M3 8a3 3 0 0 0-1 5M19 8a3 3 0 0 1 1 5"/></g>
+  <text x="424" y="360" class="node-title">已匹配</text>
+  <text x="380" y="403" class="body">等待领取，候选可以为空</text>
+  <path d="M380 422H590" stroke="#EDF0F6"/>
+  <text x="380" y="450" class="code">pending / matched</text>
+
+  <rect x="668" y="316" width="254" height="160" rx="18" fill="#FFFFFF" stroke="#C9E3DD" filter="url(#shadow)"/>
+  <rect x="688" y="336" width="34" height="34" rx="10" fill="#EAF6F2"/>
+  <g transform="translate(694 342)" class="icon" stroke="#168979"><circle cx="11" cy="11" r="9"/><path d="m9 7 6 4-6 4z"/></g>
+  <text x="734" y="360" class="node-title">执行中</text>
+  <text x="690" y="403" class="body">领取成功，Owner 已确定</text>
+  <path d="M690 422H900" stroke="#EDF0F6"/>
+  <text x="690" y="450" class="code">in_progress</text>
+
+  <rect x="978" y="316" width="254" height="160" rx="18" fill="#FFFFFF" stroke="#C9E3DD" filter="url(#shadow)"/>
+  <rect x="998" y="336" width="34" height="34" rx="10" fill="#EAF6F2"/>
+  <g transform="translate(1004 342)" class="icon" stroke="#168979"><circle cx="11" cy="11" r="9"/><path d="m6.5 11 3 3 6-6"/></g>
+  <text x="1044" y="360" class="node-title">已完成</text>
+  <text x="1000" y="403" class="body">保留 Owner，记录执行归属</text>
+  <path d="M1000 422H1210" stroke="#EDF0F6"/>
+  <text x="1000" y="450" class="code">completed</text>
+
+  <path d="M307 416H351" class="line" stroke="#A2AEC0" marker-end="url(#arrow-muted)"/>
+  <text x="330" y="378" text-anchor="middle" font-size="14" fill="#7562D8">Lead</text>
+  <text x="330" y="398" text-anchor="middle" font-size="14" fill="#7562D8">匹配</text>
+  <path d="M617 416H661" class="line" stroke="#A2AEC0" marker-end="url(#arrow-muted)"/>
+  <text x="640" y="378" text-anchor="middle" font-size="14" fill="#168979">自动</text>
+  <text x="640" y="398" text-anchor="middle" font-size="14" fill="#168979">领取</text>
+  <path d="M927 416H971" class="line" stroke="#A2AEC0" marker-end="url(#arrow-muted)"/>
+  <text x="950" y="378" text-anchor="middle" font-size="14" fill="#168979">Owner</text>
+  <text x="950" y="398" text-anchor="middle" font-size="14" fill="#168979">完成</text>
+
+  <!-- Mismatch preserves evidence and returns the task to matching. -->
+  <path d="M795 477V554" class="line" stroke="#CC8D36" marker-end="url(#arrow-amber)"/>
+  <text x="815" y="514" font-size="15" fill="#CC8D36">Owner 报告职责或能力不匹配</text>
+  <text x="815" y="537" font-size="14" class="muted">退出任务，释放当前归属</text>
+
+  <rect x="668" y="560" width="564" height="130" rx="18" fill="#FFFFFF" stroke="#EDDCC1" filter="url(#shadow)"/>
+  <rect x="688" y="579" width="34" height="34" rx="10" fill="#FCF3E5"/>
+  <g transform="translate(694 585)" class="icon" stroke="#CC8D36"><path d="M18 7a8 8 0 1 0 1 7M18 2v5h-5"/></g>
+  <text x="734" y="603" class="node-title">等待重新分配</text>
+  <text x="690" y="635" class="code">pending / rematch_required</text>
+  <text x="690" y="666" font-size="15" class="muted">记录 reason + work_summary · 清空 owner / assignee</text>
+
+  <path d="M662 624H497Q485 624 485 612V483" class="line" stroke="#7562D8" marker-end="url(#arrow-purple)"/>
+  <text x="575" y="609" text-anchor="middle" font-size="15" fill="#7562D8">Lead 重新匹配</text>
+  <rect x="668" y="706" width="564" height="40" rx="12" fill="#FCF3E5"/>
+  <circle cx="691" cy="726" r="4" fill="#CC8D36"/>
+  <text x="706" y="732" font-size="15" fill="#9C6927">Lead 完成匹配前，禁止自动重新领取</text>
+
+  <!-- Guardrails apply to both claim paths. -->
+  <rect x="48" y="536" width="394" height="210" rx="18" fill="#EFF3F8"/>
+  <g transform="translate(69 556)" class="icon" stroke="#6B7890"><path d="m11 1 8 3v6c0 5-4 8-8 11-4-3-8-6-8-11V4zM7 10l3 3 5-5"/></g>
+  <text x="106" y="574" font-size="18" font-weight="650" class="ink">每次领取都重新检查</text>
+  <text x="70" y="612" class="body">任务未领取 · 依赖已完成</text>
+  <text x="70" y="641" class="body">成员在线且空闲 · 无其他执行任务</text>
+  <path d="M70 661H420" stroke="#DFE6F0"/>
+  <text x="70" y="692" font-size="15" class="muted">人工指定只覆盖候选限制。</text>
+  <text x="70" y="720" font-size="15" class="muted">自动路径还需开启开关并具备候选资格。</text>
+
+  <text x="48" y="785" font-size="14" class="muted">要求或成员配置变化：可重新匹配的任务回到待匹配。图中简化取消指定、停止与转向等干预路径。</text>
+</svg>
