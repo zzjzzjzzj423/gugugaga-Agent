@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+import ssl
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from openai import OpenAI
+from openai import APIConnectionError, OpenAI
 
 from .config import Settings
 from .models import ChatProvider, ToolCall, ToolSpec
@@ -173,6 +174,42 @@ def is_context_length_error(error: Exception) -> bool:
     )
 
 
+def _is_certificate_error(error: Exception) -> bool:
+    """Do not retry a deterministic TLS verification failure hidden by the SDK."""
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, ssl.SSLCertVerificationError) or any(
+            marker in str(current).lower()
+            for marker in (
+                "certificate_verify_failed",
+                "certificate verify failed",
+                "certificate verification failed",
+            )
+        ):
+            return True
+        # Suppression only controls traceback rendering; inspect both branches
+        # because an SDK wrapper may retain a certificate error in either one.
+        pending.extend(
+            linked for linked in (current.__cause__, current.__context__)
+            if linked is not None
+        )
+    return False
+
+
+def _is_retryable_error(error: Exception) -> bool:
+    if isinstance(error, APIConnectionError):
+        # APITimeoutError is also an APIConnectionError. Abrupt TLS disconnects
+        # may be transient; certificate verification errors require a fix.
+        return not _is_certificate_error(error)
+    status = _status_code(error)
+    return status == 429 or (status is not None and 500 <= status < 600)
+
+
 class SiliconFlowProvider(ChatProvider):
     def __init__(
         self,
@@ -191,6 +228,11 @@ class SiliconFlowProvider(ChatProvider):
             api_key=settings.api_key,
             base_url=settings.base_url,
             timeout=120,
+        )
+        # Own chat retries here without changing the SDK's embedding retries.
+        # Injected clients may carry instrumentation, so keep them intact.
+        self._chat_client = (
+            self.client.with_options(max_retries=0) if client is None else self.client
         )
 
     def create(
@@ -218,7 +260,7 @@ class SiliconFlowProvider(ChatProvider):
                     }
                 if self.temperature is not None:
                     request["temperature"] = self.temperature
-                response = self.client.chat.completions.create(
+                response = self._chat_client.chat.completions.create(
                     **request,
                 )
                 choice = response.choices[0]
@@ -244,8 +286,7 @@ class SiliconFlowProvider(ChatProvider):
                 if is_context_length_error(error):
                     raise ContextLengthError(str(error)) from error
                 last_error = error
-                status = _status_code(error)
-                if status != 429 and (status is None or status < 500):
+                if not _is_retryable_error(error):
                     raise
                 if attempt == 3:
                     break

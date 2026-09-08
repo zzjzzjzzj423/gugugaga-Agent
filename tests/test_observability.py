@@ -10,7 +10,7 @@ from gugugaga.__main__ import build_runtime
 from gugugaga.config import Settings
 from gugugaga.observability import Observer, RecordingSystem, event_scope
 from gugugaga.provider import ProviderResponse, TextBlock, ToolUseBlock
-from gugugaga import agent, subagents, teams
+from gugugaga import agent, subagents, tasks, teams
 from tests.fakes import ScriptedProvider
 
 
@@ -266,6 +266,44 @@ def test_provider_failure_text_does_not_ack_lead_inbox(tmp_path, monkeypatch):
         assert mailbox.exists()
         assert "keep until processed" in mailbox.read_text(encoding="utf-8")
         assert app.runtime.last_lead_inbox_succeeded is False
+    finally:
+        app.close()
+
+
+def test_unfinished_matching_keeps_event_for_backoff_until_lead_persists_result(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GUGUGAGA_MEMORY_ENABLED", "false")
+    monkeypatch.setattr(teams, "BUS", teams.MessageBus())
+    teams._lead_inbox_event.clear()
+    provider = ScriptedProvider([
+        ProviderResponse(content=[TextBlock(text="I still need to match this task.")], stop_reason="end_turn"),
+    ])
+    app = build_runtime(make_settings(tmp_path, monkeypatch), provider=provider)
+    try:
+        task = tasks.create_task("Needs a specialist")
+        app.runtime.run_pending_lead_inbox()
+        assert app.runtime.last_lead_inbox_succeeded is False
+        assert [item["id"] for item in tasks.pending_matching_requests()] == [task.id]
+        assert teams.signal_pending_lead_inbox() is True
+        provider.responses.extend([
+            ProviderResponse(content=[ToolUseBlock(
+                id="match-empty", name="set_task_candidates", input={
+                    "task_id": task.id,
+                    "candidate_members": [],
+                    "assignment_reason": "No specialist exists in the current team",
+                    "expected_revision": task.matching_revision,
+                },
+            )], stop_reason="tool_use"),
+            ProviderResponse(content=[TextBlock(text="Waiting for a suitable member.")], stop_reason="end_turn"),
+        ])
+        app.runtime.run_pending_lead_inbox()
+        assert app.runtime.last_lead_inbox_succeeded is True
+        assert tasks.load_task(task.id).matching_status == "matched"
+        assert tasks.load_task(task.id).owner is None
+        assert tasks.pending_matching_requests() == []
+        assert app.runtime.run_pending_lead_inbox() is None
+        assert len(provider.requests) == 3
     finally:
         app.close()
 

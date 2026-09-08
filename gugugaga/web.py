@@ -28,7 +28,7 @@ from .memory.repository import MemoryRepository
 from .observability import sanitize
 from .permissions import PermissionBroker
 from .subagents import snapshot_subagents
-from .tasks import delete_task, load_task, release_task, unassign_task
+from .tasks import delete_task, load_task, release_task, unassign_task, update_task
 from .teams import (
     TEAM_DEFAULT_ALLOWED_TOOLS,
     assign_task_to_teammate,
@@ -66,6 +66,56 @@ def _json_safe(value: Any) -> Any:
 
 def _quote_identifier(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
+
+
+def _task_waiting_reason(
+    task: dict[str, Any],
+    *,
+    blocked: bool,
+    agents: dict[str, dict[str, Any]],
+    auto_claim_enabled: bool,
+) -> dict[str, str] | None:
+    """Explain the current dispatch gate without triggering matching or execution."""
+
+    if task.get("status") != "pending":
+        return None
+
+    def reason(code: str, message: str) -> dict[str, str]:
+        return {"code": code, "message": message}
+
+    def available(name: str) -> bool:
+        agent = agents.get(name, {})
+        return bool(
+            agent.get("online")
+            and agent.get("status") in {"idle", "running"}
+            and agent.get("dispatch_available", agent.get("status") == "idle")
+            and agent.get("current_task_id") in {None, task["id"]}
+        )
+
+    assignee = task.get("assignee")
+    if assignee:
+        if blocked:
+            return reason("dependencies", "依赖未完成")
+        if not agents.get(assignee, {}).get("online"):
+            return reason("assignee_unavailable", f"人工指定成员 {assignee} 不在线，等待上线")
+        if not available(assignee):
+            return reason("assignee_unavailable", f"人工指定成员 {assignee} 忙碌，等待空闲")
+        return reason("assigned", f"已人工指定 {assignee}，等待领取")
+    matching_status = task.get("matching_status", "pending")
+    if matching_status == "rematch_required":
+        return reason("rematch_required", "报告不匹配，等待重新分配")
+    if matching_status != "matched":
+        return reason("unmatched", "尚未确定候选成员")
+    candidates = task.get("candidate_members") or []
+    if not candidates:
+        return reason("unmatched", "尚无合适的候选成员，等待重新匹配")
+    if blocked:
+        return reason("dependencies", "依赖未完成")
+    if not auto_claim_enabled:
+        return reason("manual_assignment_required", "自动领取已关闭，等待人工指定")
+    if not any(available(name) for name in candidates):
+        return reason("candidates_unavailable", "候选成员都忙或不在线")
+    return None
 
 
 class EventHub:
@@ -632,6 +682,23 @@ class DashboardStore:
         status_by_id = {
             str(raw["id"]): str(raw.get("status", "pending")) for raw in raw_tasks
         }
+        try:
+            same_workspace = config.WORKDIR.resolve() == self.workspace
+        except OSError:
+            same_workspace = False
+        if same_workspace:
+            agents = {item["name"]: item for item in list_teammate_states()}
+            auto_claim_enabled = bool(get_team_settings()["auto_claim_enabled"])
+        else:
+            # An offline board must never borrow another workspace's live team.
+            agents = {}
+            try:
+                settings = json.loads(
+                    (self.state_dir / "team-settings.json").read_text(encoding="utf-8")
+                )
+                auto_claim_enabled = bool(settings.get("auto_claim_enabled", False))
+            except (OSError, TypeError, ValueError, AttributeError):
+                auto_claim_enabled = False
         tasks = []
         for raw in raw_tasks:
             task_id = str(raw["id"])
@@ -665,6 +732,18 @@ class DashboardStore:
                     "status": status_by_id[task_id],
                     "owner": raw.get("owner"),
                     "assignee": raw.get("assignee"),
+                    "manual_assignee": raw.get("assignee"),
+                    "candidate_members": raw.get("candidate_members") or [],
+                    "assignment_reason": str(raw.get("assignment_reason") or ""),
+                    "matching_status": raw.get("matching_status") or "pending",
+                    "matching_revision": raw.get("matching_revision", 0),
+                    "mismatch_reports": raw.get("mismatch_reports") or [],
+                    "waiting_reason": _task_waiting_reason(
+                        raw,
+                        blocked=blocked,
+                        agents=agents,
+                        auto_claim_enabled=auto_claim_enabled,
+                    ),
                     "queue_position": raw.get("queue_position"),
                     "dispatch_type": raw.get("dispatch_type"),
                     "interrupted_by_user": bool(raw.get("interrupted_by_user")),
@@ -673,6 +752,7 @@ class DashboardStore:
                     "dependencies": dependency_details,
                     "blocked": blocked and status_by_id[task_id] == "pending",
                     "ready": status_by_id[task_id] == "pending" and not blocked,
+                    "dependencies_ready": not blocked,
                     "created_at": created_at,
                     "updated_at": updated_at,
                 }
@@ -1490,6 +1570,26 @@ class DashboardApplication:
         )
         return value
 
+    def update_task(self, task_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        allowed = {"subject", "description", "blockedBy"}
+        if not payload or set(payload) - allowed:
+            raise TypeError("provide subject, description, or blockedBy")
+        for key in ("subject", "description"):
+            if key in payload and not isinstance(payload[key], str):
+                raise TypeError(f"{key} must be a string")
+        if "subject" in payload and not payload["subject"].strip():
+            raise TypeError("subject is required")
+        if "blockedBy" in payload and (
+            not isinstance(payload["blockedBy"], list)
+            or any(not isinstance(item, str) for item in payload["blockedBy"])
+        ):
+            raise TypeError("blockedBy must be an array of task ids")
+        value = asdict(update_task(task_id, **payload))
+        self.events.publish(
+            {"type": "task", "action": "updated", "task_id": task_id}
+        )
+        return value
+
     def unassign_task(self, task_id: str) -> dict[str, Any]:
         value = asdict(unassign_task(task_id))
         self.events.publish(
@@ -1936,11 +2036,18 @@ def _handler_factory(application: DashboardApplication):
 
         def do_PUT(self) -> None:
             parsed = urlparse(self.path)
+            task_match = re.fullmatch(
+                r"/api/tasks/(task_[0-9]+_[0-9]{4})", parsed.path
+            )
             agent_profile = re.fullmatch(
                 r"/api/team/agents/([A-Za-z0-9][A-Za-z0-9_-]{0,63})/profile",
                 parsed.path,
             )
-            if parsed.path != "/api/team/settings" and agent_profile is None:
+            if (
+                parsed.path != "/api/team/settings"
+                and agent_profile is None
+                and task_match is None
+            ):
                 self._error(HTTPStatus.NOT_FOUND, "not found")
                 return
             if not self._is_loopback():
@@ -1951,7 +2058,12 @@ def _handler_factory(application: DashboardApplication):
                 return
             try:
                 payload = self._read_json_body()
-                if agent_profile is not None:
+                if task_match is not None:
+                    try:
+                        self._json(application.update_task(task_match.group(1), payload))
+                    except ValueError as error:
+                        self._error(HTTPStatus.CONFLICT, str(error))
+                elif agent_profile is not None:
                     self._json(
                         application.update_team_agent_profile(
                             agent_profile.group(1), payload
@@ -1959,7 +2071,7 @@ def _handler_factory(application: DashboardApplication):
                     )
                 else:
                     self._json(application.set_team_settings(payload))
-            except KeyError as error:
+            except (KeyError, FileNotFoundError) as error:
                 self._error(HTTPStatus.NOT_FOUND, str(error))
             except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
                 self._error(HTTPStatus.BAD_REQUEST, str(error))

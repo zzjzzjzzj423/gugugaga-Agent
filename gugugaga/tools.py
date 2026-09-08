@@ -23,6 +23,9 @@ from .teams import (
     run_spawn_teammate,
     run_restart_teammate,
     run_stop_teammate,
+    run_task_candidates_context,
+    run_set_task_candidates,
+    run_update_task,
 )
 from .workspace import run_bash, run_edit, run_glob, run_read, run_write
 from .web_search import run_web_search
@@ -307,6 +310,39 @@ TOOL_DEFINITIONS: list[dict] = [
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
+        "name": "list_task_candidates_context",
+        "description": "Read unclaimed tasks with matching revisions and every Team member's role, prompt, and tool configuration for candidate matching.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "set_task_candidates",
+        "description": "Maintain eligible candidates and explain the assignment reasoning for an unclaimed task without manual assignment. Use the current matching_revision as expected_revision; an empty list means nobody fits. This does not assign or start the task.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string"},
+                "candidate_members": {"type": "array", "items": {"type": "string"}},
+                "assignment_reason": {"type": "string"},
+                "expected_revision": {"type": "integer"},
+            },
+            "required": ["task_id", "candidate_members", "assignment_reason", "expected_revision"],
+        },
+    },
+    {
+        "name": "update_task",
+        "description": "Update an unclaimed task's requirements and request candidate rematching. For running work, use the existing user intervention flow instead.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string"},
+                "subject": {"type": "string"},
+                "description": {"type": "string"},
+                "blockedBy": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["task_id"],
+        },
+    },
+    {
         "name": "get_task",
         "description": "Get full task details.",
         "input_schema": {
@@ -495,6 +531,9 @@ TOOL_HANDLERS: dict[str, Callable] = {
     "compact": run_compact,
     "create_task": run_lead_create_task,
     "list_tasks": run_list_tasks,
+    "list_task_candidates_context": run_task_candidates_context,
+    "set_task_candidates": run_set_task_candidates,
+    "update_task": run_update_task,
     "get_task": run_get_task,
     "claim_task": run_lead_claim_task,
     "complete_task": run_lead_complete_task,

@@ -22,6 +22,8 @@
     teamDetailName: null,
     teamDetail: null,
     teamConfigDirty: false,
+    taskMemberScopes: new Set(),
+    taskRefreshTimer: null,
     pageScroll: { overview: 0, tasks: 0, memory: 0, database: 0 },
   };
 
@@ -155,6 +157,7 @@
     if (task.blocked) return ['blocked', '被阻塞'];
     if (task.status === 'in_progress') return ['in-progress', '进行中'];
     if (task.status === 'completed') return ['completed', '已完成'];
+    if (task.waiting_reason) return ['waiting', '等待分配'];
     return ['ready', '可开始'];
   }
 
@@ -171,6 +174,39 @@
     if (task.description) {
       const description = document.createElement('p'); description.textContent = task.description; card.append(description);
     }
+    const allocation = document.createElement('div'); allocation.className = 'task-allocation';
+    const candidateNames = task.candidate_members || [];
+    const candidatesLabel = document.createElement('div'); candidatesLabel.className = 'task-candidates';
+    const candidatesTitle = document.createElement('strong'); candidatesTitle.textContent = '候选成员'; candidatesLabel.append(candidatesTitle);
+    if (!candidateNames.length) {
+      const empty = document.createElement('span'); empty.textContent = task.matching_status === 'matched' ? '暂无合适成员' : '尚未确定'; candidatesLabel.append(empty);
+    }
+    candidateNames.forEach((name) => {
+      const member = state.teamAgents.find((agent) => agent.name === name);
+      const chip = document.createElement('span'); chip.className = 'task-candidate';
+      const availability = taskMemberAvailability(member, task);
+      chip.textContent = `${name} · ${availability.label}`;
+      if (!availability.available) chip.classList.add('is-unavailable');
+      candidatesLabel.append(chip);
+    });
+    allocation.append(candidatesLabel);
+    const rationale = document.createElement('p'); rationale.className = 'task-assignment-reason';
+    rationale.textContent = `分配理由 · ${task.assignment_reason || '等待 Lead 评估'}`; allocation.append(rationale);
+    const manual = document.createElement('p'); manual.textContent = `人工指定 · ${task.manual_assignee || '无'}`; allocation.append(manual);
+    if (task.waiting_reason) {
+      const waiting = document.createElement('p'); waiting.className = 'task-waiting-reason'; waiting.textContent = task.waiting_reason.message; allocation.append(waiting);
+    }
+    if (task.mismatch_reports?.length) {
+      const reports = document.createElement('details'); reports.className = 'task-mismatch-reports';
+      const summary = document.createElement('summary'); summary.textContent = `不匹配记录 · ${task.mismatch_reports.length}`; reports.append(summary);
+      task.mismatch_reports.forEach((report) => {
+        const entry = document.createElement('p'); entry.textContent = `${report.agent}：${report.reason}`;
+        if (report.work_summary) entry.textContent += `\n已有工作：${report.work_summary}`;
+        reports.append(entry);
+      });
+      allocation.append(reports);
+    }
+    card.append(allocation);
     if (task.dependencies?.length) {
       const dependencies = document.createElement('div'); dependencies.className = 'task-dependencies';
       const label = document.createElement('small'); label.textContent = '依赖'; dependencies.append(label);
@@ -197,14 +233,19 @@
           finally { cancel.disabled = false; }
         });
         controls.append(assigned, cancel);
-      } else {
-        const candidates = state.teamAgents.filter((agent) => agent.online && agent.status === 'idle' && !agent.current_task_id);
+      }
+      {
+        const showAll = state.taskMemberScopes.has(task.id);
+        const members = showAll ? state.teamAgents : candidateNames.map((name) => state.teamAgents.find((agent) => agent.name === name) || { name, online: false });
         const select = document.createElement('select'); select.setAttribute('aria-label', `为 ${task.subject} 选择 Team Agent`);
-        const placeholder = document.createElement('option'); placeholder.value = ''; placeholder.textContent = candidates.length ? '选择空闲 Agent' : '没有空闲 Agent'; select.append(placeholder);
-        candidates.forEach((agent) => {
-          const option = document.createElement('option'); option.value = agent.name; option.textContent = `${agent.name} · ${agent.role || 'teammate'}`; select.append(option);
+        const placeholder = document.createElement('option'); placeholder.value = ''; placeholder.textContent = members.length ? '选择成员' : (showAll ? '暂无团队成员' : '暂无候选，可查看全部成员'); select.append(placeholder);
+        members.forEach((agent) => {
+          const availability = taskMemberAvailability(agent, task);
+          const option = document.createElement('option'); option.value = agent.name;
+          option.textContent = `${agent.name} · ${agent.role || 'teammate'} · ${availability.label}${candidateNames.includes(agent.name) ? '' : ' · 非候选成员'}`;
+          option.disabled = !availability.available; select.append(option);
         });
-        const assign = document.createElement('button'); assign.type = 'button'; assign.textContent = '指派'; assign.disabled = !candidates.length;
+        const assign = document.createElement('button'); assign.type = 'button'; assign.textContent = task.assignee ? '更改指派' : '指派'; assign.disabled = true;
         select.addEventListener('change', () => { assign.disabled = !select.value; });
         assign.addEventListener('click', async () => {
           if (!select.value) return;
@@ -216,6 +257,13 @@
           finally { assign.disabled = !select.value; }
         });
         controls.append(select, assign);
+        const scope = document.createElement('button'); scope.type = 'button'; scope.className = 'task-member-scope';
+        scope.textContent = showAll ? '仅查看候选成员' : '查看全部成员'; scope.setAttribute('aria-pressed', String(showAll));
+        scope.addEventListener('click', () => {
+          if (showAll) state.taskMemberScopes.delete(task.id); else state.taskMemberScopes.add(task.id);
+          card.replaceWith(makeTaskCard(task));
+        });
+        controls.append(scope);
       }
       card.append(controls);
     }
@@ -252,10 +300,16 @@
     });
     deleteControls.append(deleteButton); card.append(deleteControls);
     const footer = document.createElement('footer');
-    const owner = document.createElement('span'); owner.textContent = task.owner ? `负责人 · ${task.owner}` : (task.assignee ? `预留给 · ${task.assignee}` : '尚未分配');
+    const owner = document.createElement('span'); owner.textContent = `实际 Owner · ${task.owner || '尚未领取'}`;
     const updated = document.createElement('time'); updated.textContent = `更新于 ${formatDate(task.updated_at)}`;
     footer.append(owner, updated); card.append(footer);
     return card;
+  }
+
+  function taskMemberAvailability(agent, task) {
+    if (!agent?.online) return { available: false, label: '不在线' };
+    if (agent.status !== 'idle' || (agent.current_task_id && agent.current_task_id !== task.id)) return { available: false, label: '忙碌' };
+    return { available: true, label: '空闲' };
   }
 
   function teamGraphNode(name) {
@@ -640,6 +694,14 @@
     });
   }
 
+  function scheduleTaskRefresh() {
+    if (state.page !== 'tasks' || state.taskRefreshTimer !== null) return;
+    state.taskRefreshTimer = setTimeout(() => {
+      state.taskRefreshTimer = null;
+      if (state.page === 'tasks') loadTasks();
+    }, 250);
+  }
+
   async function loadTasks() {
     const button = $('#task-refresh');
     button.disabled = true;
@@ -965,12 +1027,15 @@
   }
 
   function enqueueEvent(event) {
+    if (['task_matching_requested', 'task_matching_updated', 'task_assignment', 'task', 'team_agent', 'team_agent_profile', 'team_settings'].includes(event.type)) {
+      scheduleTaskRefresh();
+    }
     if (event.type === 'permission_requested' || event.type === 'permission_resolved') {
       loadPermissions();
     }
     if (event.type === 'team_inbox_unread') {
       $('#event-chip').textContent = 'Team 消息未读';
-      if (state.page === 'tasks') loadTasks();
+      scheduleTaskRefresh();
     }
     if (event.type === 'team_message') {
       rememberTeamMessage(event);

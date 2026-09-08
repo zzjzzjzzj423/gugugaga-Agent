@@ -6,6 +6,7 @@ import random
 import re
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -31,6 +32,13 @@ class Task:
     dispatch_type: str | None = None
     interventions: list[dict] = field(default_factory=list)
     interrupted_by_user: bool = False
+    candidate_members: list[str] = field(default_factory=list)
+    assignment_reason: str = ""
+    matching_status: str = "pending"
+    matching_revision: int = 1
+    matching_notified_revision: int = 0
+    matching_events: list[str] = field(default_factory=lambda: ["task_created"])
+    mismatch_reports: list[dict] = field(default_factory=list)
 
 
 def _task_path(task_id: str) -> Path:
@@ -60,7 +68,8 @@ def create_task(
             blockedBy=list(blockedBy or []),
         )
         _save_task_unlocked(task)
-        return task
+    _notify_matching([task])
+    return task
 
 
 def create_queued_task(
@@ -159,7 +168,201 @@ def _save_task_unlocked(task: Task) -> None:
 def save_task(task: Task) -> None:
     _task_path(task.id)
     with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
+        if _task_path(task.id).exists():
+            previous = _load_task_unlocked(task.id)
+            if (previous.subject, previous.description, previous.blockedBy) != (
+                task.subject, task.description, task.blockedBy
+            ):
+                if previous.status != "pending" or previous.owner:
+                    raise ValueError("use the existing intervention flow for claimed tasks")
+                # Preserve concurrent ownership/candidate decisions. Requirement
+                # edits must not overwrite them from a stale Task snapshot.
+                previous.subject = task.subject
+                previous.description = task.description
+                previous.blockedBy = list(task.blockedBy)
+                task = previous
+                if _is_matchable(task):
+                    _request_rematch_unlocked(task, "task_requirements_changed")
         _save_task_unlocked(task)
+    _notify_matching([task])
+
+
+def _is_matchable(task: Task) -> bool:
+    return task.status == "pending" and not task.owner and not task.assignee
+
+
+def _notify_matching(tasks: list[Task], *, updated: bool = False) -> None:
+    # Notify only after releasing the storage lock: team dispatch acquires the
+    # teammate lock before the task lock, never the reverse.
+    from .observability import notify
+    from .teams import _lead_inbox_event
+
+    pending = [task for task in tasks if _is_matchable(task)]
+    if not pending:
+        return
+    if not updated:
+        _lead_inbox_event.set()
+    notify(
+        "task_matching_updated" if updated else "task_matching_requested",
+        {"task_ids": [task.id for task in pending]},
+    )
+
+
+def _request_rematch_unlocked(task: Task, reason: str) -> None:
+    task.matching_revision += 1
+    if task.matching_status != "rematch_required":
+        task.matching_status = "pending"
+    if reason not in task.matching_events:
+        task.matching_events.append(reason)
+
+
+def request_task_rematch(task_id: str, reason: str) -> Task:
+    _task_path(task_id)
+    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
+        task = _load_task_unlocked(task_id)
+        if not _is_matchable(task):
+            return task
+        _request_rematch_unlocked(task, reason)
+        _save_task_unlocked(task)
+    _notify_matching([task])
+    return task
+
+
+def request_all_task_rematches(reason: str) -> list[Task]:
+    changed = []
+    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
+        for task in _list_tasks_unlocked():
+            if _is_matchable(task):
+                _request_rematch_unlocked(task, reason)
+                _save_task_unlocked(task)
+                changed.append(task)
+    _notify_matching(changed)
+    return changed
+
+
+def pending_matching_requests() -> list[dict]:
+    """A durable, coalesced outbox; reads and idle polls never call a model."""
+    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
+        return [
+            asdict(task) for task in _list_tasks_unlocked()
+            if _is_matchable(task)
+            and task.matching_status != "matched"
+            and task.matching_revision > task.matching_notified_revision
+        ]
+
+
+def ack_matching_requests(revisions: dict[str, int]) -> None:
+    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
+        for task_id, revision in revisions.items():
+            try:
+                task = _load_task_unlocked(task_id)
+            except FileNotFoundError:
+                continue
+            task.matching_notified_revision = max(
+                task.matching_notified_revision,
+                min(revision, task.matching_revision),
+            )
+            _save_task_unlocked(task)
+
+
+def set_task_candidates(
+    task_id: str,
+    candidate_members: list[str],
+    assignment_reason: str,
+    *,
+    expected_revision: int,
+) -> Task:
+    _task_path(task_id)
+    if not isinstance(candidate_members, list) or any(
+        not isinstance(name, str)
+        or not re.fullmatch(r"[A-Za-z0-9_-]+", name)
+        for name in candidate_members
+    ):
+        raise ValueError("candidate_members must be an array of agent names")
+    if not isinstance(assignment_reason, str) or not assignment_reason.strip():
+        raise ValueError("assignment_reason is required, including for empty candidates")
+    if type(expected_revision) is not int:
+        raise ValueError("expected_revision must be an integer")
+    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
+        task = _load_task_unlocked(task_id)
+        if not _is_matchable(task):
+            raise ValueError("cannot rematch a claimed or manually assigned task")
+        if task.matching_revision != expected_revision:
+            raise ValueError("stale matching revision; reload task and member context")
+        task.candidate_members = list(dict.fromkeys(candidate_members))
+        task.assignment_reason = assignment_reason.strip()
+        task.matching_status = "matched"
+        task.matching_notified_revision = task.matching_revision
+        task.matching_events = []
+        _save_task_unlocked(task)
+    _notify_matching([task], updated=True)
+    return task
+
+
+def update_task(
+    task_id: str,
+    subject: str | None = None,
+    description: str | None = None,
+    blockedBy: list[str] | None = None,
+) -> Task:
+    _task_path(task_id)
+    if subject is not None and (not isinstance(subject, str) or not subject.strip()):
+        raise ValueError("subject is required")
+    if description is not None and not isinstance(description, str):
+        raise ValueError("description must be a string")
+    if blockedBy is not None:
+        if not isinstance(blockedBy, list):
+            raise ValueError("blockedBy must be an array")
+        for dependency in blockedBy:
+            _task_path(dependency)
+            if dependency == task_id:
+                raise ValueError("a task cannot depend on itself")
+    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
+        task = _load_task_unlocked(task_id)
+        if task.status != "pending" or task.owner:
+            raise ValueError("use the existing intervention flow for claimed tasks")
+        previous = (task.subject, task.description, task.blockedBy)
+        if subject is not None:
+            task.subject = subject.strip()
+        if description is not None:
+            task.description = description
+        if blockedBy is not None:
+            task.blockedBy = list(dict.fromkeys(blockedBy))
+        changed = previous != (task.subject, task.description, task.blockedBy)
+        if changed:
+            if _is_matchable(task):
+                _request_rematch_unlocked(task, "task_requirements_changed")
+            _save_task_unlocked(task)
+    if changed:
+        _notify_matching([task])
+    return task
+
+
+def report_task_mismatch(
+    task_id: str, owner: str, reason: str, work_summary: str = ""
+) -> Task:
+    _task_path(task_id)
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("mismatch reason is required")
+    if not isinstance(work_summary, str):
+        raise ValueError("work_summary must be a string")
+    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
+        task = _load_task_unlocked(task_id)
+        if task.status != "in_progress" or task.owner != owner:
+            raise ValueError(f"task {task_id} is not owned by {owner}")
+        task.mismatch_reports.append({
+            "agent": owner, "reason": reason.strip(),
+            "work_summary": work_summary, "created_at": time.time(),
+        })
+        task.status = "pending"
+        task.owner = None
+        task.assignee = None
+        task.matching_status = "rematch_required"
+        task.interrupted_by_user = False
+        _request_rematch_unlocked(task, "task_mismatch_reported")
+        _save_task_unlocked(task)
+    _notify_matching([task])
+    return task
 
 
 def _load_task_unlocked(task_id: str) -> Task:
@@ -210,7 +413,12 @@ def can_start(task_id: str) -> bool:
         return _can_start_unlocked(task_id)
 
 
-def _claim_task_unlocked(task_id: str, owner: str = "agent") -> str:
+def _claim_task_unlocked(
+    task_id: str,
+    owner: str = "agent",
+    *,
+    eligibility_check: Callable[[Task], str | None] | None = None,
+) -> str:
     task = _load_task_unlocked(task_id)
     if task.status != "pending":
         return f"Task {task_id} is {task.status}, cannot claim"
@@ -248,8 +456,16 @@ def _claim_task_unlocked(task_id: str, owner: str = "agent") -> str:
         if missing:
             parts.append(f"missing deps: {missing}")
         return "Cannot start — " + ", ".join(parts)
+    if not task.assignee:
+        if task.matching_status != "matched":
+            return f"Task {task_id} is waiting for candidate matching"
+        if owner not in task.candidate_members:
+            return f"Owner {owner} is not a candidate for task {task_id}"
+    if eligibility_check is not None:
+        rejection = eligibility_check(task)
+        if rejection:
+            return rejection
     task.owner = owner
-    task.assignee = owner
     task.status = "in_progress"
     task.interrupted_by_user = False
     _save_task_unlocked(task)
@@ -257,12 +473,19 @@ def _claim_task_unlocked(task_id: str, owner: str = "agent") -> str:
     return f"Claimed {task.id} ({task.subject})"
 
 
-def claim_task(task_id: str, owner: str = "agent") -> str:
+def claim_task(
+    task_id: str,
+    owner: str = "agent",
+    *,
+    eligibility_check: Callable[[Task], str | None] | None = None,
+) -> str:
     # Autonomous teammates share one task directory. The full read/check/write
     # transition must be indivisible between their polling threads.
     _task_path(task_id)
     with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
-        return _claim_task_unlocked(task_id, owner)
+        return _claim_task_unlocked(
+            task_id, owner, eligibility_check=eligibility_check
+        )
 
 
 def assign_task(task_id: str, assignee: str) -> Task:
@@ -283,7 +506,7 @@ def assign_task(task_id: str, assignee: str) -> Task:
                 candidate
                 for candidate in _list_tasks_unlocked()
                 if candidate.id != task_id
-                and candidate.assignee == value
+                and (candidate.assignee == value or candidate.owner == value)
                 and candidate.status in {"pending", "in_progress"}
             ),
             None,
@@ -291,10 +514,6 @@ def assign_task(task_id: str, assignee: str) -> Task:
         if reserved is not None:
             raise ValueError(
                 f"teammate {value} already has task {reserved.id}"
-            )
-        if task.assignee and task.assignee != value:
-            raise ValueError(
-                f"task {task_id} is already assigned to {task.assignee}"
             )
         task.assignee = value
         _save_task_unlocked(task)
@@ -312,8 +531,10 @@ def unassign_task(task_id: str) -> Task:
         if not task.assignee:
             raise ValueError(f"task {task_id} is not assigned")
         task.assignee = None
+        _request_rematch_unlocked(task, "manual_assignment_removed")
         _save_task_unlocked(task)
-        return task
+    _notify_matching([task])
+    return task
 
 
 def release_task(task_id: str) -> Task:
@@ -327,8 +548,10 @@ def release_task(task_id: str) -> Task:
         task.status = "pending"
         task.owner = None
         task.assignee = None
+        _request_rematch_unlocked(task, "task_released")
         _save_task_unlocked(task)
-        return task
+    _notify_matching([task])
+    return task
 
 
 def interrupt_task(task_id: str, owner: str) -> Task:

@@ -62,6 +62,11 @@ def test_task_dependency_claim_gate_is_durable(tmp_path, monkeypatch):
 
     dependency = tasks.create_task("dependency")
     dependent = tasks.create_task("dependent", blockedBy=[dependency.id])
+    for task in (dependency, dependent):
+        tasks.set_task_candidates(
+            task.id, ["agent"], "Dependency workflow test",
+            expected_revision=task.matching_revision,
+        )
 
     assert tasks.claim_task(dependent.id) == (
         f"Cannot start — blocked by: ['{dependency.id}']"
@@ -95,6 +100,7 @@ def test_claimed_task_can_be_released_for_manual_reassignment(
 ):
     monkeypatch.setattr(config, "TASKS_DIR", tmp_path / ".tasks")
     task = tasks.create_task("recover stale owner")
+    tasks.assign_task(task.id, "agent")
     assert tasks.claim_task(task.id, "agent").startswith("Claimed")
 
     released = tasks.release_task(task.id)
@@ -120,6 +126,7 @@ def test_task_delete_rejects_running_and_referenced_tasks(tmp_path, monkeypatch)
     with pytest.raises(FileNotFoundError):
         tasks.load_task(dependent.id)
 
+    tasks.assign_task(dependency.id, "alice")
     assert tasks.claim_task(dependency.id, "alice").startswith("Claimed")
     with pytest.raises(ValueError, match="running and cannot be deleted"):
         tasks.delete_task(dependency.id)

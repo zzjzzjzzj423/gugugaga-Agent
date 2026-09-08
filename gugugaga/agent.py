@@ -346,8 +346,9 @@ class SourceRuntime:
             self.last_lead_inbox_succeeded = False
             nack_lead_inbox(batch, "Lead Turn returned a recoverable failure")
             return reply
-        self.last_lead_inbox_succeeded = True
-        ack_lead_inbox(batch)
+        # An answered inbox Turn may still have left candidate matching undone.
+        # Keep that durable event pending and use the existing inbox backoff.
+        self.last_lead_inbox_succeeded = ack_lead_inbox(batch) is not False
         return reply
 
     def context_status(self) -> dict[str, Any]:
@@ -637,6 +638,7 @@ def agent_loop(
                 {
                     "role": "user",
                     "content": "<reminder>Update your todos.</reminder>",
+                    "_context_meta": {"source": "runtime_reminder", "turn_boundary": False},
                 }
             )
             rounds_since_todo = 0
@@ -790,7 +792,11 @@ def agent_loop(
             )
             if state.recovery_count < config.MAX_RECOVERY_RETRIES:
                 messages.append(
-                    {"role": "user", "content": config.CONTINUATION_PROMPT}
+                    {
+                        "role": "user",
+                        "content": config.CONTINUATION_PROMPT,
+                        "_context_meta": {"source": "runtime_reminder", "turn_boundary": False},
+                    }
                 )
                 state.recovery_count += 1
                 continue
