@@ -4,6 +4,8 @@ import json
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 
 import pytest
 
@@ -436,6 +438,210 @@ def test_message_bus_delivers_each_mailbox_in_fifo_order_once():
     assert delivered[1]["type"] == "status"
     assert delivered[1]["metadata"] == {"sequence": 2}
     assert bus.read_inbox("alice") == []
+
+
+def test_message_bus_different_mailboxes_can_write_while_one_fsync_is_blocked(monkeypatch):
+    bus = teams.MessageBus()
+    entered_fsync = threading.Event()
+    release_fsync = threading.Event()
+    blocked_sender = []
+    real_fsync = teams.os.fsync
+
+    def gated_fsync(descriptor):
+        if threading.get_ident() in blocked_sender:
+            entered_fsync.set()
+            assert release_fsync.wait(timeout=5), "test did not release alice's fsync"
+        return real_fsync(descriptor)
+
+    def send_to_alice():
+        blocked_sender.append(threading.get_ident())
+        return bus.send("lead", "alice", "alice's message")
+
+    monkeypatch.setattr(teams.os, "fsync", gated_fsync)
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        alice = workers.submit(send_to_alice)
+        try:
+            assert entered_fsync.wait(timeout=5), "alice did not reach file I/O"
+            bob = workers.submit(bus.send, "lead", "bob", "bob's message")
+            bob.result(timeout=3)
+            assert not alice.done()
+        finally:
+            release_fsync.set()
+        alice.result(timeout=5)
+
+    assert [item["content"] for item in bus.read_inbox("alice")] == ["alice's message"]
+    assert [item["content"] for item in bus.read_inbox("bob")] == ["bob's message"]
+
+
+def test_message_bus_send_waits_for_nack_snapshot_to_be_committed(monkeypatch):
+    bus = teams.MessageBus()
+    bus.send("lead", "alice", "retry me")
+    batch = bus.claim_inbox("alice")
+    bus.send("bob", "alice", "arrived during processing")
+    inbox = config.MAILBOX_DIR / "alice.jsonl"
+    lock_path = config.MAILBOX_DIR / ".alice.lock"
+    snapshot_ready = threading.Event()
+    allow_commit = threading.Event()
+    snapshot_committed = threading.Event()
+    sender_attempted_lock = threading.Event()
+    sender_entered_lock = threading.Event()
+    premature_sender = threading.Event()
+    concurrent_sender = []
+    real_write = teams.atomic_write_text
+    real_lock = teams.interprocess_lock
+
+    def gated_write(path, content, **kwargs):
+        if path == inbox:
+            snapshot_ready.set()
+            assert allow_commit.wait(timeout=5), "test did not release the NACK commit"
+            result = real_write(path, content, **kwargs)
+            snapshot_committed.set()
+            return result
+        return real_write(path, content, **kwargs)
+
+    @contextmanager
+    def observed_lock(path):
+        is_sender = threading.get_ident() in concurrent_sender and path == lock_path
+        if is_sender:
+            sender_attempted_lock.set()
+        with real_lock(path):
+            if is_sender:
+                sender_entered_lock.set()
+                if not snapshot_committed.is_set():
+                    premature_sender.set()
+            yield
+
+    def send_during_nack():
+        concurrent_sender.append(threading.get_ident())
+        return bus.send("bob", "alice", "arrived during NACK")
+
+    monkeypatch.setattr(teams, "atomic_write_text", gated_write)
+    monkeypatch.setattr(teams, "interprocess_lock", observed_lock)
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        returning = workers.submit(bus.nack_inbox, batch)
+        try:
+            assert snapshot_ready.wait(timeout=5), "NACK did not capture its snapshot"
+            sending = workers.submit(send_during_nack)
+            assert sender_attempted_lock.wait(timeout=3), "sender did not use the mailbox lock"
+            assert not sender_entered_lock.is_set()
+        finally:
+            allow_commit.set()
+        returning.result(timeout=5)
+        sending.result(timeout=5)
+
+    assert not premature_sender.is_set()
+    assert batch.path is not None and not batch.path.exists()
+    assert [item["content"] for item in bus.read_inbox("alice")] == [
+        "retry me",
+        "arrived during processing",
+        "arrived during NACK",
+    ]
+
+
+@pytest.mark.parametrize("fail_consumption", [False, True])
+def test_message_bus_receives_new_mail_while_consuming_and_settles_only_its_batch(
+    fail_consumption,
+):
+    bus = teams.MessageBus()
+    bus.send("lead", "alice", "already claimed")
+    consuming = threading.Event()
+    finish_consuming = threading.Event()
+
+    def consume_batch():
+        with bus.consume("alice") as messages:
+            assert [item["content"] for item in messages] == ["already claimed"]
+            consuming.set()
+            assert finish_consuming.wait(timeout=5), "test did not release consumption"
+            if fail_consumption:
+                raise ValueError("consumer failed")
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        consumer = workers.submit(consume_batch)
+        try:
+            assert consuming.wait(timeout=5), "consumer did not receive its batch"
+            sender = workers.submit(bus.send, "bob", "alice", "new arrival")
+            sender.result(timeout=3)
+            assert not consumer.done()
+            assert len(bus._state_for("alice").claimed) == 1
+        finally:
+            finish_consuming.set()
+        if fail_consumption:
+            with pytest.raises(ValueError, match="consumer failed"):
+                consumer.result(timeout=5)
+        else:
+            consumer.result(timeout=5)
+
+    assert bus._state_for("alice").claimed == {}
+    expected = ["already claimed", "new arrival"] if fail_consumption else ["new arrival"]
+    assert [item["content"] for item in bus.read_inbox("alice")] == expected
+
+
+def test_message_bus_claimed_batches_are_per_mailbox_and_lead_aliases_share_state():
+    bus = teams.MessageBus()
+    alice_state = bus._state_for("alice")
+    bob_state = bus._state_for("bob")
+    lead_state = bus._state_for("lead")
+    assert alice_state is not bob_state
+    assert alice_state.claimed is not bob_state.claimed
+    assert all(bus._state_for(alias) is lead_state for alias in ("Lead", "leader", "main"))
+
+    bus.send("lead", "alice", "alice's work")
+    bus.send("lead", "bob", "bob's work")
+    alice = bus.claim_inbox("alice")
+    bob = bus.claim_inbox("bob")
+    assert alice_state.claimed == {alice.batch_id: alice.path}
+    assert bob_state.claimed == {bob.batch_id: bob.path}
+
+    bus.ack_inbox(alice)
+    assert alice_state.claimed == {}
+    assert bob_state.claimed == {bob.batch_id: bob.path}
+    bus.nack_inbox(bob)
+    assert bob_state.claimed == {}
+    assert bus.read_inbox("alice") == []
+    assert [item["content"] for item in bus.read_inbox("bob")] == ["bob's work"]
+
+
+def test_lead_claimed_batch_is_not_signaled_again_but_new_mail_is():
+    bus = teams.BUS
+    bus.send("alice", "Leader", "currently processing", "result")
+    assert teams.signal_pending_lead_inbox() is True
+    batch = bus.claim_inbox("main")
+    teams._lead_inbox_event.clear()
+    bus.send("lead", "bob", "another recipient's mail")
+
+    assert teams.signal_pending_lead_inbox() is False
+    assert not teams._lead_inbox_event.is_set()
+    bus.send("alice", "LEAD", "new result", "result")
+    assert teams.signal_pending_lead_inbox() is True
+    bus.ack_inbox(batch)
+    assert teams.signal_pending_lead_inbox() is True
+    assert [item["content"] for item in bus.read_inbox("lead")] == ["new result"]
+    assert teams.signal_pending_lead_inbox() is False
+
+
+@pytest.mark.parametrize("operation", ["ack_inbox", "nack_inbox"])
+def test_message_bus_settles_batch_in_original_workspace_after_switch(tmp_path, operation):
+    bus = teams.MessageBus()
+    bus.send("lead", "alice", "original workspace")
+    batch = bus.claim_inbox("alice")
+    original_state = bus._state_for("alice")
+
+    config.configure_workspace(tmp_path / "other-workspace")
+    bus.send("lead", "alice", "new workspace")
+    current_state = bus._state_for("alice")
+    assert current_state is not original_state
+    assert bus._state_for("alice", directory=original_state.directory) is original_state
+
+    getattr(bus, operation)(batch)
+    assert batch.path is not None and not batch.path.exists()
+    assert original_state.claimed == {}
+    assert current_state.claimed == {}
+    assert [item["content"] for item in bus.read_inbox("alice")] == ["new workspace"]
+    if operation == "nack_inbox":
+        recovered = [json.loads(line) for line in original_state.inbox.read_text(encoding="utf-8").splitlines()]
+        assert [item["content"] for item in recovered] == ["original workspace"]
+    else:
+        assert not original_state.inbox.exists()
 
 
 def test_message_bus_records_content_free_routes_for_team_graph():

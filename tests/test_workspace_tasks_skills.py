@@ -113,6 +113,23 @@ def test_claimed_task_can_be_released_for_manual_reassignment(
         tasks.release_task(task.id)
 
 
+def test_delayed_manual_release_cannot_release_a_new_claim(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "TASKS_DIR", tmp_path / ".tasks")
+    task = tasks.create_task("recover abandoned work")
+    tasks.assign_task(task.id, "alice")
+    assert tasks.claim_task(task.id, "alice").startswith("Claimed")
+    abandoned = tasks.load_task(task.id)
+    tasks.release_task(task.id, expected_task=abandoned)
+    tasks.assign_task(task.id, "bob")
+    assert tasks.claim_task(task.id, "bob").startswith("Claimed")
+
+    with pytest.raises(ValueError, match="changed; reload"):
+        tasks.release_task(task.id, expected_task=abandoned)
+
+    current = tasks.load_task(task.id)
+    assert (current.status, current.owner) == ("in_progress", "bob")
+
+
 def test_task_delete_rejects_running_and_referenced_tasks(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "TASKS_DIR", tmp_path / ".tasks")
     dependency = tasks.create_task("dependency")
@@ -179,6 +196,23 @@ def test_teammate_cannot_reserve_or_claim_two_active_tasks(tmp_path, monkeypatch
     assert tasks.claim_task(second.id, "alice") == (
         f"Owner alice is already working on {first.id}"
     )
+
+
+def test_saving_old_pending_snapshot_preserves_new_dispatch_metadata(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "TASKS_DIR", tmp_path / ".tasks")
+    snapshot = tasks.create_task("work")
+    tasks.assign_task(snapshot.id, "alice")
+    tasks.ack_matching_requests({snapshot.id: snapshot.matching_revision})
+
+    tasks.save_task(snapshot)
+
+    current = tasks.load_task(snapshot.id)
+    assert current.assignee == "alice"
+    assert current.matching_notified_revision == snapshot.matching_revision
+    assert tasks.claim_task(snapshot.id, "alice").startswith("Claimed")
+    with pytest.raises(ValueError, match="intervention flow"):
+        tasks.save_task(snapshot)
+    assert tasks.load_task(snapshot.id).owner == "alice"
 
 
 def test_old_task_json_without_assignee_remains_readable(tmp_path, monkeypatch):

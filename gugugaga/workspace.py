@@ -226,7 +226,9 @@ def run_read(
 ) -> str:
     try:
         target = safe_path(path, cwd)
-        lines = target.read_text(encoding="utf-8").splitlines()
+        # Keep the text and digest on the same snapshot if the path is replaced.
+        raw_content = target.read_bytes()
+        lines = raw_content.decode("utf-8").splitlines()
         offset = max(int(offset or 0), 0)
         limit = int(limit) if limit is not None else None
         lines = lines[offset:]
@@ -234,7 +236,8 @@ def run_read(
             lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
         rendered = "\n".join(lines)
         if include_hash:
-            metadata = f"<file_metadata sha256=\"{file_sha256(target)}\" />"
+            digest = hashlib.sha256(raw_content).hexdigest()
+            metadata = f"<file_metadata sha256=\"{digest}\" />"
             rendered = f"{rendered}\n{metadata}" if rendered else metadata
         return rendered
     except Exception as error:

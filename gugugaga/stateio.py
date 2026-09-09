@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Iterator
 
@@ -20,7 +22,20 @@ def interprocess_lock(path: Path) -> Iterator[None]:
         if os.name == "nt":
             import msvcrt
 
-            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            # LK_LOCK retries only once per second on contention. Use short
+            # retries for brief state transactions, preserving its bounded wait.
+            deadline = time.monotonic() + 10.0
+            while True:
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError as error:
+                    if error.errno != errno.EACCES:
+                        raise
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise
+                    time.sleep(min(0.01, remaining))
             try:
                 yield
             finally:

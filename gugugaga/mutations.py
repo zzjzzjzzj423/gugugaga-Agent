@@ -141,12 +141,12 @@ class WorkspaceMutationCoordinator:
                     self._queue.remove(request)
                 self._condition.notify_all()
                 raise
-        emit_mutation_state(
-            "writing",
-            paths=list(normalized),
-            global_write=request.global_write,
-        )
         try:
+            emit_mutation_state(
+                "writing",
+                paths=list(normalized),
+                global_write=request.global_write,
+            )
             yield normalized
         finally:
             with self._condition:

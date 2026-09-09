@@ -136,6 +136,6 @@
   <text x="998" y="796" class="small">校验不通过：拒绝本次领取</text>
   <text x="998" y="819" class="small">保留任务当前状态与归属</text>
 
-  <text x="48" y="887" class="small">成员锁 → 任务 RLock → 跨进程 .state.lock</text>
+  <text x="48" y="887" class="small">每个 Task 一把文件锁 → 锁内复核 → 原子保存</text>
   <text x="1232" y="887" text-anchor="end" class="small">匹配更新资格，领取确定归属。</text>
 </svg>

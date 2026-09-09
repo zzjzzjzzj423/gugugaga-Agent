@@ -1617,7 +1617,7 @@ class DashboardApplication:
             raise ValueError(
                 f"task {task_id} is still running on teammate {task.owner}"
             )
-        value = asdict(release_task(task_id))
+        value = asdict(release_task(task_id, expected_task=task))
         self.events.publish(
             {
                 "type": "task_assignment",
