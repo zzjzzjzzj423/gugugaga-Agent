@@ -1066,6 +1066,20 @@ class DashboardApplication:
         self._unsubscribe: Callable[[], None] | None = None
         self._active_turn_id: str | None = None
         self.last_memory_hits = 0
+        self._evaluations = None
+        self._evaluation_lock = threading.Lock()
+
+    def evaluations(self):
+        """The evaluator never uses the chat runtime or its memory repository."""
+        with self._evaluation_lock:
+            if self._evaluations is None:
+                from .evaluation.manager import EvaluationManager
+                self._evaluations = EvaluationManager(
+                    self.workspace,
+                    settings_getter=lambda: self.configuration.effective(self.model),
+                    publish=self.events.publish,
+                )
+            return self._evaluations
 
     def _build_runtime(self) -> GugugagaApp:
         if self._runtime_factory is not None:
@@ -1668,6 +1682,8 @@ class DashboardApplication:
 
     def close(self) -> None:
         self.permissions.close()
+        if self._evaluations is not None:
+            self._evaluations.close()
         if self._unsubscribe is not None:
             self._unsubscribe()
             self._unsubscribe = None
@@ -1758,12 +1774,32 @@ def _handler_factory(application: DashboardApplication):
                     self._asset(WEB_ASSETS / "styles.css")
                 elif parsed.path == "/assets/app.js":
                     self._asset(WEB_ASSETS / "app.js")
+                elif parsed.path in {"/assets/evaluation.js", "/assets/evaluation.css"}:
+                    self._asset(WEB_ASSETS / parsed.path.rsplit("/", 1)[-1])
                 elif parsed.path == "/assets/gugugaga-avatar.png":
                     self._asset(WEB_ASSETS / "gugugaga-avatar.png")
                 elif parsed.path == "/api/status":
                     self._json(application.status())
                 elif parsed.path == "/api/config":
                     self._json(application.configuration_status())
+                elif parsed.path == "/api/evaluations/catalog":
+                    self._json(application.evaluations().catalog())
+                elif parsed.path == "/api/evaluations":
+                    self._json({"runs": application.evaluations().list_runs()})
+                elif parsed.path.startswith("/api/evaluations/"):
+                    parts = parsed.path[len("/api/evaluations/"):].split("/")
+                    run_id = unquote(parts[0])
+                    manager = application.evaluations()
+                    if len(parts) == 1:
+                        self._json(manager.get(run_id))
+                    elif len(parts) == 2 and parts[1] == "questions":
+                        self._json(manager.questions(run_id, offset=int(query.get("offset", ["0"])[0]), limit=int(query.get("limit", ["50"])[0]), filter=query.get("filter", ["all"])[0]))
+                    elif len(parts) == 2 and parts[1] == "question":
+                        self._json(manager.question(run_id, query.get("qa_id", [""])[0]))
+                    elif len(parts) == 2 and parts[1] == "events":
+                        self._json(manager.events(run_id, int(query.get("after", ["0"])[0])))
+                    else:
+                        self._error(HTTPStatus.NOT_FOUND, "not found")
                 elif parsed.path == "/api/overview":
                     session_id = query.get("session_id", [None])[0]
                     self._json(application.overview(session_id))
@@ -1831,6 +1867,38 @@ def _handler_factory(application: DashboardApplication):
 
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
+            # Evaluation jobs are explicit local actions, separate from Agent Tasks.
+            if parsed.path == "/api/evaluations" or parsed.path.startswith("/api/evaluations/"):
+                if not self._is_loopback():
+                    self._error(HTTPStatus.FORBIDDEN, "测评运行操作需要本地连接")
+                    return
+                origin = self.headers.get("Origin")
+                if origin and (urlparse(origin).netloc != self.headers.get("Host") or urlparse(origin).scheme not in {"http", "https"}):
+                    self._error(HTTPStatus.FORBIDDEN, "测评运行操作不允许跨站请求")
+                    return
+                try:
+                    manager = application.evaluations()
+                    if parsed.path == "/api/evaluations":
+                        self._json(manager.create(self._read_json_body()), HTTPStatus.ACCEPTED)
+                    elif parsed.path == "/api/evaluations/preview":
+                        self._json(manager.preview(self._read_json_body()))
+                    else:
+                        parts = parsed.path[len("/api/evaluations/"):].split("/")
+                        if len(parts) != 2 or parts[1] not in {"stop", "resume"}:
+                            self._error(HTTPStatus.NOT_FOUND, "not found")
+                            return
+                        self._read_json_body(allow_empty=True)
+                        operation = manager.stop if parts[1] == "stop" else manager.resume
+                        self._json(operation(unquote(parts[0])))
+                except KeyError as error:
+                    self._error(HTTPStatus.NOT_FOUND, str(error))
+                except (TypeError, ValueError, UnicodeDecodeError) as error:
+                    self._error(HTTPStatus.BAD_REQUEST, str(error))
+                except RuntimeError as error:
+                    self._error(HTTPStatus.CONFLICT, str(error))
+                except Exception:
+                    self._error(HTTPStatus.INTERNAL_SERVER_ERROR, "测评操作失败，请检查本地实验状态")
+                return
             task_action = re.fullmatch(
                 r"/api/tasks/(task_[0-9]+_[0-9]{4})/(assign|unassign|release)",
                 parsed.path,

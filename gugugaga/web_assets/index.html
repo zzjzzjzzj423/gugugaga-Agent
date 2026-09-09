@@ -7,6 +7,7 @@
   <title>gugugaga Console</title>
   <link rel="icon" type="image/png" href="/assets/gugugaga-avatar.png">
   <link rel="stylesheet" href="/assets/styles.css">
+  <link rel="stylesheet" href="/assets/evaluation.css">
 </head>
 <body>
   <div class="app-shell">
@@ -19,6 +20,7 @@
         <button class="nav-item is-active" type="button" data-page="overview" aria-current="page"><span class="nav-icon">▦</span><span>Overview</span></button>
         <button class="nav-item" type="button" data-page="tasks"><span class="nav-icon">◫</span><span>任务可视化</span></button>
         <button class="nav-item" type="button" data-page="memory"><span class="nav-icon">◎</span><span>Memory</span></button>
+        <button class="nav-item" type="button" data-page="evaluation"><span class="nav-icon">▥</span><span>记忆测评</span></button>
         <button class="nav-item" type="button" data-page="database"><span class="nav-icon">▤</span><span>Database</span></button>
       </nav>
       <div class="sidebar-footer">
@@ -178,6 +180,16 @@
         </div>
       </section>
 
+      <section class="page" id="page-evaluation" aria-labelledby="evaluation-title" aria-hidden="true">
+        <header class="page-header">
+          <div><p class="eyebrow">Memory evaluation</p><h1 id="evaluation-title">记忆测评</h1><p>设计对照实验，跟踪每个阶段，从成绩追到证据。</p></div>
+          <div class="ev-actions"><button class="ev-button" id="evaluation-refresh" type="button">↻ 刷新</button><button class="ev-button ev-primary" id="evaluation-new" type="button" disabled>加载实验配置…</button></div>
+        </header>
+        <div class="ev-isolation"><span aria-hidden="true">◇</span><span>独立测评空间 · 实验写入专属数据库，不修改用户日常记忆。</span><span class="ev-connection" id="evaluation-connection">尚未连接</span></div>
+        <div class="ev-error" id="evaluation-error" role="alert" hidden></div>
+        <div id="evaluation-content"><div class="ev-empty">正在读取实验记录…</div></div>
+      </section>
+
       <section class="page" id="page-database" aria-labelledby="database-title" aria-hidden="true">
         <header class="page-header">
           <div><p class="eyebrow">SQLite inspector</p><h1 id="database-title">Database</h1><p>只读浏览 <code>.gugugaga/state.db</code> 的原型表、字段和索引。</p></div>
@@ -313,6 +325,7 @@
       </form>
     </section>
   </div>
+  <script src="/assets/evaluation.js" defer></script>
   <script src="/assets/app.js" defer></script>
 </body>
 </html>
