@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import random
 import re
-import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -15,7 +16,6 @@ from .stateio import atomic_write_text, interprocess_lock
 
 
 CURRENT_TODOS: list[dict] = []
-_task_state_lock = threading.RLock()
 _TASK_ID_PATTERN = re.compile(r"task_[0-9]+_[0-9]{4}\Z", re.ASCII)
 
 
@@ -47,27 +47,60 @@ def _task_path(task_id: str) -> Path:
     return config.TASKS_DIR / f"{task_id}.json"
 
 
+def _task_lock(task_id: str) -> AbstractContextManager[None]:
+    """Serialize contenders for one task, across threads and local processes."""
+    _task_path(task_id)
+    # Keep the lock file separate from the atomically replaced JSON. Never
+    # unlink it on task deletion: existing waiters must keep the same lock.
+    return interprocess_lock(config.TASKS_DIR / ".locks" / f"{task_id}.lock")
+
+
+@contextmanager
+def _task_locks(task_ids: Iterable[str]) -> Iterator[None]:
+    """Coordinate dependency reference edits in a consistent lock order."""
+    ids = sorted(set(task_ids))
+    for task_id in ids:
+        _task_path(task_id)
+    with ExitStack() as stack:
+        for task_id in ids:
+            stack.enter_context(_task_lock(task_id))
+        yield
+
+
+def _queue_lock(assignee: str) -> AbstractContextManager[None]:
+    """Coordinate FIFO creation for this assignee, not other agents' tasks."""
+    key = hashlib.sha256(assignee.encode("utf-8")).hexdigest()
+    return interprocess_lock(config.TASKS_DIR / ".locks" / f"queue-{key}.lock")
+
+
+def _create_task_record(
+    subject: str, description: str, blocked_by: list[str], **fields,
+) -> Task:
+    for dependency_id in blocked_by:
+        _task_path(dependency_id)
+    while True:
+        task_id = f"task_{int(time.time())}_{random.randint(0, 9999):04d}"
+        if task_id in blocked_by:
+            continue
+        # Contention is limited to an ID collision or a shared dependency.
+        # Publish a complete JSON only after checking the ID under its lock.
+        with _task_locks([task_id, *blocked_by]):
+            if _task_path(task_id).exists():
+                continue
+            task = Task(
+                id=task_id, subject=subject, description=description,
+                status="pending", owner=None, blockedBy=list(blocked_by), **fields,
+            )
+            _save_task_unlocked(task)
+            return task
+
+
 def create_task(
     subject: str,
     description: str = "",
     blockedBy: list[str] | None = None,
 ) -> Task:
-    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
-        for dependency_id in blockedBy or []:
-            _task_path(dependency_id)
-        while True:
-            task_id = f"task_{int(time.time())}_{random.randint(0, 9999):04d}"
-            if not _task_path(task_id).exists():
-                break
-        task = Task(
-            id=task_id,
-            subject=subject,
-            description=description,
-            status="pending",
-            owner=None,
-            blockedBy=list(blockedBy or []),
-        )
-        _save_task_unlocked(task)
+    task = _create_task_record(subject, description, list(blockedBy or []))
     _notify_matching([task])
     return task
 
@@ -87,7 +120,7 @@ def create_queued_task(
     title = str(subject or "").strip()[:120]
     if not title:
         raise ValueError("subject is required")
-    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
+    with _queue_lock(value):
         positions = [
             task.queue_position or 0
             for task in _list_tasks_unlocked()
@@ -95,18 +128,11 @@ def create_queued_task(
             and task.dispatch_type == "queued"
             and task.status in {"pending", "in_progress"}
         ]
-        while True:
-            task_id = f"task_{int(time.time())}_{random.randint(0, 9999):04d}"
-            if not _task_path(task_id).exists():
-                break
         now = time.time()
-        task = Task(
-            id=task_id,
+        task = _create_task_record(
             subject=title,
             description=str(description or "").strip(),
-            status="pending",
-            owner=None,
-            blockedBy=[],
+            blocked_by=[],
             assignee=value,
             queue_position=max(positions, default=0) + 1,
             dispatch_type="queued",
@@ -120,7 +146,6 @@ def create_queued_task(
                 }
             ],
         )
-        _save_task_unlocked(task)
         return task
 
 
@@ -132,32 +157,25 @@ def append_task_intervention(
     content: str,
     status: str,
 ) -> Task:
+    """Record an injected message from the owning agent's serial worker only."""
     _task_path(task_id)
-    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
-        task = _load_task_unlocked(task_id)
-        existing = next(
-            (
-                item
-                for item in task.interventions
-                if item.get("id") == interaction_id
-            ),
-            None,
-        )
-        if existing is None:
-            task.interventions.append(
-                {
-                    "id": interaction_id,
-                    "action": action,
-                    "content": content,
-                    "status": status,
-                    "created_at": time.time(),
-                }
-            )
-        else:
-            existing["status"] = status
-            existing["updated_at"] = time.time()
-        _save_task_unlocked(task)
-        return task
+    task = _load_task_unlocked(task_id)
+    if task.status != "in_progress" or not task.owner:
+        raise ValueError(f"task {task_id} has no executing owner")
+    existing = next(
+        (item for item in task.interventions if item.get("id") == interaction_id),
+        None,
+    )
+    if existing is None:
+        task.interventions.append({
+            "id": interaction_id, "action": action, "content": content,
+            "status": status, "created_at": time.time(),
+        })
+    else:
+        existing["status"] = status
+        existing["updated_at"] = time.time()
+    _save_task_unlocked(task)
+    return task
 
 
 def _save_task_unlocked(task: Task) -> None:
@@ -166,23 +184,26 @@ def _save_task_unlocked(task: Task) -> None:
 
 
 def save_task(task: Task) -> None:
+    """Save pending requirements while preserving newer dispatch metadata."""
     _task_path(task.id)
-    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
+    if task.status != "pending" or task.owner:
+        raise ValueError("use claim_task or complete_task to change execution state")
+    with _task_locks([task.id, *task.blockedBy]):
         if _task_path(task.id).exists():
             previous = _load_task_unlocked(task.id)
+            if previous.status != "pending" or previous.owner:
+                raise ValueError("use the existing intervention flow for claimed tasks")
             if (previous.subject, previous.description, previous.blockedBy) != (
                 task.subject, task.description, task.blockedBy
             ):
-                if previous.status != "pending" or previous.owner:
-                    raise ValueError("use the existing intervention flow for claimed tasks")
                 # Preserve concurrent ownership/candidate decisions. Requirement
                 # edits must not overwrite them from a stale Task snapshot.
                 previous.subject = task.subject
                 previous.description = task.description
                 previous.blockedBy = list(task.blockedBy)
-                task = previous
-                if _is_matchable(task):
-                    _request_rematch_unlocked(task, "task_requirements_changed")
+                if _is_matchable(previous):
+                    _request_rematch_unlocked(previous, "task_requirements_changed")
+            task = previous
         _save_task_unlocked(task)
     _notify_matching([task])
 
@@ -192,8 +213,7 @@ def _is_matchable(task: Task) -> bool:
 
 
 def _notify_matching(tasks: list[Task], *, updated: bool = False) -> None:
-    # Notify only after releasing the storage lock: team dispatch acquires the
-    # teammate lock before the task lock, never the reverse.
+    # Notify outside storage locks: observers may inspect tasks or team state.
     from .observability import notify
     from .teams import _lead_inbox_event
 
@@ -218,7 +238,7 @@ def _request_rematch_unlocked(task: Task, reason: str) -> None:
 
 def request_task_rematch(task_id: str, reason: str) -> Task:
     _task_path(task_id)
-    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
+    with _task_lock(task_id):
         task = _load_task_unlocked(task_id)
         if not _is_matchable(task):
             return task
@@ -230,8 +250,12 @@ def request_task_rematch(task_id: str, reason: str) -> Task:
 
 def request_all_task_rematches(reason: str) -> list[Task]:
     changed = []
-    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
-        for task in _list_tasks_unlocked():
+    for snapshot in _list_tasks_unlocked():
+        with _task_lock(snapshot.id):
+            try:
+                task = _load_task_unlocked(snapshot.id)
+            except FileNotFoundError:
+                continue
             if _is_matchable(task):
                 _request_rematch_unlocked(task, reason)
                 _save_task_unlocked(task)
@@ -242,21 +266,24 @@ def request_all_task_rematches(reason: str) -> list[Task]:
 
 def pending_matching_requests() -> list[dict]:
     """A durable, coalesced outbox; reads and idle polls never call a model."""
-    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
-        return [
-            asdict(task) for task in _list_tasks_unlocked()
-            if _is_matchable(task)
-            and task.matching_status != "matched"
-            and task.matching_revision > task.matching_notified_revision
-        ]
+    return [
+        asdict(task) for task in _list_tasks_unlocked()
+        if _is_matchable(task)
+        and task.matching_status != "matched"
+        and task.matching_revision > task.matching_notified_revision
+    ]
 
 
 def ack_matching_requests(revisions: dict[str, int]) -> None:
-    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
-        for task_id, revision in revisions.items():
+    for task_id, revision in revisions.items():
+        with _task_lock(task_id):
             try:
                 task = _load_task_unlocked(task_id)
             except FileNotFoundError:
+                continue
+            # A late Lead acknowledgement must not write a running task. Once
+            # claimed, only its serial worker can update the record.
+            if task.status != "pending" or task.owner:
                 continue
             task.matching_notified_revision = max(
                 task.matching_notified_revision,
@@ -283,7 +310,7 @@ def set_task_candidates(
         raise ValueError("assignment_reason is required, including for empty candidates")
     if type(expected_revision) is not int:
         raise ValueError("expected_revision must be an integer")
-    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
+    with _task_lock(task_id):
         task = _load_task_unlocked(task_id)
         if not _is_matchable(task):
             raise ValueError("cannot rematch a claimed or manually assigned task")
@@ -317,7 +344,7 @@ def update_task(
             _task_path(dependency)
             if dependency == task_id:
                 raise ValueError("a task cannot depend on itself")
-    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
+    with _task_locks([task_id, *(blockedBy or [])]):
         task = _load_task_unlocked(task_id)
         if task.status != "pending" or task.owner:
             raise ValueError("use the existing intervention flow for claimed tasks")
@@ -346,71 +373,74 @@ def report_task_mismatch(
         raise ValueError("mismatch reason is required")
     if not isinstance(work_summary, str):
         raise ValueError("work_summary must be a string")
-    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
-        task = _load_task_unlocked(task_id)
-        if task.status != "in_progress" or task.owner != owner:
-            raise ValueError(f"task {task_id} is not owned by {owner}")
-        task.mismatch_reports.append({
-            "agent": owner, "reason": reason.strip(),
-            "work_summary": work_summary, "created_at": time.time(),
-        })
-        task.status = "pending"
-        task.owner = None
-        task.assignee = None
-        task.matching_status = "rematch_required"
-        task.interrupted_by_user = False
-        _request_rematch_unlocked(task, "task_mismatch_reported")
-        _save_task_unlocked(task)
+    task = _load_task_unlocked(task_id)
+    if task.status != "in_progress" or task.owner != owner:
+        raise ValueError(f"task {task_id} is not owned by {owner}")
+    task.mismatch_reports.append({
+        "agent": owner, "reason": reason.strip(),
+        "work_summary": work_summary, "created_at": time.time(),
+    })
+    task.status = "pending"
+    task.owner = None
+    task.assignee = None
+    task.matching_status = "rematch_required"
+    task.interrupted_by_user = False
+    _request_rematch_unlocked(task, "task_mismatch_reported")
+    # This is the worker's last write for this ownership. Publish all fields
+    # together before another idle worker can see and claim the pending task.
+    _save_task_unlocked(task)
     _notify_matching([task])
     return task
 
 
 def _load_task_unlocked(task_id: str) -> Task:
-    task = Task(**json.loads(_task_path(task_id).read_text()))
+    task = Task(**json.loads(_task_path(task_id).read_text(encoding="utf-8")))
     if task.id != task_id:
         raise ValueError(f"task id mismatch: expected {task_id}, got {task.id}")
     return task
 
 
 def load_task(task_id: str) -> Task:
-    _task_path(task_id)
-    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
-        return _load_task_unlocked(task_id)
+    # Atomic replacement publishes either the old or new complete record.
+    return _load_task_unlocked(task_id)
 
 
 def _list_tasks_unlocked() -> list[Task]:
-    return [
-        Task(**json.loads(path.read_text()))
-        for path in sorted(config.TASKS_DIR.glob("task_*.json"))
-        if _TASK_ID_PATTERN.fullmatch(path.stem)
-    ]
+    result = []
+    for path in sorted(config.TASKS_DIR.glob("task_*.json")):
+        if not _TASK_ID_PATTERN.fullmatch(path.stem):
+            continue
+        try:
+            result.append(_load_task_unlocked(path.stem))
+        except FileNotFoundError:
+            # A directory scan is not a transaction over all tasks; deletion
+            # may finish after the path was enumerated.
+            continue
+    return result
 
 
 def list_tasks() -> list[Task]:
-    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
-        return _list_tasks_unlocked()
+    return _list_tasks_unlocked()
 
 
 def get_task_json(task_id: str) -> str:
-    _task_path(task_id)
-    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
-        return json.dumps(asdict(_load_task_unlocked(task_id)), indent=2)
+    return json.dumps(asdict(load_task(task_id)), indent=2)
 
 
 def _can_start_unlocked(task_id: str) -> bool:
-    task = _load_task_unlocked(task_id)
-    for dependency_id in task.blockedBy:
-        if not _task_path(dependency_id).exists():
-            return False
-        if _load_task_unlocked(dependency_id).status != "completed":
-            return False
+    try:
+        task = _load_task_unlocked(task_id)
+        for dependency_id in task.blockedBy:
+            if _load_task_unlocked(dependency_id).status != "completed":
+                return False
+    except FileNotFoundError:
+        return False
     return True
 
 
 def can_start(task_id: str) -> bool:
     _task_path(task_id)
-    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
-        return _can_start_unlocked(task_id)
+    return _can_start_unlocked(task_id)
 
 
 def _claim_task_unlocked(
@@ -438,18 +468,14 @@ def _claim_task_unlocked(
     )
     if active is not None:
         return f"Owner {owner} is already working on {active.id}"
-    if not _can_start_unlocked(task_id):
-        dependencies = [
-            dependency_id
-            for dependency_id in task.blockedBy
-            if _task_path(dependency_id).exists()
-            and _load_task_unlocked(dependency_id).status != "completed"
-        ]
-        missing = [
-            dependency_id
-            for dependency_id in task.blockedBy
-            if not _task_path(dependency_id).exists()
-        ]
+    dependencies, missing = [], []
+    for dependency_id in task.blockedBy:
+        try:
+            if _load_task_unlocked(dependency_id).status != "completed":
+                dependencies.append(dependency_id)
+        except FileNotFoundError:
+            missing.append(dependency_id)
+    if dependencies or missing:
         parts = []
         if dependencies:
             parts.append(f"blocked by: {dependencies}")
@@ -479,10 +505,10 @@ def claim_task(
     *,
     eligibility_check: Callable[[Task], str | None] | None = None,
 ) -> str:
-    # Autonomous teammates share one task directory. The full read/check/write
-    # transition must be indivisible between their polling threads.
+    # Each agent has a serial worker. Competing agents only serialize when
+    # claiming the same task; the scan above is a guard, not an owner lock.
     _task_path(task_id)
-    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
+    with _task_lock(task_id):
         return _claim_task_unlocked(
             task_id, owner, eligibility_check=eligibility_check
         )
@@ -495,7 +521,7 @@ def assign_task(task_id: str, assignee: str) -> Task:
     if not value:
         raise ValueError("assignee is required")
     _task_path(task_id)
-    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
+    with _queue_lock(value), _task_lock(task_id):
         task = _load_task_unlocked(task_id)
         if task.status != "pending" or task.owner:
             raise ValueError(f"task {task_id} is not pending")
@@ -524,7 +550,7 @@ def unassign_task(task_id: str) -> Task:
     """Remove a pending reservation. Claimed work must be completed by its owner."""
 
     _task_path(task_id)
-    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
+    with _task_lock(task_id):
         task = _load_task_unlocked(task_id)
         if task.status != "pending" or task.owner:
             raise ValueError(f"task {task_id} has already been claimed")
@@ -537,12 +563,16 @@ def unassign_task(task_id: str) -> Task:
     return task
 
 
-def release_task(task_id: str) -> Task:
-    """Return abandoned or incorrectly claimed work to the pending queue."""
+def release_task(task_id: str, *, expected_task: Task | None = None) -> Task:
+    """Manually release abandoned work after its worker has stopped."""
 
     _task_path(task_id)
-    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
+    # Unlike the worker's own interrupt, multiple administrative requests can
+    # arrive together. Serialize them with claim using only this task's lock.
+    with _task_lock(task_id):
         task = _load_task_unlocked(task_id)
+        if expected_task is not None and task != expected_task:
+            raise ValueError(f"task {task_id} changed; reload before releasing it")
         if task.status != "in_progress" or not task.owner:
             raise ValueError(f"task {task_id} is not claimed")
         task.status = "pending"
@@ -558,80 +588,104 @@ def interrupt_task(task_id: str, owner: str) -> Task:
     """Release interrupted work while preserving its Team Agent reservation."""
 
     _task_path(task_id)
-    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
-        task = _load_task_unlocked(task_id)
-        if task.status != "in_progress" or task.owner != owner:
-            raise ValueError(f"task {task_id} is not owned by {owner}")
-        task.status = "pending"
-        task.owner = None
-        task.assignee = owner
-        task.interrupted_by_user = True
-        _save_task_unlocked(task)
-        return task
+    task = _load_task_unlocked(task_id)
+    if task.status != "in_progress" or task.owner != owner:
+        raise ValueError(f"task {task_id} is not owned by {owner}")
+    task.status = "pending"
+    task.owner = None
+    task.assignee = owner
+    task.interrupted_by_user = True
+    # The owning worker has stopped executing and makes no further writes
+    # after publishing this complete pending record.
+    _save_task_unlocked(task)
+    return task
 
 
 def delete_task(task_id: str) -> Task:
     """Delete a non-running, unreferenced task and return its final record."""
 
     path = _task_path(task_id)
-    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
-        task = _load_task_unlocked(task_id)
-        if task.status == "in_progress":
-            raise ValueError(f"task {task_id} is running and cannot be deleted")
-        dependents = [
-            candidate.id
-            for candidate in _list_tasks_unlocked()
-            if candidate.id != task_id and task_id in candidate.blockedBy
-        ]
-        if dependents:
-            raise ValueError(
-                f"task {task_id} is still required by: {', '.join(dependents)}"
-            )
-        path.unlink()
-        if task.dispatch_type == "queued" and task.assignee:
-            queued = sorted(
-                (
-                    candidate
-                    for candidate in _list_tasks_unlocked()
-                    if candidate.assignee == task.assignee
-                    and candidate.dispatch_type == "queued"
-                    and candidate.status in {"pending", "in_progress"}
-                ),
-                key=lambda candidate: (
-                    candidate.queue_position is None,
-                    candidate.queue_position or 0,
-                    candidate.id,
-                ),
-            )
-            for position, candidate in enumerate(queued, start=1):
-                if candidate.queue_position != position:
-                    candidate.queue_position = position
-                    _save_task_unlocked(candidate)
-        return task
+    while True:
+        snapshot = _load_task_unlocked(task_id)
+        queue = snapshot.assignee if snapshot.dispatch_type == "queued" else None
+        with ExitStack() as stack:
+            if queue:
+                stack.enter_context(_queue_lock(queue))
+            with _task_lock(task_id):
+                task = _load_task_unlocked(task_id)
+                if (task.assignee if task.dispatch_type == "queued" else None) != queue:
+                    continue
+                if task.status == "in_progress":
+                    raise ValueError(f"task {task_id} is running and cannot be deleted")
+                dependents = [
+                    candidate.id for candidate in _list_tasks_unlocked()
+                    if candidate.id != task_id and task_id in candidate.blockedBy
+                ]
+                if dependents:
+                    raise ValueError(
+                        f"task {task_id} is still required by: {', '.join(dependents)}"
+                    )
+                path.unlink()
+            if queue:
+                _renumber_pending_queue(queue)
+            return task
+
+
+def _renumber_pending_queue(assignee: str) -> None:
+    """Compact waiting positions under the queue lock; never write running work."""
+    queued = sorted(
+        (
+            task for task in _list_tasks_unlocked()
+            if task.assignee == assignee and task.dispatch_type == "queued"
+            and task.status in {"pending", "in_progress"}
+        ),
+        key=lambda task: (task.queue_position is None, task.queue_position or 0, task.id),
+    )
+    position = max(
+        (task.queue_position or 0 for task in queued if task.status == "in_progress"),
+        default=0,
+    )
+    for snapshot in queued:
+        with _task_lock(snapshot.id):
+            try:
+                task = _load_task_unlocked(snapshot.id)
+            except FileNotFoundError:
+                continue
+            if task.assignee != assignee or task.dispatch_type != "queued":
+                continue
+            if task.status == "in_progress":
+                position = max(position, task.queue_position or 0)
+                continue
+            if task.status != "pending":
+                continue
+            position += 1
+            if task.queue_position != position:
+                task.queue_position = position
+                _save_task_unlocked(task)
 
 
 def complete_task(task_id: str, owner: str = "agent") -> str:
     _task_path(task_id)
-    with _task_state_lock, interprocess_lock(config.TASKS_DIR / ".state.lock"):
-        task = _load_task_unlocked(task_id)
-        if task.status != "in_progress":
-            return f"Task {task_id} is {task.status}, cannot complete"
-        if task.owner != owner:
-            return f"Task {task_id} is owned by {task.owner}, not {owner}"
-        task.status = "completed"
-        _save_task_unlocked(task)
-        unblocked = [
-            candidate.subject
-            for candidate in _list_tasks_unlocked()
-            if candidate.status == "pending"
-            and candidate.blockedBy
-            and _can_start_unlocked(candidate.id)
-        ]
-        print(f"  \033[32m[complete] {task.subject} ✓\033[0m")
-        message = f"Completed {task.id} ({task.subject})"
-        if unblocked:
-            message += f"\nUnblocked: {', '.join(unblocked)}"
-        return message
+    task = _load_task_unlocked(task_id)
+    if task.status != "in_progress":
+        return f"Task {task_id} is {task.status}, cannot complete"
+    if task.owner != owner:
+        return f"Task {task_id} is owned by {task.owner}, not {owner}"
+    # Completion is called by the same serial worker that owns execution.
+    task.status = "completed"
+    _save_task_unlocked(task)
+    unblocked = [
+        candidate.subject
+        for candidate in _list_tasks_unlocked()
+        if candidate.status == "pending"
+        and candidate.blockedBy
+        and _can_start_unlocked(candidate.id)
+    ]
+    print(f"  \033[32m[complete] {task.subject} ✓\033[0m")
+    message = f"Completed {task.id} ({task.subject})"
+    if unblocked:
+        message += f"\nUnblocked: {', '.join(unblocked)}"
+    return message
 
 
 def _normalize_todos(todos):

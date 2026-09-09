@@ -56,7 +56,6 @@ if TYPE_CHECKING:
 
 # S15-S17 source-compatible team communication. Paths are resolved from
 # config at call time so every teammate sees the selected shared workspace.
-_mailbox_lock = threading.RLock()
 _AGENT_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 _LEAD_AGENT_NAME = "lead"
 _LEAD_AGENT_ALIASES = frozenset({"lead", "leader", "main"})
@@ -147,22 +146,49 @@ class InboxBatch:
     path: Path | None = field(default=None, repr=False, compare=False)
 
 
+@dataclass
+class _MailboxState:
+    """One recipient's state; file operations and claims use its file lock."""
+
+    agent: str
+    directory: Path
+    claimed: dict[str, Path] = field(default_factory=dict)
+
+    @property
+    def inbox(self) -> Path:
+        return self.directory / f"{self.agent}.jsonl"
+
+    @property
+    def lock_path(self) -> Path:
+        return self.directory / f".{self.agent}.lock"
+
+
 class MessageBus:
     def __init__(self):
-        self._claimed: dict[str, Path] = {}
+        self._states: dict[Path, _MailboxState] = {}
+        # Only protects lookup/creation. Never held during file I/O or consumption.
+        self._registry_lock = threading.Lock()
 
-    @staticmethod
-    def _lock_path(agent: str) -> Path:
+    def _state_for(
+        self, agent: str, *, directory: Path | None = None
+    ) -> _MailboxState:
         agent = _canonical_agent_name(agent)
-        return config.MAILBOX_DIR / f".{agent}.lock"
+        directory = (config.MAILBOX_DIR if directory is None else directory).resolve()
+        key = directory / f"{agent}.jsonl"
+        with self._registry_lock:
+            state = self._states.get(key)
+            if state is None:
+                state = _MailboxState(agent, directory)
+                self._states[key] = state
+            return state
 
-    def _recover_lead_alias_mailboxes_locked(self) -> None:
+    def _recover_lead_alias_mailboxes_locked(self, state: _MailboxState) -> None:
         """Move mail addressed to Lead aliases into the canonical mailbox."""
 
-        canonical = config.MAILBOX_DIR / f"{_LEAD_AGENT_NAME}.jsonl"
+        canonical = state.inbox
         recovered: list[str] = []
-        claimed = set(self._claimed.values())
-        for path in sorted(config.MAILBOX_DIR.iterdir()):
+        claimed = set(state.claimed.values())
+        for path in sorted(state.directory.iterdir()):
             if not path.is_file() or path in claimed:
                 continue
             alias: str | None = None
@@ -192,6 +218,40 @@ class MessageBus:
             existing = canonical.read_text(encoding="utf-8") if canonical.exists() else ""
             atomic_write_text(canonical, existing + "".join(recovered))
 
+    def has_unread(self, agent: str) -> bool:
+        """Inspect only this mailbox, excluding batches its consumer has claimed."""
+
+        state = self._state_for(agent)
+        if not state.directory.exists():
+            return False
+        with interprocess_lock(state.lock_path):
+            if state.inbox.exists():
+                return True
+            claimed = set(state.claimed.values())
+            if state.agent != _LEAD_AGENT_NAME:
+                return any(
+                    path not in claimed and path.is_file()
+                    for path in state.directory.glob(
+                        f".{state.agent}.*.inflight.jsonl"
+                    )
+                )
+            for path in state.directory.iterdir():
+                if path in claimed or not path.is_file():
+                    continue
+                if path.name.startswith("."):
+                    match = re.fullmatch(
+                        r"\.([A-Za-z0-9_-]+)\.batch_[A-Za-z0-9]+\.inflight\.jsonl",
+                        path.name,
+                    )
+                    if match and match.group(1).casefold() in _LEAD_AGENT_ALIASES:
+                        return True
+                elif (
+                    path.suffix == ".jsonl"
+                    and path.stem.casefold() in _LEAD_AGENT_ALIASES
+                ):
+                    return True
+            return False
+
     def send(
         self,
         from_agent: str,
@@ -211,9 +271,8 @@ class MessageBus:
             "ts": time.time(),
             "metadata": metadata or {},
         }
-        config.MAILBOX_DIR.mkdir(parents=True, exist_ok=True)
-        inbox = config.MAILBOX_DIR / f"{to_agent}.jsonl"
-        with _mailbox_lock, interprocess_lock(self._lock_path(to_agent)), inbox.open(
+        state = self._state_for(to_agent)
+        with interprocess_lock(state.lock_path), state.inbox.open(
             "a", encoding="utf-8"
         ) as handle:
             handle.write(json.dumps(msg, ensure_ascii=False) + "\n")
@@ -248,25 +307,25 @@ class MessageBus:
 
     def claim_inbox(self, agent: str) -> InboxBatch:
         agent = _canonical_agent_name(agent)
-        config.MAILBOX_DIR.mkdir(parents=True, exist_ok=True)
-        with _mailbox_lock, interprocess_lock(self._lock_path(agent)):
+        state = self._state_for(agent)
+        with interprocess_lock(state.lock_path):
             if agent == _LEAD_AGENT_NAME:
-                self._recover_lead_alias_mailboxes_locked()
-            claimed_paths = set(self._claimed.values())
+                self._recover_lead_alias_mailboxes_locked(state)
+            claimed_paths = set(state.claimed.values())
             recoverable = [
                 path
-                for path in sorted(config.MAILBOX_DIR.glob(f".{agent}.*.inflight.jsonl"))
+                for path in sorted(state.directory.glob(f".{agent}.*.inflight.jsonl"))
                 if path not in claimed_paths
             ]
             if recoverable:
                 processing = recoverable[0]
                 batch_id = processing.name.split(".")[2]
             else:
-                inbox = config.MAILBOX_DIR / f"{agent}.jsonl"
+                inbox = state.inbox
                 if not inbox.exists():
                     return InboxBatch("", agent, ())
                 batch_id = f"batch_{uuid.uuid4().hex}"
-                processing = config.MAILBOX_DIR / f".{agent}.{batch_id}.inflight.jsonl"
+                processing = state.directory / f".{agent}.{batch_id}.inflight.jsonl"
                 os.replace(inbox, processing)
 
             messages: list[dict] = []
@@ -289,7 +348,7 @@ class MessageBus:
                 except (json.JSONDecodeError, ValueError):
                     malformed.append(line)
             if malformed:
-                dead_letter = config.MAILBOX_DIR / f"{agent}.dead-letter.jsonl"
+                dead_letter = state.directory / f"{agent}.dead-letter.jsonl"
                 with dead_letter.open("a", encoding="utf-8") as handle:
                     for line in malformed:
                         handle.write(line + "\n")
@@ -302,14 +361,15 @@ class MessageBus:
                         for message in messages
                     ),
                 )
-            self._claimed[batch_id] = processing
+            state.claimed[batch_id] = processing
             return InboxBatch(batch_id, agent, tuple(messages), processing)
 
     def ack_inbox(self, batch: InboxBatch) -> None:
         if not batch.batch_id or batch.path is None:
             return
-        with _mailbox_lock, interprocess_lock(self._lock_path(batch.agent)):
-            path = self._claimed.pop(batch.batch_id, batch.path)
+        state = self._state_for(batch.agent, directory=batch.path.parent)
+        with interprocess_lock(state.lock_path):
+            path = state.claimed.pop(batch.batch_id, batch.path)
             try:
                 path.unlink()
             except FileNotFoundError:
@@ -318,11 +378,12 @@ class MessageBus:
     def nack_inbox(self, batch: InboxBatch) -> None:
         if not batch.batch_id or batch.path is None:
             return
-        with _mailbox_lock, interprocess_lock(self._lock_path(batch.agent)):
-            path = self._claimed.pop(batch.batch_id, batch.path)
+        state = self._state_for(batch.agent, directory=batch.path.parent)
+        with interprocess_lock(state.lock_path):
+            path = state.claimed.pop(batch.batch_id, batch.path)
             if not path.exists():
                 return
-            inbox = config.MAILBOX_DIR / f"{batch.agent}.jsonl"
+            inbox = state.inbox
             older = path.read_text(encoding="utf-8")
             newer = inbox.read_text(encoding="utf-8") if inbox.exists() else ""
             atomic_write_text(inbox, older + newer)
@@ -332,6 +393,7 @@ class MessageBus:
     def consume(self, agent: str):
         batch = self.claim_inbox(agent)
         try:
+            # No mailbox lock is held while the caller handles the messages.
             yield list(batch.messages)
         except BaseException:
             self.nack_inbox(batch)
@@ -910,7 +972,7 @@ def assign_task_to_teammate(task_id: str, teammate: str) -> dict[str, Any]:
         state = _teammate_states.get(teammate)
         if teammate not in active_teammates or state is None:
             raise ValueError(f"teammate '{teammate}' is offline")
-        if state.get("status") != "idle":
+        if state.get("status") != "idle" or state.get("_claim_token"):
             raise ValueError(f"teammate '{teammate}' is not idle")
         previous_assignee = load_task(task_id).assignee
         task = assign_task(task_id, teammate)
@@ -939,22 +1001,52 @@ def assign_task_to_teammate(task_id: str, teammate: str) -> dict[str, Any]:
 
 
 def claim_task_for_teammate(task_id: str, teammate: str) -> str:
-    """Use one dispatch rule for polling and model tools, under ordered locks."""
+    """Reserve dispatch briefly, then claim without holding the team registry lock."""
 
     with _teammate_lock:
+        state = _teammate_states.get(teammate)
+        if teammate not in active_teammates or state is None:
+            return f"Error: teammate '{teammate}' is offline"
+        available = state.get(
+            "dispatch_available", not state.get("current_task_id")
+            or state.get("current_task_id") == task_id,
+        )
+        stop_event = _teammate_stop_events.get(teammate)
+        if (
+            state.get("status") not in {"idle", "running"}
+            or teammate in _teammate_profile_restart_pending
+            or state.get("_claim_token")
+            or not available
+            or bool(stop_event and stop_event.is_set())
+        ):
+            return f"Error: teammate '{teammate}' is not idle"
+        token = uuid.uuid4().hex
+        state["_claim_token"] = token
+        state["dispatch_available"] = False
+
+    def runtime_rejection() -> str | None:
+        # This callback also runs inside the Task's lock. It must not wait for
+        # _teammate_lock: lifecycle callers may hold it while inspecting Tasks.
+        if (
+            teammate not in active_teammates
+            or _teammate_states.get(teammate) is not state
+            or state.get("_claim_token") != token
+        ):
+            return f"Error: teammate '{teammate}' is offline"
+        if (
+            state.get("status") not in {"idle", "running"}
+            or teammate in _teammate_profile_restart_pending
+            or bool(stop_event and stop_event.is_set())
+        ):
+            return f"Error: teammate '{teammate}' is not idle"
+        return None
+
+    published = False
+    try:
         def eligible(task) -> str | None:
-            state = _teammate_states.get(teammate)
-            if teammate not in active_teammates or state is None:
-                return f"Error: teammate '{teammate}' is offline"
-            if (
-                state.get("status") not in {"idle", "running"}
-                or teammate in _teammate_profile_restart_pending
-                or not state.get(
-                    "dispatch_available", not state.get("current_task_id")
-                    or state.get("current_task_id") == task.id,
-                )
-            ):
-                return f"Error: teammate '{teammate}' is not idle"
+            rejection = runtime_rejection()
+            if rejection:
+                return rejection
             if not get_team_settings()["auto_claim_enabled"] and task.assignee != teammate:
                 return (
                     "Error: manual assignment required while Team auto-claim "
@@ -967,11 +1059,38 @@ def claim_task_for_teammate(task_id: str, teammate: str) -> str:
         except (FileNotFoundError, ValueError) as error:
             return f"Error: {error}"
         if result.startswith("Claimed"):
-            _set_teammate_state(
-                teammate, status="running", current_task_id=task_id,
-                dispatch_available=False,
-            )
+            with _teammate_lock:
+                rejection = runtime_rejection()
+                if rejection is None:
+                    _set_teammate_state(
+                        teammate, status="running", current_task_id=task_id,
+                        dispatch_available=False,
+                    )
+                    published = True
+            if rejection:
+                # A stop/reload can arrive while the Task is being persisted.
+                # Return the reservation outside the registry lock and leave
+                # the lifecycle state intact instead of reviving the Agent.
+                try:
+                    interrupt_task(task_id, teammate)
+                except (FileNotFoundError, ValueError):
+                    pass
+                return rejection
         return result
+    finally:
+        with _teammate_lock:
+            if (
+                _teammate_states.get(teammate) is state
+                and state.get("_claim_token") == token
+            ):
+                state.pop("_claim_token", None)
+                if not published:
+                    state["dispatch_available"] = bool(
+                        available
+                        and state.get("status") in {"idle", "running"}
+                        and teammate not in _teammate_profile_restart_pending
+                        and not (stop_event and stop_event.is_set())
+                    )
 
 
 def task_candidates_context() -> dict[str, Any]:
@@ -1080,17 +1199,8 @@ def _submit_team_interaction_unlocked(
         content,
         task_id=current_task_id,
     )
-    if current_task_id and action in {"steer", "redirect"}:
-        try:
-            append_task_intervention(
-                current_task_id,
-                interaction_id=item.id,
-                action=action,
-                content=content,
-                status="pending",
-            )
-        except (FileNotFoundError, ValueError):
-            pass
+    # Running Task JSON belongs to its Agent. The HTTP/CLI thread only queues
+    # the message; inject_interactions records it when the Agent consumes it.
     if action == "stop":
         result = stop_teammate(name)
         if result.startswith("Error:"):
@@ -1272,24 +1382,7 @@ def _route_protocol_messages(msgs: list[dict]) -> None:
 def _lead_inbox_has_pending() -> bool:
     if pending_matching_requests():
         return True
-    if (config.MAILBOX_DIR / "lead.jsonl").exists():
-        return True
-    claimed = set(getattr(BUS, "_claimed", {}).values())
-    if not config.MAILBOX_DIR.exists():
-        return False
-    for path in config.MAILBOX_DIR.iterdir():
-        if path in claimed or not path.is_file():
-            continue
-        if path.name.startswith("."):
-            match = re.fullmatch(
-                r"\.([A-Za-z0-9_-]+)\.batch_[A-Za-z0-9]+\.inflight\.jsonl",
-                path.name,
-            )
-            if match and match.group(1).casefold() in _LEAD_AGENT_ALIASES:
-                return True
-        elif path.suffix == ".jsonl" and path.stem.casefold() in _LEAD_AGENT_ALIASES:
-            return True
-    return False
+    return BUS.has_unread(_LEAD_AGENT_NAME)
 
 
 def signal_pending_lead_inbox() -> bool:

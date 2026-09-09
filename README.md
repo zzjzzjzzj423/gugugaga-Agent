@@ -118,7 +118,7 @@ flowchart TB
 flowchart TB
     subgraph TASKS["Task Concurrency"]
         direction LR
-        TR["空闲轮询 / 模型 claim_task"] --> TL["成员锁 → 任务 RLock<br/>→ 跨进程 .state.lock"]
+        TR["空闲轮询 / 模型 claim_task"] --> TL["按 Task ID 获取文件锁<br/>.tasks/.locks/task_*.lock"]
         TL --> TV{"状态 · 依赖 · 占用 · 开关<br/>候选资格 / 人工指定"}
         TV -->|"通过"| TO["原子领取<br/>一任务一 Owner"]
         TV -->|"冲突"| TX["拒绝领取"]
@@ -329,13 +329,17 @@ Task System 是工作归属的唯一权威来源。创建 Team Agent 会触发�
 
 多个 Agent 同时领取时，系统按以下顺序处理：
 
-1. 运行时先获取成员锁，再使用任务 `RLock` 和跨进程 `.tasks/.state.lock` 包住完整状态转换；
+1. 每个 Team Agent 使用一个串行执行循环；领取时只获取目标 Task 对应的文件锁 `.tasks/.locks/<task_id>.lock`，不同任务可以并发领取；
 2. 在锁内重新读取 Task，而不是相信轮询时看到的旧快照；
 3. 校验 Task 仍是 pending、没有 Owner、所有依赖已完成；人工指定时验证指定者，否则验证匹配状态与候选资格；
 4. 校验领取者在线、可领取、没有其他 `in_progress` Task，且自动领取已开启或有人工指定；
 5. 写入 Owner 和 `in_progress` 状态，再原子保存 JSON。自动领取不改写 Assignee。
 
 因此多个 Agent 可以同时“发现”一个候选任务，但只能有一个成功成为 Owner。后到者会看到状态或 Owner 已改变并收到拒绝结果。完成任务时再次校验 Owner，其他 Agent 无法代替实际 Owner 标记完成。
+
+Task 读取与模型、工具执行不持有任务锁。运行中的 Task 只由所属 Agent 的执行循环写入；完成、退回和不匹配退出都以完整 JSON 原子发布状态。Web 的 Steer / Redirect 只投递消息，由执行循环在安全边界消费，不在 HTTP 请求中改写运行中的 Task JSON。
+
+pending 任务的管理变更与领取共用该 Task 的短锁；涉及依赖引用的新增和删除，按固定顺序获取相关 Task 的锁。创建任务时，在新 Task 对应的锁内检查 ID 冲突并原子发布，冲突则换 ID 重试。Queue 为指定 Assignee 创建 pending Task；同一 Assignee 的 FIFO 队列创建使用 `.tasks/.locks/queue-<sha256>.lock` 协调顺序，不同成员的队列可并发创建，无需锁住整个任务目录。
 
 人工指定可以超出候选范围，其他候选成员也不能抢走已指定任务。看板默认显示候选成员，可切换“查看全部成员”，范围外成员标注“非候选成员”；忙碌或离线成员不可选。人工指定同样受依赖、在线状态和任务占用检查约束。
 
@@ -494,9 +498,11 @@ Workspace Guard 使用 `WorkspaceMutationCoordinator` 统一管理 Main、Subage
 | 动作 | 语义 |
 |---|---|
 | `steer` | 把补充要求注入当前执行；暂时无法注入时转为 pending message |
-| `queue` | 当前任务结束后，在新 Turn 执行独立任务；Team Agent queue 会创建可见 Task |
+| `queue` | 当前任务结束后，在新 Turn 执行独立任务；Team Agent queue 创建指定 Assignee 的 pending Task，等待该成员领取执行 |
 | `redirect` | 修正当前方向；LLM 阶段可取消并重发，工具阶段等待工具结束后注入 |
 | `stop` | 强制停止当前目标；用于必须终止正在运行工具的情况 |
+
+Team Agent 的 Steer / Redirect 通过 Broker 投递消息，由该成员的串行执行循环消费；Queue 则创建后续任务，不修改当前 Task。
 
 CLI 示例：
 
@@ -807,7 +813,7 @@ $workspaceDir = "C:\path\to\your-workspace"
 │   ├── team-settings.json       # Workspace Team 自动领取设置
 │   ├── agent-interactions.json  # steer/queue/redirect/stop 状态
 │   └── skills/                  # Runtime 与 Web 共用的 Workspace Skills
-├── .tasks/                      # Task JSON 与 .state.lock
+├── .tasks/                      # Task JSON；.locks/ 下按 Task / Queue 分别加锁
 ├── .mailboxes/                  # Team Agent 与 Lead Mailbox
 ├── .transcripts/                # 上下文模式会话记录
 ├── .memory/                     # 兼容 Memory 文件
