@@ -24,7 +24,7 @@
     teamConfigDirty: false,
     taskMemberScopes: new Set(),
     taskRefreshTimer: null,
-    pageScroll: { overview: 0, tasks: 0, memory: 0, database: 0 },
+    pageScroll: { overview: 0, tasks: 0, memory: 0, evaluation: 0, database: 0 },
   };
 
   const $ = (selector, root = document) => root.querySelector(selector);
@@ -102,6 +102,7 @@
   function setPage(page) {
     const target = $(`#page-${page}`);
     if (!target) return;
+    let pageTransition = Promise.resolve();
 
     const workspace = $('.workspace');
     const selectPage = () => {
@@ -125,7 +126,7 @@
       const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
       if (document.startViewTransition && !reducedMotion) {
         try {
-          document.startViewTransition(selectPage).finished.catch(() => {});
+          pageTransition = document.startViewTransition(selectPage).finished.catch(() => {});
         } catch (_) {
           selectPage();
         }
@@ -143,6 +144,7 @@
     if (page === 'tasks') loadTasks();
     if (page === 'memory') loadMemories();
     if (page === 'database') loadTables();
+    window.MemoryEvaluation?.onPageChange(page, pageTransition);
   }
 
   $$('.nav-item').forEach((button) => button.addEventListener('click', () => setPage(button.dataset.page)));

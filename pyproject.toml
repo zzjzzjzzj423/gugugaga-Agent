@@ -17,9 +17,11 @@ gugugaga-web = "gugugaga.web:main"
 
 [tool.setuptools.package-data]
 gugugaga = ["web_assets/*"]
+"gugugaga.evaluation" = ["frozen200.json"]
+"eval.locomo_refined" = ["data/conversations.jsonl", "data/questions.jsonl"]
 
 [tool.setuptools.packages.find]
-include = ["gugugaga*"]
+include = ["gugugaga*", "eval.locomo_refined"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
