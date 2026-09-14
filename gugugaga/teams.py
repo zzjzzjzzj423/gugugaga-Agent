@@ -45,6 +45,7 @@ from .tasks import (
     report_task_mismatch,
     request_all_task_rematches,
     set_task_candidates,
+    task_dependency_cycles,
     update_task,
 )
 from .web_search import run_web_search
@@ -62,8 +63,10 @@ _LEAD_AGENT_ALIASES = frozenset({"lead", "leader", "main"})
 _RESERVED_TEAMMATE_NAMES = _LEAD_AGENT_ALIASES
 _lead_inbox_event = threading.Event()
 _LEAD_WAKE_MESSAGE_TYPES = frozenset(
-    {"result", "error", "plan_approval_request"}
+    {"result", "error", "plan_approval_request", "task_dependency_cycle"}
 )
+_dependency_cycle_report_lock = threading.RLock()
+_reported_dependency_cycles: dict[Path, set[tuple[str, ...]]] = {}
 
 
 def _team_communications_path() -> Path:
@@ -1379,7 +1382,41 @@ def _route_protocol_messages(msgs: list[dict]) -> None:
             )
 
 
+def _report_task_dependency_cycles() -> None:
+    """Tell the Lead once per active cycle; repairs allow later reports again."""
+
+    with _dependency_cycle_report_lock:
+        workspace = config.WORKDIR.resolve()
+        affected = task_dependency_cycles()
+        grouped: dict[tuple[str, ...], list[str]] = {}
+        for task_id, cycle in affected.items():
+            grouped.setdefault(tuple(cycle), []).append(task_id)
+        reported = _reported_dependency_cycles.setdefault(workspace, set())
+        reported.intersection_update(grouped)
+        for cycle, task_ids in sorted(grouped.items()):
+            if cycle in reported:
+                continue
+            # Mark before delivery because observers may re-enter inbox checks.
+            reported.add(cycle)
+            try:
+                BUS.send(
+                    "system",
+                    _LEAD_AGENT_NAME,
+                    "Task dependency cycle detected: " + " -> ".join(cycle)
+                    + ". Affected pending tasks cannot be dispatched. Review the "
+                    "actual prerequisites and repair blockedBy using update_task; "
+                    "do not remove dependencies only to bypass the check. Dispatch "
+                    "resumes automatically after the cycle is resolved.",
+                    "task_dependency_cycle",
+                    {"cycle": list(cycle), "task_ids": sorted(task_ids)},
+                )
+            except BaseException:
+                reported.discard(cycle)
+                raise
+
+
 def _lead_inbox_has_pending() -> bool:
+    _report_task_dependency_cycles()
     if pending_matching_requests():
         return True
     return BUS.has_unread(_LEAD_AGENT_NAME)
@@ -1404,6 +1441,7 @@ def wait_for_lead_inbox(
 
 
 def claim_lead_inbox(route_protocol: bool = True) -> InboxBatch:
+    _report_task_dependency_cycles()
     # Clear before claiming so a message sent concurrently after the atomic
     # rename leaves the event set for the next delivery.
     _lead_inbox_event.clear()
@@ -1524,7 +1562,15 @@ def render_lead_inbox(batch: InboxBatch) -> str:
         "call set_task_candidates with the current matching_revision and a clear "
         "assignment_reason. An empty candidate list is valid when nobody fits; "
         "never widen eligibility because qualified members are busy. Candidate "
+        "members must include qualified members even while busy or offline, "
+        "while dependencies are incomplete, or while auto-claim is disabled. "
+        "These conditions gate execution, not capability matching, and must not "
+        "be used to justify an empty candidate list. Candidate "
         "updates do not dispatch work and are allowed in automatic inbox Turns. "
+        "For task_dependency_cycle, inspect the reported cycle and affected tasks, "
+        "then repair blockedBy with update_task according to actual prerequisites. "
+        "Re-read current tasks first because the reported cycle may already be "
+        "resolved. Affected tasks resume dispatch automatically once repaired. "
         "Message ids support at-least-once "
         "deduplication.\n"
         + json.dumps(payload, ensure_ascii=False, indent=2)
@@ -1551,6 +1597,7 @@ PLAN_APPROVAL_TIMEOUT = 60
 
 
 def scan_unclaimed_tasks(agent_name: str | None = None) -> list[dict]:
+    _report_task_dependency_cycles()
     values = [
         asdict(task)
         for task in list_tasks()

@@ -28,7 +28,14 @@ from .memory.repository import MemoryRepository
 from .observability import sanitize
 from .permissions import PermissionBroker
 from .subagents import snapshot_subagents
-from .tasks import delete_task, load_task, release_task, unassign_task, update_task
+from .tasks import (
+    delete_task,
+    find_dependency_cycle,
+    load_task,
+    release_task,
+    unassign_task,
+    update_task,
+)
 from .teams import (
     TEAM_DEFAULT_ALLOWED_TOOLS,
     assign_task_to_teammate,
@@ -74,6 +81,7 @@ def _task_waiting_reason(
     blocked: bool,
     agents: dict[str, dict[str, Any]],
     auto_claim_enabled: bool,
+    dependency_cycle: list[str] | None = None,
 ) -> dict[str, str] | None:
     """Explain the current dispatch gate without triggering matching or execution."""
 
@@ -82,6 +90,12 @@ def _task_waiting_reason(
 
     def reason(code: str, message: str) -> dict[str, str]:
         return {"code": code, "message": message}
+
+    if dependency_cycle:
+        return reason(
+            "dependency_cycle",
+            "依赖成环，等待 Lead 修正：" + " → ".join(dependency_cycle),
+        )
 
     def available(name: str) -> bool:
         agent = agents.get(name, {})
@@ -682,6 +696,13 @@ class DashboardStore:
         status_by_id = {
             str(raw["id"]): str(raw.get("status", "pending")) for raw in raw_tasks
         }
+        dependency_graph = {
+            str(raw["id"]): (
+                [] if status_by_id[str(raw["id"])] == "completed"
+                else [str(value) for value in (raw.get("blockedBy") or [])]
+            )
+            for raw in raw_tasks
+        }
         try:
             same_workspace = config.WORKDIR.resolve() == self.workspace
         except OSError:
@@ -708,6 +729,11 @@ class DashboardStore:
                 for dependency in dependencies
             ]
             blocked = any(item["status"] != "completed" for item in dependency_details)
+            dependency_cycle = (
+                find_dependency_cycle(dependency_graph, task_id)
+                if status_by_id[task_id] == "pending" else []
+            )
+            blocked = blocked or bool(dependency_cycle)
             path = raw.pop("_path")
             timestamp_match = re.match(r"task_(\d+)_", task_id)
             created_at = None
@@ -743,6 +769,7 @@ class DashboardStore:
                         blocked=blocked,
                         agents=agents,
                         auto_claim_enabled=auto_claim_enabled,
+                        dependency_cycle=dependency_cycle,
                     ),
                     "queue_position": raw.get("queue_position"),
                     "dispatch_type": raw.get("dispatch_type"),
@@ -750,6 +777,7 @@ class DashboardStore:
                     "interventions": raw.get("interventions") or [],
                     "blocked_by": dependencies,
                     "dependencies": dependency_details,
+                    "dependency_cycle": dependency_cycle,
                     "blocked": blocked and status_by_id[task_id] == "pending",
                     "ready": status_by_id[task_id] == "pending" and not blocked,
                     "dependencies_ready": not blocked,
@@ -1784,6 +1812,8 @@ def _handler_factory(application: DashboardApplication):
                     self._json(application.configuration_status())
                 elif parsed.path == "/api/evaluations/catalog":
                     self._json(application.evaluations().catalog())
+                elif parsed.path == "/api/evaluations/snapshots":
+                    self._json(application.evaluations().snapshots())
                 elif parsed.path == "/api/evaluations":
                     self._json({"runs": application.evaluations().list_runs()})
                 elif parsed.path.startswith("/api/evaluations/"):
@@ -1882,14 +1912,21 @@ def _handler_factory(application: DashboardApplication):
                         self._json(manager.create(self._read_json_body()), HTTPStatus.ACCEPTED)
                     elif parsed.path == "/api/evaluations/preview":
                         self._json(manager.preview(self._read_json_body()))
+                    elif parsed.path == "/api/evaluations/snapshots/preview":
+                        self._json(manager.preview_snapshot(self._read_json_body()))
+                    elif parsed.path == "/api/evaluations/snapshots":
+                        self._json(manager.create_snapshot(self._read_json_body()), HTTPStatus.ACCEPTED)
                     else:
                         parts = parsed.path[len("/api/evaluations/"):].split("/")
-                        if len(parts) != 2 or parts[1] not in {"stop", "resume"}:
+                        if len(parts) != 2 or parts[1] not in {"stop", "resume", "snapshot"}:
                             self._error(HTTPStatus.NOT_FOUND, "not found")
                             return
-                        self._read_json_body(allow_empty=True)
-                        operation = manager.stop if parts[1] == "stop" else manager.resume
-                        self._json(operation(unquote(parts[0])))
+                        if parts[1] == "snapshot":
+                            self._json(manager.export_snapshot(unquote(parts[0]), self._read_json_body()), HTTPStatus.CREATED)
+                        else:
+                            self._read_json_body(allow_empty=True)
+                            operation = manager.stop if parts[1] == "stop" else manager.resume
+                            self._json(operation(unquote(parts[0])))
                 except KeyError as error:
                     self._error(HTTPStatus.NOT_FOUND, str(error))
                 except (TypeError, ValueError, UnicodeDecodeError) as error:

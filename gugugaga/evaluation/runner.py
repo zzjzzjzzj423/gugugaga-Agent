@@ -18,13 +18,27 @@ from eval.locomo_refined.evaluate import _best, bleu1, summarize, token_f1
 from eval.locomo_refined.run_smoke import ANSWER_SYSTEM, response_text, token_cost
 from gugugaga.memory import MemoryService
 from gugugaga.memory.service import _CONSOLIDATION_SYSTEM
-from gugugaga.memory.validation import parse_consolidation_result
+from gugugaga.memory.validation import MemoryValidationError, parse_consolidation_result
 from .config import normalize_config
 from .retrieval import retrieve
 
 
 class EvaluationStopped(RuntimeError):
     """The current model call may finish; no subsequent work is started."""
+
+
+_CONSOLIDATION_RETRY_DELAYS = (5, 15, 30)
+_RETRYABLE_CONSOLIDATION_ERRORS = {"schema_invalid", "subject_length", "content_length", "episode_length"}
+
+
+def _wait_for_retry(seconds: float, check_stop: Callable[[], None]) -> None:
+    deadline = time.monotonic() + seconds
+    while True:
+        check_stop()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(.25, remaining))
 
 
 def _hash(value: Any) -> str:
@@ -84,6 +98,7 @@ class _EvaluationMemoryService(MemoryService):
     def __init__(self, *args: Any, arm: dict, check_stop: Callable[[], None], **kwargs: Any):
         self.arm = arm
         self.check_stop = check_stop
+        self.last_consolidation_error: str | None = None
         super().__init__(*args, **kwargs)
 
     def _consolidate(self, batch: Any) -> Any:
@@ -97,8 +112,13 @@ class _EvaluationMemoryService(MemoryService):
             model=self.model, system=_CONSOLIDATION_SYSTEM + constraints,
             messages=[{"role": "user", "content": self._batch_prompt(batch)}], tools=[], max_tokens=2400,
         )
-        parsed = parse_consolidation_result(response_text(response), max_facts=10, min_importance=self.min_importance,
-                                            max_episodes=5, episode_min_importance=self.episode_min_importance)
+        try:
+            parsed = parse_consolidation_result(response_text(response), max_facts=10, min_importance=self.min_importance,
+                                                max_episodes=5, episode_min_importance=self.episode_min_importance)
+        except MemoryValidationError as error:
+            # Retain only a validation code, never model output or provider exception bodies.
+            self.last_consolidation_error = error.code
+            raise
         return replace(parsed, facts=parsed.facts if self.arm["generate_facts"] else (),
                        episodes=parsed.episodes if self.arm["generate_episodes"] else ())
 
@@ -131,6 +151,7 @@ def _recover_private_work(database: Path) -> None:
     with closing(sqlite3.connect(database)) as connection, connection:
         connection.execute("UPDATE consolidation_batches SET status='failed',lease_expires_at=NULL,error_code='evaluation_resumed' WHERE status='processing'")
         connection.execute("UPDATE chat_log SET consolidation_status='pending',batch_id=NULL,lease_expires_at=NULL,next_retry_at=NULL WHERE consolidation_status IN ('processing','failed')")
+        connection.execute("UPDATE chat_log SET next_retry_at=NULL WHERE consolidation_status='pending' AND last_error_code IS NOT NULL")
         connection.execute("UPDATE memory_index_outbox SET status='pending',lease_expires_at=NULL,next_retry_at=NULL WHERE status IN ('processing','failed')")
 
 
@@ -170,6 +191,18 @@ def _metrics(predictions: list[dict]) -> dict:
     if not predictions:
         return {"overall_f1": None, "overall_bleu1": None, "question_count": 0, "categories": {}}
     return summarize(predictions)
+
+
+def _snapshot_result(config: dict, dataset: dict, state: dict) -> dict:
+    arm_id = config["arms"][0]["id"]
+    samples = [str(item["sample_id"]) for item in dataset["conversations"]]
+    ready = {sample: state["databases"][f"{arm_id}:1:{sample}"] for sample in samples
+             if state["databases"].get(f"{arm_id}:1:{sample}", {}).get("ready")}
+    return {"kind": "snapshot_build", "status": "completed" if len(ready) == len(samples) else "partial_complete",
+            "completed": len(ready), "planned": len(samples), "failed": 0,
+            "arms": [], "questions": [], "stability": [], "comparison": [], "warnings": [],
+            "sample_ids": samples, "snapshot_stats": {sample: entry.get("stats", {}) for sample, entry in ready.items()},
+            "dataset_fingerprint": dataset["fingerprint"]}
 
 
 def _result(config: dict, dataset: dict, state: dict) -> dict:
@@ -245,18 +278,22 @@ def _result(config: dict, dataset: dict, state: dict) -> dict:
 
 def execute_run(run_dir: Path | str, config: dict, *, repo_root: Path | str,
                 provider_factory: Callable[[dict], Any], progress: Callable[[dict], None],
-                should_stop: Callable[[], bool], snapshots: dict | None = None) -> dict:
+                should_stop: Callable[[], bool], snapshots: dict | None = None, build_only: bool = False) -> dict:
     from .data import load_dataset
     root = Path(run_dir).resolve()
     root.mkdir(parents=True, exist_ok=True)
     config = normalize_config(config)
+    if build_only and (len(config["arms"]) != 1 or config["repeats"] != 1 or
+                       config["arms"][0]["mode"] != "memory" or config["arms"][0]["memory_source"] != "rebuild"):
+        raise ValueError("制造快照必须使用一个重新构建记忆的方案，且只能构建一轮")
     dataset_path = _inside(root, "dataset.json")
     if dataset_path.exists():
         dataset = json.loads(dataset_path.read_text(encoding="utf-8"))
     else:
         dataset = load_dataset(Path(repo_root), config["dataset"])
         _write(dataset_path, dataset)
-    fingerprint = _hash({"config": config, "dataset": dataset, "protocol": "memory-evaluation-v1"})
+    fingerprint = _hash({"config": config, "dataset": dataset,
+                         "protocol": "memory-snapshot-build-v1" if build_only else "memory-evaluation-v1"})
     checkpoint_path = _inside(root, "checkpoint.json")
     if checkpoint_path.exists():
         state = json.loads(checkpoint_path.read_text(encoding="utf-8"))
@@ -265,12 +302,15 @@ def execute_run(run_dir: Path | str, config: dict, *, repo_root: Path | str,
     else:
         state = {"fingerprint": fingerprint, "answers": {}, "contexts": {}, "databases": {}, "snapshots": {},
                  "retrieval_clock": datetime.now(timezone.utc).isoformat()}
-    total = len(dataset["questions"]) * len(config["arms"]) * config["repeats"]
+    total = len(dataset["conversations"]) if build_only else len(dataset["questions"]) * len(config["arms"]) * config["repeats"]
     context: dict = {}
+
+    def result_state() -> dict:
+        return _snapshot_result(config, dataset, state) if build_only else _result(config, dataset, state)
 
     def persist() -> None:
         _write(checkpoint_path, state)
-        _write(_inside(root, "result.json"), _result(config, dataset, state))
+        _write(_inside(root, "result.json"), result_state())
 
     def check_stop() -> None:
         if should_stop():
@@ -278,11 +318,12 @@ def execute_run(run_dir: Path | str, config: dict, *, repo_root: Path | str,
             raise EvaluationStopped("已停止；完成的上下文、答案和数据库保留在检查点")
 
     def emit(phase: str, message: str, **extra: Any) -> None:
-        progress({"phase": phase, **context, "completed": len(state["answers"]), "total": total,
-                  "message": message, **extra})
+        completed = result_state()["completed"] if build_only else len(state["answers"])
+        progress({"phase": phase, **context, "completed": completed, "total": total,
+                  "message": message, **({"unit": "conversations"} if build_only else {}), **extra})
 
     persist()
-    emit("preparing", "验证冻结配置、题目与独立运行目录")
+    emit("preparing", "验证冻结配置、会话与快照构建目录" if build_only else "验证冻结配置、题目与独立运行目录")
     check_stop()
     conversations = {str(c["sample_id"]): c for c in dataset["conversations"]}
     for arm in config["arms"]:
@@ -292,7 +333,7 @@ def execute_run(run_dir: Path | str, config: dict, *, repo_root: Path | str,
         for repeat in range(1, config["repeats"] + 1):
             for sample_id, conversation in conversations.items():
                 selected = [qa for qa in dataset["questions"] if str(qa["sample_id"]) == sample_id]
-                if not selected:
+                if not selected and not build_only:
                     continue
                 context = {"arm_id": arm["id"], "arm_name": arm["name"], "repeat": repeat, "sample_id": sample_id}
                 # Paths use digests rather than trusting externally sourced sample/qa identifiers.
@@ -301,10 +342,16 @@ def execute_run(run_dir: Path | str, config: dict, *, repo_root: Path | str,
                 database = _inside(root, "databases", arm["id"], str(build_repeat), _hash(sample_id)[:24] + ".db")
                 service = None
                 try:
-                    incomplete = [qa for qa in selected if state["answers"].get(f"{arm['id']}:{repeat}:{qa['qa_id']}", {}).get("status") != "completed"]
-                    if not incomplete:
+                    if build_only and state["databases"].get(build_key, {}).get("ready"):
+                        if not database.is_file():
+                            raise ValueError("检查点中已完成的会话数据库不存在")
+                        emit("preparing", "复用检查点中已完成的会话记忆", stage_completed=1, stage_total=1)
+                        check_stop()
                         continue
-                    need_memory = arm["mode"] == "memory" and any(f"{arm['id']}:{build_repeat}:{qa['qa_id']}" not in state["contexts"] for qa in incomplete)
+                    incomplete = [qa for qa in selected if state["answers"].get(f"{arm['id']}:{repeat}:{qa['qa_id']}", {}).get("status") != "completed"]
+                    if not incomplete and not build_only:
+                        continue
+                    need_memory = build_only or (arm["mode"] == "memory" and any(f"{arm['id']}:{build_repeat}:{qa['qa_id']}" not in state["contexts"] for qa in incomplete))
                     if need_memory:
                         check_stop()
                         emit("preparing", "准备测评专用记忆数据库", stage_completed=0, stage_total=1)
@@ -340,6 +387,7 @@ def execute_run(run_dir: Path | str, config: dict, *, repo_root: Path | str,
                             def drain(tail: bool = False) -> None:
                                 if not service.consolidation_enabled:
                                     return
+                                retry_count = 0
                                 while True:
                                     pending = int(service.status().get("pending", 0))
                                     if not pending or pending < arm["threshold"] and not tail:
@@ -347,10 +395,31 @@ def execute_run(run_dir: Path | str, config: dict, *, repo_root: Path | str,
                                     check_stop()
                                     service.threshold = min(pending, arm["threshold"])
                                     consolidated = int(service.status().get("consolidated", 0))
-                                    emit("consolidating", f"整合 {service.threshold} 个 Exchange", stage_completed=consolidated, stage_total=len(exchanges))
+                                    message = (f"正在自动重试摘要整合（第 {retry_count}/{len(_CONSOLIDATION_RETRY_DELAYS)} 次）"
+                                               if retry_count else f"整合 {service.threshold} 个 Exchange")
+                                    emit("consolidating", message, stage_completed=consolidated, stage_total=len(exchanges))
+                                    service.last_consolidation_error = None
                                     if not service.process_pending(max_batches=1):
                                         check_stop()
-                                        raise RuntimeError("摘要整合失败；可从检查点重试")
+                                        error_code = service.last_consolidation_error or "consolidation_failed"
+                                        # The provider already retries transport/HTTP errors. Only retry invalid
+                                        # generated summaries here, using the same inputs, model and validation.
+                                        if error_code in _RETRYABLE_CONSOLIDATION_ERRORS and retry_count < len(_CONSOLIDATION_RETRY_DELAYS):
+                                            delay = _CONSOLIDATION_RETRY_DELAYS[retry_count]
+                                            retry_count += 1
+                                            persist()
+                                            emit("consolidating", f"摘要校验失败（{error_code}）；{delay} 秒后自动重试（第 {retry_count}/{len(_CONSOLIDATION_RETRY_DELAYS)} 次）",
+                                                 stage_completed=consolidated, stage_total=len(exchanges), error_code=error_code,
+                                                 retry_attempt=retry_count, retry_limit=len(_CONSOLIDATION_RETRY_DELAYS), retry_delay_seconds=delay)
+                                            _wait_for_retry(delay, check_stop)
+                                            check_stop()
+                                            # Only this worker owns this run's private DB. Failed attempts stay
+                                            # in the batch audit; the retry claims a fresh batch and lease.
+                                            service.repository.retry_failed()
+                                            continue
+                                        attempts = f"；已自动重试 {retry_count} 次" if retry_count else ""
+                                        raise RuntimeError(f"摘要整合失败（{error_code}）{attempts}；可从检查点重试")
+                                    retry_count = 0
                                     persist()
                                     emit("consolidating", "已保存本批整合结果", stage_completed=int(service.status().get("consolidated", 0)), stage_total=len(exchanges))
                                     check_stop()
@@ -385,7 +454,14 @@ def execute_run(run_dir: Path | str, config: dict, *, repo_root: Path | str,
                         else:
                             emit("indexing", "BM25 索引已准备完成", stage_completed=1, stage_total=1, coverage=coverage)
                         state["databases"][build_key] = {"path": str(database.relative_to(root)), "ready": True, "coverage": coverage}
+                        if build_only:
+                            from .snapshots import database_stats
+                            state["databases"][build_key]["stats"] = database_stats(database)
                         persist()
+                    if build_only:
+                        emit("indexing", "本会话记忆已完成并保存，可复用于后续测评", stage_completed=1, stage_total=1)
+                        check_stop()
+                        continue
                     for qa in selected:
                         context["qa_id"] = qa["qa_id"]
                         answer_key = f"{arm['id']}:{repeat}:{qa['qa_id']}"
@@ -443,7 +519,9 @@ def execute_run(run_dir: Path | str, config: dict, *, repo_root: Path | str,
                 finally:
                     if service is not None:
                         service.close()
-    result = _result(config, dataset, state)
+    result = result_state()
     _write(_inside(root, "result.json"), result)
-    emit("completed", "测评完成" if result["status"] == "completed" else "部分题目失败，可重试", completed=result["completed"], total=result["planned"])
+    message = "全部会话记忆构建完成，正在发布快照" if build_only else "测评完成" if result["status"] == "completed" else "部分题目失败，可重试"
+    emit("completed", message, completed=result["completed"], total=result["planned"],
+         **({"stage_completed": result["completed"], "stage_total": result["planned"]} if build_only else {}))
     return result

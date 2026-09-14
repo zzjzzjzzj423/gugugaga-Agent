@@ -28,6 +28,7 @@ PHASES = [
 ACTIVE = {"queued", "running", "stopping"}
 RESUMABLE = {"stopped", "interrupted", "failed", "partial_complete"}
 RUN_ID = re.compile(r"eval-[a-f0-9]{24}\Z")
+SNAPSHOT_ID = re.compile(r"snapshot-[a-f0-9]{24}\Z")
 
 
 def now() -> str:
@@ -199,13 +200,23 @@ class EvaluationManager:
         }
 
     def _snapshots(self) -> list[dict]:
+        from .snapshots import read_snapshot
         values = list(self._history().snapshots())
+        published = self.root / "snapshots"
+        if published.is_dir() and published.resolve().parent == self.root:
+            for folder in sorted(published.iterdir()):
+                if not SNAPSHOT_ID.fullmatch(folder.name) or folder.resolve().parent != published.resolve():
+                    continue
+                try:
+                    values.append(read_snapshot(folder))
+                except (OSError, ValueError, KeyError):
+                    continue
         # Only completed, isolated experiments are offered as reusable sources.
         for folder in self.root.iterdir():
             if not RUN_ID.fullmatch(folder.name) or folder.resolve().parent != self.root:
                 continue
             record = read_json(folder / "run.json", {})
-            if record.get("status") != "completed":
+            if record.get("status") != "completed" or record.get("type") == "snapshot_build":
                 continue
             # Each arm/repeat remains a separate snapshot, never mixing databases.
             groups: dict[str, dict[str, str]] = {}
@@ -227,13 +238,71 @@ class EvaluationManager:
                                "construction_metadata_complete": True})
         return values
 
+    def _public_snapshot(self, item: dict) -> dict:
+        return self._safe({key: value for key, value in item.items() if key not in {"databases", "hashes", "protocol"}})
+
+    def snapshots(self) -> dict:
+        return {"snapshots": [self._public_snapshot(item) for item in self._snapshots()],
+                "jobs": [item for item in self.list_runs() if item.get("type") == "snapshot_build"]}
+
+    def preview_snapshot(self, payload: dict) -> dict:
+        from .data import load_dataset
+        from .snapshots import normalize_snapshot_config, snapshot_estimate
+        config = normalize_snapshot_config(payload, self._defaults())
+        dataset = load_dataset(self.repo_root, config["dataset"])
+        return {"config": config, **snapshot_estimate(dataset, config), "dataset_fingerprint": dataset["fingerprint"]}
+
+    def create_snapshot(self, payload: dict) -> dict:
+        from .data import load_dataset
+        from .snapshots import normalize_snapshot_config
+        with self._condition:
+            self._ensure_owner()
+            config = normalize_snapshot_config(payload, self._defaults())
+            dataset = load_dataset(self.repo_root, config["dataset"])
+            return self._create_job(config, dataset, [], [], kind="snapshot_build")
+
+    def _publish_snapshot(self, record: dict, *, arm_id: str, repeat: int, name: str, snapshot_id: str) -> dict:
+        from .snapshots import export_snapshot, read_snapshot, validate_snapshot_hashes
+        source_dir = self._directory(record["id"])
+        if (fingerprint(read_json(source_dir / "config.json")) != record.get("config_fingerprint") or
+                fingerprint(read_json(source_dir / "dataset.json")) != record.get("dataset_fingerprint")):
+            raise ValueError("来源实验的冻结配置或数据已变化，不能发布为快照")
+        folder = (self.root / "snapshots" / snapshot_id).resolve()
+        if folder.parent != self.root / "snapshots" or not SNAPSHOT_ID.fullmatch(snapshot_id):
+            raise ValueError("快照发布目录无效")
+        if (folder / "manifest.json").is_file():
+            saved = read_snapshot(folder)
+            if saved.get("source_run_id") != record["id"] or saved.get("source_arm_id") != arm_id or saved.get("source_repeat") != repeat:
+                raise ValueError("快照标识已被其他来源使用")
+            validate_snapshot_hashes(saved)
+            return saved
+        return export_snapshot(folder, run_dir=source_dir, record=record,
+                               arm_id=arm_id, repeat=repeat, name=name, snapshot_id=snapshot_id)
+
+    def export_snapshot(self, run_id: str, payload: dict) -> dict:
+        if not isinstance(payload, dict) or set(payload) - {"name", "arm_id", "repeat"}:
+            raise ValueError("快照保存参数无效")
+        name, arm_id, repeat = payload.get("name", ""), payload.get("arm_id", ""), payload.get("repeat", 1)
+        if not isinstance(name, str) or not name.strip() or len(name) > 160:
+            raise ValueError("快照名称不能为空，且不超过 160 字符")
+        if not isinstance(arm_id, str) or not isinstance(repeat, int) or isinstance(repeat, bool) or repeat < 1:
+            raise ValueError("请选择有效的方案和重复轮次")
+        with self._condition:
+            self._ensure_owner()
+            record = self._read_record(run_id)
+            if record["status"] in ACTIVE:
+                raise RuntimeError("请先停止实验，或等待实验结束，再保存已完成记忆")
+            saved = self._publish_snapshot(record, arm_id=arm_id, repeat=repeat, name=name.strip(),
+                                           snapshot_id="snapshot-" + uuid.uuid4().hex[:24])
+            return {"snapshot": self._public_snapshot(saved)}
+
     def catalog(self) -> dict:
         from .config import catalog
         from .data import dataset_catalog
         result = catalog(self._defaults())
         result.update(
             dataset=dataset_catalog(self.repo_root),
-            snapshots=[{key: value for key, value in item.items() if key != "databases"} for item in self._snapshots()],
+            snapshots=[self._public_snapshot(item) for item in self._snapshots()],
             phases=PHASES,
             execution_available=self._provider_factory is not None or bool(self._settings().get("siliconflow_api_key")),
             isolation="每个实验及方案使用独立数据库；用户记忆和历史源产物保持只读",
@@ -328,11 +397,15 @@ class EvaluationManager:
                      if arm["mode"] == "memory" and arm["memory_source"] == "snapshot"}
         sources = {item["id"]: item for item in self._snapshots()} if requested else {}
         samples = {str(qa["sample_id"]) for qa in dataset["questions"]}
-        frozen = {"paths": {}, "hashes": {}}
+        frozen = {"paths": {}, "hashes": {}, "metadata": {}}
         for snapshot_id in sorted(requested):
             source = sources.get(snapshot_id)
             if source is None:
                 raise ValueError("来源快照已不可用，请重新预检")
+            if source.get("hashes"):
+                from .snapshots import validate_snapshot_hashes
+                validate_snapshot_hashes(source)
+            frozen["metadata"][snapshot_id] = self._public_snapshot(source)
             frozen["paths"][snapshot_id] = {}
             for sample in sorted(samples):
                 path = Path(source["databases"][sample]).resolve()
@@ -368,20 +441,33 @@ class EvaluationManager:
         with self._condition:
             self._ensure_owner()
             config, dataset, differences, warnings = self._prepare(payload)
+            return self._create_job(config, dataset, differences, warnings)
+
+    def _job_factory(self, folder: Path, config: dict, kind: str) -> Callable:
+        arm = config["arms"][0]
+        if kind == "snapshot_build" and not any(arm.get(key) for key in ("generate_facts", "generate_episodes", "embedding_model")):
+            return lambda arm: None
+        return self._capture_factory(folder)
+
+    def _create_job(self, config: dict, dataset: dict, differences: list, warnings: list, *, kind: str | None = None) -> dict:
+        with self._condition:
             run_id = "eval-" + uuid.uuid4().hex[:24]
             folder = self._directory(run_id)
-            factory = self._capture_factory(folder)
+            job_type = kind or config["type"]
+            factory = self._job_factory(folder, config, job_type)
             folder.mkdir()
             write_json(folder / "config.json", config)
             write_json(folder / "dataset.json", dataset)
             write_json(folder / "protocol.json", self._protocol())
             frozen_sources = self._freeze_snapshots(folder, config, dataset)
             record = {
-                "id": run_id, "name": config["name"], "type": config["type"], "status": "queued",
+                "id": run_id, "name": config["name"], "type": job_type, "status": "queued",
                 "config": config, "config_fingerprint": fingerprint(config),
                 "dataset_fingerprint": fingerprint(dataset), "created_at": now(), "updated_at": now(),
                 "snapshot_fingerprint": fingerprint(frozen_sources),
-                "progress": {"phase": "preparing", "completed": 0, "total": len(dataset["questions"]) * len(config["arms"]) * config["repeats"], "message": "已排队，等待执行"},
+                "progress": {"phase": "preparing", "completed": 0,
+                             "total": len(dataset["conversations"]) if kind == "snapshot_build" else len(dataset["questions"]) * len(config["arms"]) * config["repeats"],
+                             "unit": "conversations" if kind == "snapshot_build" else "answers", "message": "已排队，等待执行"},
                 "differences": differences, "warnings": warnings, "resumable": False, "error": None,
             }
             self._persist(record)
@@ -409,7 +495,8 @@ class EvaluationManager:
             if "phase" in event:
                 # Counts and question ids belong to one event's phase/scope only.
                 # A previous indexing count must never appear as answering progress.
-                for key in ("stage_completed", "stage_total", "stage", "qa_id", "coverage", "cached_context"):
+                for key in ("stage_completed", "stage_total", "stage", "qa_id", "coverage", "cached_context",
+                            "retry_attempt", "retry_limit", "retry_delay_seconds", "error_code"):
                     previous.pop(key, None)
                 if any(previous.get(key) != event.get(key) for key in ("arm_id", "sample_id", "repeat")):
                     for key in ("arm_id", "arm_name", "sample_id", "repeat"):
@@ -441,12 +528,17 @@ class EvaluationManager:
                 try:
                     from .runner import EvaluationStopped, execute_run
                     source_map = self._frozen_sources(run_id)
+                    execution_options = {"build_only": True} if record.get("type") == "snapshot_build" else {}
                     result = (self._executor or execute_run)(
                         self._directory(run_id), record["config"], repo_root=self.repo_root,
                         provider_factory=factory, progress=lambda event: self._event(run_id, event),
-                        should_stop=lambda: attempt_cancel.is_set() or self._closed, snapshots=source_map,
+                        should_stop=lambda: attempt_cancel.is_set() or self._closed, snapshots=source_map, **execution_options,
                     )
                     with self._lock:
+                        if record.get("type") == "snapshot_build" and result.get("status") == "completed" and not attempt_cancel.is_set() and not self._closed:
+                            saved = self._publish_snapshot(record, arm_id=record["config"]["arms"][0]["id"], repeat=1,
+                                                           name=record["name"], snapshot_id="snapshot-" + run_id[len("eval-"):])
+                            result["snapshot"] = self._public_snapshot(saved)
                         write_json(self._directory(run_id) / "result.json", self._safe(result))
                         if attempt_cancel.is_set() or self._closed:
                             status = "interrupted" if self._closed else "stopped"
@@ -469,7 +561,8 @@ class EvaluationManager:
                         self._factories.pop(run_id, None)
                         current.update(status=final_status, error=final_error, resumable=final_status in RESUMABLE, finished_at=now())
                         self._persist(current)
-                        self._event(run_id, {"message": {"completed": "测评完成", "partial_complete": "部分题目失败，可重试", "stopped": "已停止，进度已保存", "interrupted": "服务中断，进度已保存", "failed": "测评失败，可查看错误并重试"}.get(current["status"], current["status"]), "run_status": current["status"]})
+                        message = {"completed": "快照构建完成" if current.get("type") == "snapshot_build" else "测评完成", "partial_complete": "部分题目失败，可重试", "stopped": "已停止，进度已保存", "interrupted": "服务中断，进度已保存", "failed": "任务失败，可查看错误并重试"}.get(current["status"], current["status"])
+                        self._event(run_id, {"message": message, "run_status": current["status"]})
         finally:
             if self._closed:
                 self._lease.release()
@@ -591,7 +684,7 @@ class EvaluationManager:
             if read_json(folder / "protocol.json") != self._protocol():
                 raise ValueError("执行代码或评分协议已变化，请创建新实验以保持可比性")
             self._frozen_sources(run_id)
-            factory = self._capture_factory(folder)
+            factory = self._job_factory(folder, config, record.get("type", "basic"))
             record.update(status="queued", error=None, resumable=False)
             self._persist(record)
             self._enqueue(run_id, factory)

@@ -7,7 +7,7 @@ import random
 import re
 import time
 from collections.abc import Callable, Iterable, Iterator
-from contextlib import AbstractContextManager, ExitStack, contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -73,6 +73,73 @@ def _queue_lock(assignee: str) -> AbstractContextManager[None]:
     return interprocess_lock(config.TASKS_DIR / ".locks" / f"queue-{key}.lock")
 
 
+def _dependency_graph_lock() -> AbstractContextManager[None]:
+    # Structural writers acquire this before any task locks. Claim/read paths
+    # must not acquire it while holding a task lock (the reverse lock order).
+    return interprocess_lock(config.TASKS_DIR / ".locks" / "dependencies.lock")
+
+
+def find_dependency_cycle(graph: dict[str, list[str]], start: str) -> list[str]:
+    """Return a closed cycle reachable from start, or [] for an acyclic graph."""
+    path = [start]
+    positions = {start: 0}
+    finished: set[str] = set()
+    stack = [iter(sorted(graph.get(start, [])))]
+    while stack:
+        dependency = next(stack[-1], None)
+        if dependency is None:
+            node = path.pop()
+            finished.add(node)
+            del positions[node]
+            stack.pop()
+        elif dependency in positions:
+            cycle = path[positions[dependency]:]
+            first = cycle.index(min(cycle))
+            cycle = cycle[first:] + cycle[:first]
+            return [*cycle, cycle[0]]
+        elif dependency not in finished:
+            positions[dependency] = len(path)
+            path.append(dependency)
+            stack.append(iter(sorted(graph.get(dependency, []))))
+    return []
+
+
+def _validate_task_dependencies_unlocked(task: Task) -> None:
+    if not task.blockedBy:
+        return
+    graph = {item.id: item.blockedBy for item in _list_tasks_unlocked()}
+    graph[task.id] = task.blockedBy
+    cycle = find_dependency_cycle(graph, task.id)
+    if cycle:
+        raise ValueError("Task dependency cycle: " + " -> ".join(cycle))
+
+
+def task_dependency_cycles() -> dict[str, list[str]]:
+    """Describe pending work blocked by legacy cycles without changing tasks."""
+    # A directory scan without the structural lock can combine opposite sides
+    # of two valid edits into a cycle that never existed in the stored graph.
+    with _dependency_graph_lock():
+        tasks = _list_tasks_unlocked()
+    graph = {
+        task.id: [] if task.status == "completed" else task.blockedBy
+        for task in tasks
+    }
+    return {
+        task.id: cycle
+        for task in tasks
+        if task.status == "pending"
+        and (cycle := find_dependency_cycle(graph, task.id))
+    }
+
+
+def _task_dependency_cycle_unlocked(task_id: str) -> list[str]:
+    graph = {
+        task.id: [] if task.status == "completed" else task.blockedBy
+        for task in _list_tasks_unlocked()
+    }
+    return find_dependency_cycle(graph, task_id)
+
+
 def _create_task_record(
     subject: str, description: str, blocked_by: list[str], **fields,
 ) -> Task:
@@ -82,15 +149,17 @@ def _create_task_record(
         task_id = f"task_{int(time.time())}_{random.randint(0, 9999):04d}"
         if task_id in blocked_by:
             continue
-        # Contention is limited to an ID collision or a shared dependency.
-        # Publish a complete JSON only after checking the ID under its lock.
-        with _task_locks([task_id, *blocked_by]):
+        # A new node without outgoing dependencies cannot introduce a cycle.
+        # Keep independent empty-task creation concurrent.
+        graph_lock = _dependency_graph_lock() if blocked_by else nullcontext()
+        with graph_lock, _task_locks([task_id, *blocked_by]):
             if _task_path(task_id).exists():
                 continue
             task = Task(
                 id=task_id, subject=subject, description=description,
                 status="pending", owner=None, blockedBy=list(blocked_by), **fields,
             )
+            _validate_task_dependencies_unlocked(task)
             _save_task_unlocked(task)
             return task
 
@@ -188,7 +257,7 @@ def save_task(task: Task) -> None:
     _task_path(task.id)
     if task.status != "pending" or task.owner:
         raise ValueError("use claim_task or complete_task to change execution state")
-    with _task_locks([task.id, *task.blockedBy]):
+    with _dependency_graph_lock(), _task_locks([task.id, *task.blockedBy]):
         if _task_path(task.id).exists():
             previous = _load_task_unlocked(task.id)
             if previous.status != "pending" or previous.owner:
@@ -196,6 +265,8 @@ def save_task(task: Task) -> None:
             if (previous.subject, previous.description, previous.blockedBy) != (
                 task.subject, task.description, task.blockedBy
             ):
+                if previous.blockedBy != task.blockedBy:
+                    _validate_task_dependencies_unlocked(task)
                 # Preserve concurrent ownership/candidate decisions. Requirement
                 # edits must not overwrite them from a stale Task snapshot.
                 previous.subject = task.subject
@@ -204,6 +275,8 @@ def save_task(task: Task) -> None:
                 if _is_matchable(previous):
                     _request_rematch_unlocked(previous, "task_requirements_changed")
             task = previous
+        else:
+            _validate_task_dependencies_unlocked(task)
         _save_task_unlocked(task)
     _notify_matching([task])
 
@@ -342,9 +415,8 @@ def update_task(
             raise ValueError("blockedBy must be an array")
         for dependency in blockedBy:
             _task_path(dependency)
-            if dependency == task_id:
-                raise ValueError("a task cannot depend on itself")
-    with _task_locks([task_id, *(blockedBy or [])]):
+    graph_lock = _dependency_graph_lock() if blockedBy is not None else nullcontext()
+    with graph_lock, _task_locks([task_id, *(blockedBy or [])]):
         task = _load_task_unlocked(task_id)
         if task.status != "pending" or task.owner:
             raise ValueError("use the existing intervention flow for claimed tasks")
@@ -355,6 +427,7 @@ def update_task(
             task.description = description
         if blockedBy is not None:
             task.blockedBy = list(dict.fromkeys(blockedBy))
+            _validate_task_dependencies_unlocked(task)
         changed = previous != (task.subject, task.description, task.blockedBy)
         if changed:
             if _is_matchable(task):
@@ -424,12 +497,22 @@ def list_tasks() -> list[Task]:
 
 
 def get_task_json(task_id: str) -> str:
-    return json.dumps(asdict(load_task(task_id)), indent=2)
+    _task_path(task_id)
+    with _dependency_graph_lock():
+        task = load_task(task_id)
+        value = asdict(task)
+        if task.status == "pending" and task.blockedBy:
+            cycle = _task_dependency_cycle_unlocked(task_id)
+            if cycle:
+                value["dependency_cycle"] = cycle
+    return json.dumps(value, indent=2)
 
 
 def _can_start_unlocked(task_id: str) -> bool:
     try:
         task = _load_task_unlocked(task_id)
+        if task.blockedBy and _task_dependency_cycle_unlocked(task_id):
+            return False
         for dependency_id in task.blockedBy:
             if _load_task_unlocked(dependency_id).status != "completed":
                 return False
@@ -440,13 +523,15 @@ def _can_start_unlocked(task_id: str) -> bool:
 
 def can_start(task_id: str) -> bool:
     _task_path(task_id)
-    return _can_start_unlocked(task_id)
+    with _dependency_graph_lock():
+        return _can_start_unlocked(task_id)
 
 
 def _claim_task_unlocked(
     task_id: str,
     owner: str = "agent",
     *,
+    dependency_cycle: list[str],
     eligibility_check: Callable[[Task], str | None] | None = None,
 ) -> str:
     task = _load_task_unlocked(task_id)
@@ -468,6 +553,8 @@ def _claim_task_unlocked(
     )
     if active is not None:
         return f"Owner {owner} is already working on {active.id}"
+    if task.blockedBy and dependency_cycle:
+        return "Cannot start — dependency cycle: " + " -> ".join(dependency_cycle)
     dependencies, missing = [], []
     for dependency_id in task.blockedBy:
         try:
@@ -508,9 +595,14 @@ def claim_task(
     # Each agent has a serial worker. Competing agents only serialize when
     # claiming the same task; the scan above is a guard, not an owner lock.
     _task_path(task_id)
+    # Capture a consistent cycle check, then release the graph lock before
+    # waiting for a task or committing ownership. Validated structural writers
+    # cannot introduce a cycle in this gap; a concurrent repair may require a retry.
+    with _dependency_graph_lock():
+        cycle = _task_dependency_cycle_unlocked(task_id)
     with _task_lock(task_id):
         return _claim_task_unlocked(
-            task_id, owner, eligibility_check=eligibility_check
+            task_id, owner, dependency_cycle=cycle, eligibility_check=eligibility_check
         )
 
 
@@ -521,10 +613,12 @@ def assign_task(task_id: str, assignee: str) -> Task:
     if not value:
         raise ValueError("assignee is required")
     _task_path(task_id)
-    with _queue_lock(value), _task_lock(task_id):
+    with _queue_lock(value), _dependency_graph_lock(), _task_lock(task_id):
         task = _load_task_unlocked(task_id)
         if task.status != "pending" or task.owner:
             raise ValueError(f"task {task_id} is not pending")
+        if task.blockedBy and (cycle := _task_dependency_cycle_unlocked(task_id)):
+            raise ValueError("Task dependency cycle: " + " -> ".join(cycle))
         if not _can_start_unlocked(task_id):
             raise ValueError(f"task {task_id} is blocked")
         reserved = next(
@@ -611,7 +705,7 @@ def delete_task(task_id: str) -> Task:
         with ExitStack() as stack:
             if queue:
                 stack.enter_context(_queue_lock(queue))
-            with _task_lock(task_id):
+            with _dependency_graph_lock(), _task_lock(task_id):
                 task = _load_task_unlocked(task_id)
                 if (task.assignee if task.dispatch_type == "queued" else None) != queue:
                     continue
@@ -664,6 +758,35 @@ def _renumber_pending_queue(assignee: str) -> None:
                 _save_task_unlocked(task)
 
 
+def _rematch_after_dependency_completion(
+    completed_task_id: str, unblocked: list[Task],
+) -> None:
+    changed = []
+    for snapshot in unblocked:
+        if completed_task_id not in snapshot.blockedBy:
+            continue
+        # Requirements may change after the ready-task scan. Keep the normal
+        # graph -> task lock order and recheck before invalidating a match.
+        with _dependency_graph_lock(), _task_lock(snapshot.id):
+            try:
+                task = _load_task_unlocked(snapshot.id)
+            except FileNotFoundError:
+                continue
+            if (
+                _is_matchable(task)
+                and completed_task_id in task.blockedBy
+                and (task.matching_status != "matched" or not task.candidate_members)
+                and _can_start_unlocked(task.id)
+            ):
+                # Recover empty matches based on an earlier dependency gate,
+                # and reject in-flight results using that same stale context.
+                # Confirmed nonempty capability matches remain valid.
+                _request_rematch_unlocked(task, "dependency_completed")
+                _save_task_unlocked(task)
+                changed.append(task)
+    _notify_matching(changed)
+
+
 def complete_task(task_id: str, owner: str = "agent") -> str:
     _task_path(task_id)
     task = _load_task_unlocked(task_id)
@@ -675,16 +798,17 @@ def complete_task(task_id: str, owner: str = "agent") -> str:
     task.status = "completed"
     _save_task_unlocked(task)
     unblocked = [
-        candidate.subject
+        candidate
         for candidate in _list_tasks_unlocked()
         if candidate.status == "pending"
         and candidate.blockedBy
-        and _can_start_unlocked(candidate.id)
+        and can_start(candidate.id)
     ]
+    _rematch_after_dependency_completion(task_id, unblocked)
     print(f"  \033[32m[complete] {task.subject} ✓\033[0m")
     message = f"Completed {task.id} ({task.subject})"
     if unblocked:
-        message += f"\nUnblocked: {', '.join(unblocked)}"
+        message += f"\nUnblocked: {', '.join(candidate.subject for candidate in unblocked)}"
     return message
 
 
@@ -733,12 +857,21 @@ def run_create_task(
 
 
 def run_list_tasks() -> str:
-    tasks = list_tasks()
+    with _dependency_graph_lock():
+        tasks = list_tasks()
     if not tasks:
         return "No tasks."
-    return "\n".join(
-        f"  {task.id}: {task.subject} [{task.status}]" for task in tasks
-    )
+    graph = {
+        task.id: [] if task.status == "completed" else task.blockedBy
+        for task in tasks
+    }
+    lines = []
+    for task in tasks:
+        line = f"  {task.id}: {task.subject} [{task.status}]"
+        if task.status == "pending" and (cycle := find_dependency_cycle(graph, task.id)):
+            line += " (dependency cycle: " + " -> ".join(cycle) + ")"
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def run_get_task(task_id: str) -> str:

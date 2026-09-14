@@ -316,7 +316,7 @@ TOOL_DEFINITIONS: list[dict] = [
     },
     {
         "name": "set_task_candidates",
-        "description": "Maintain eligible candidates and explain the assignment reasoning for an unclaimed task without manual assignment. Use the current matching_revision as expected_revision; an empty list means nobody fits. This does not assign or start the task.",
+        "description": "Maintain eligible candidates and explain the assignment reasoning for an unclaimed task without manual assignment. Use the current matching_revision as expected_revision; an empty list means nobody has the required capabilities. Include qualified members regardless of busy/offline status, incomplete dependencies, or auto-claim settings. This does not assign or start the task.",
         "input_schema": {
             "type": "object",
             "properties": {
