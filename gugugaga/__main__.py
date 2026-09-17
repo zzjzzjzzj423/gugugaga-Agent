@@ -371,7 +371,8 @@ def handle_command(command: str, app: GugugagaApp) -> tuple[bool, str]:
             "/redirect <main|agent> <text>\n"
             "/stop <main|agent>\n"
             "/memory [list|status|search <text>|show <id>|update <fact_id> <text>|"
-            "forget <id>|feedback <id> <helpful|irrelevant>|retry]"
+            "forget <id>|feedback <id> <helpful|irrelevant>|conflicts|"
+            "resolve <id> <existing|candidate|custom|neither> [content]|retry]"
         )
     if command == "/status":
         teammates = ", ".join(sorted(active_teammates)) or "none"
@@ -435,6 +436,43 @@ def handle_command(command: str, app: GugugagaApp) -> tuple[bool, str]:
             return True, json.dumps(service.status(), ensure_ascii=False, indent=2)
         if action == "retry":
             return True, f"memory retry scheduled for {service.retry_failed()} chat rows"
+        if action == "conflicts":
+            if len(parts) != 2:
+                return True, "usage: /memory conflicts"
+            try:
+                conflicts = service.list_conflicts(status="pending", limit=100)
+            except (KeyError, ValueError, RuntimeError) as error:
+                return True, f"memory command error: {error}"
+            return True, (
+                json.dumps(conflicts, ensure_ascii=False, indent=2)
+                if conflicts else "(no pending memory conflicts)"
+            )
+        if action == "resolve":
+            usage = (
+                "usage: /memory resolve <id> "
+                "<existing|candidate|custom|neither> [content] "
+                "(content is required for custom only)"
+            )
+            if len(parts) < 4:
+                return True, usage
+            conflict_id, resolution = parts[2], parts[3].casefold()
+            content = " ".join(parts[4:]).strip() if len(parts) > 4 else None
+            if (
+                not conflict_id.strip()
+                or resolution not in {"existing", "candidate", "custom", "neither"}
+                or (resolution == "custom" and not content)
+                or (resolution != "custom" and len(parts) != 4)
+            ):
+                return True, usage
+            try:
+                conflict = service.get_conflict(conflict_id)
+                options = {"content": content}
+                if conflict is not None:
+                    options["expected_existing_fact_id"] = conflict["existing_fact_id"]
+                result = service.resolve_conflict(conflict_id, resolution, **options)
+            except (KeyError, ValueError, RuntimeError) as error:
+                return True, f"memory command error: {error}"
+            return True, json.dumps(result, ensure_ascii=False, indent=2)
         if action == "search" and len(parts) >= 3:
             rows = service.list_memories(" ".join(parts[2:]))
         elif action == "show" and len(parts) == 3:
@@ -467,7 +505,8 @@ def handle_command(command: str, app: GugugagaApp) -> tuple[bool, str]:
             return True, (
                 "usage: /memory [list|status|search <text>|show <id>|"
                 "update <fact_id> <text>|forget <id>|"
-                "feedback <id> <helpful|irrelevant>|retry]"
+                "feedback <id> <helpful|irrelevant>|conflicts|"
+                "resolve <id> <existing|candidate|custom|neither> [content]|retry]"
             )
         if not rows:
             return True, "(no memories)"

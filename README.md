@@ -694,7 +694,13 @@ Web 会为实际注入的结果保存 Recall Impression，记录查询、来源�
 
 **提交后，索引和原文生命周期继续更新。** 同一后台 Worker 后续处理 Outbox，调用当前配置的 `bge-m3` 并写入 `memory_embeddings`；向量失败只重试索引任务，不重新提取摘要，也不撤销已提交记忆。默认最多自动尝试 3 次，前两次失败分别等待 5 秒、30 秒，第 3 次失败后记为 `failed`，等待显式重试。
 
-整合成功后、服务启动时都会校准 Evidence 生命周期：最近 10000 个已整合 Exchange 保持 Hot，更早的转为 Cold；Cold 保留原文和 FTS，删除现有向量并登记 Outbox 删除任务，重新进入热窗口时再排队建向量。未整合或未完整的原文始终保持 Hot。Web 中的 `Retry pending · N` 表示仍有等待重试或等待凑批的 pending 记录，不代表主对话已经失败。
+整合成功后、服务启动时都会校准 Evidence 生命周期：最近 10000 个已整合 Exchange 保持 Hot，更早的转为 Cold；Cold 保留原文和 FTS，删除现有向量并登记 Outbox 删除任务，重新进入热窗口时再排队建向量。未整合或未完整的原文始终保持 Hot。Web 分别显示“等待积累”“等待执行”“正在整合”和失败原因；失败待重试轮数与新增待处理轮数分开计数，并显示预计重试时间。Vector Index 的“已同步现有记忆”只代表向量索引状态。
+
+记忆整理、意图门控和冲突检查使用各自的请求时间预算，超出预算后不再发起内部重试；外层仍保留超时保护。GLM-5.3 的这些结构化请求使用 `reasoning_effort=low`，主对话不受影响。整合日志中的 `consolidation_admission` 事件记录提取、准入和过滤数量，不记录模型响应正文；成功但零产出的整合也会留下这些诊断计数。
+
+### 待确认记忆
+
+显式保存和后台事实整合会检查相关旧记忆。发现矛盾或更新时，双方先退出有效事实召回；只有当前任务需要时，助手才使用单独的不确定信息区进行澄清。用户可在 Memory 页面确认、修订或稍后处理，也可用 `/memory conflicts` 与 `/memory resolve` 操作，不会强制弹窗。详见[记忆冲突与用户确认](docs/memory-conflicts.md)。
 
 ## 快速开始
 
@@ -778,6 +784,8 @@ $workspaceDir = "C:\path\to\your-workspace"
 /memory search <text>
 /memory show <id>
 /memory update <fact_id> <new text>
+/memory conflicts
+/memory resolve <conflict_id> <existing|candidate|custom|neither> [new text]
 /memory forget <id>
 /memory feedback <id> <helpful|irrelevant>
 /memory retry
@@ -814,7 +822,7 @@ $workspaceDir = "C:\path\to\your-workspace"
 | `GUGUGAGA_MEMORY_CONSOLIDATION_ENABLED` | `true` | 后台整合开关 |
 | `GUGUGAGA_MEMORY_CONSOLIDATION_EXCHANGES` | `6` | 每批完整 Exchange 数量 |
 | `GUGUGAGA_MEMORY_CONSOLIDATION_MODEL` | 主模型 | 整理记忆使用的模型 |
-| `GUGUGAGA_MEMORY_CONSOLIDATION_TIMEOUT` | `90` | 单次整合超时（秒） |
+| `GUGUGAGA_MEMORY_CONSOLIDATION_TIMEOUT` | `300` | 单次整合超时（秒），默认 5 分钟，范围 1–300 |
 | `GUGUGAGA_MEMORY_CONSOLIDATION_LEASE` | `600` | 整合租约（秒） |
 | `GUGUGAGA_MEMORY_CONSOLIDATION_MAX_FACTS` | `10` | 单批最大 Fact 候选数 |
 | `GUGUGAGA_MEMORY_CONSOLIDATION_MIN_IMPORTANCE` | `0.8` | Fact 最低重要度 |

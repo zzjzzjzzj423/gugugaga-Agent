@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import math
 import ssl
 import time
+from copy import copy
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -224,6 +226,8 @@ class SiliconFlowProvider(ChatProvider):
         self.settings = settings
         self.enable_thinking = enable_thinking
         self.temperature = temperature
+        self._call_timeout_seconds: float | None = None
+        self._reasoning_effort: str | None = None
         self.client = client or OpenAI(
             api_key=settings.api_key,
             base_url=settings.base_url,
@@ -235,6 +239,26 @@ class SiliconFlowProvider(ChatProvider):
             self.client.with_options(max_retries=0) if client is None else self.client
         )
 
+    def with_timeout(
+        self, timeout_seconds: float, *, reasoning_effort: str | None = None
+    ) -> SiliconFlowProvider:
+        """Return a call-budget view without changing the shared chat provider."""
+        timeout = float(timeout_seconds)
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("provider timeout must be finite and positive")
+        if reasoning_effort is not None and reasoning_effort not in {"low", "high", "max"}:
+            raise ValueError("reasoning effort must be low, high, or max")
+        bounded = copy(self)
+        bounded._call_timeout_seconds = timeout
+        if reasoning_effort is not None:
+            bounded._reasoning_effort = reasoning_effort
+        # An injected OpenAI client can have its own SDK retries. They must not
+        # extend a memory operation beyond the budget managed in create().
+        with_options = getattr(self._chat_client, "with_options", None)
+        if callable(with_options):
+            bounded._chat_client = with_options(max_retries=0)
+        return bounded
+
     def create(
         self,
         messages: list[dict[str, Any]],
@@ -244,6 +268,20 @@ class SiliconFlowProvider(ChatProvider):
         model: str | None = None,
     ) -> ProviderResponse:
         """Call SiliconFlow and return the S20 content-block response shape."""
+        deadline = (
+            time.monotonic() + self._call_timeout_seconds
+            if self._call_timeout_seconds is not None
+            else None
+        )
+
+        def remaining_budget() -> float | None:
+            if deadline is None:
+                return None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("provider_timeout")
+            return remaining
+
         last_error: Exception | None = None
         for attempt in range(4):
             try:
@@ -260,9 +298,17 @@ class SiliconFlowProvider(ChatProvider):
                     }
                 if self.temperature is not None:
                     request["temperature"] = self.temperature
+                if self._reasoning_effort is not None:
+                    request["reasoning_effort"] = self._reasoning_effort
+                remaining = remaining_budget()
+                if remaining is not None:
+                    request["timeout"] = remaining
                 response = self._chat_client.chat.completions.create(
                     **request,
                 )
+                # The caller may already have stopped waiting. A delayed HTTP
+                # completion must not be accepted or start another retry.
+                remaining_budget()
                 choice = response.choices[0]
                 message = choice.message
                 content: list[TextBlock | ToolUseBlock] = []
@@ -283,6 +329,7 @@ class SiliconFlowProvider(ChatProvider):
                     provider="siliconflow",
                 )
             except Exception as error:
+                remaining_budget()
                 if is_context_length_error(error):
                     raise ContextLengthError(str(error)) from error
                 last_error = error
@@ -290,7 +337,9 @@ class SiliconFlowProvider(ChatProvider):
                     raise
                 if attempt == 3:
                     break
-                time.sleep(min(2**attempt, 4))
+                delay = min(2**attempt, 4)
+                remaining = remaining_budget()
+                time.sleep(delay if remaining is None else min(delay, remaining))
         assert last_error is not None
         raise last_error
 

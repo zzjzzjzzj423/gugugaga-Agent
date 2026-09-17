@@ -675,7 +675,7 @@ def update_context(
     memories = ""
     index = Path(memory_index or config.MEMORY_INDEX)
     if index.exists():
-        memories = index.read_text()[:2000]
+        memories = index.read_text(encoding="utf-8")[:2000]
     return {
         "memories": memories,
         "active_teammates": list(active_teammates.keys()),

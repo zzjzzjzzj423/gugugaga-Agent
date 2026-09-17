@@ -112,7 +112,7 @@ def test_agent_overview_uses_intent_gate_and_conversation_evidence_labels():
     assert "Conversation Evidence" in html
     assert 'data-stage="consolidation"' not in html
     assert "Fact ${Number(data.memory?.facts || 0)}" in script
-    assert "Retry pending" in script
+    assert "轮待重试" in script
     assert "consolidationFailure.error_code" in script
     assert "String(event.call_type || '').startsWith('memory_')" in script
 

@@ -12,6 +12,7 @@ from gugugaga.provider import (
     ToolUseBlock,
 )
 from gugugaga.context_modes import SessionContextConfig, SessionContextCoordinator
+from gugugaga.memory import MemoryService
 
 
 class ScriptedProvider:
@@ -364,8 +365,8 @@ def test_two_source_runtimes_bind_files_and_memory_to_their_own_workspace(
     second_root = tmp_path / "second"
     (first_root / ".memory").mkdir(parents=True)
     (second_root / ".memory").mkdir(parents=True)
-    (first_root / ".memory" / "MEMORY.md").write_text("first-memory")
-    (second_root / ".memory" / "MEMORY.md").write_text("second-memory")
+    (first_root / ".memory" / "MEMORY.md").write_text("legacy-first-memory")
+    (second_root / ".memory" / "MEMORY.md").write_text("legacy-second-memory")
     provider = ScriptedProvider(
         [
             ProviderResponse(
@@ -388,20 +389,39 @@ def test_two_source_runtimes_bind_files_and_memory_to_their_own_workspace(
             summary_callback=agent._summary_callback(provider),
             workspace=root,
         )
-        return agent.SourceRuntime(provider, context_coordinator=coordinator)
+        memory = MemoryService(
+            root / ".gugugaga" / "state.db", provider,
+            start_worker=False, intent_gate_enabled=False, retrieval_min_score=0,
+        )
+        memory.repository.save_fact(
+            subject="project", content=f"{root.name}-memory", source="explicit", turn_id="seed"
+        )
+        return agent.SourceRuntime(provider, context_coordinator=coordinator, memory_service=memory)
 
     first = runtime(first_root)
     second = runtime(second_root)
     config.configure_workspace(second_root)
 
-    assert first.run_turn("write first") == "first done"
-    assert second.run_turn("write second") == "second done"
-    assert (first_root / "first.txt").read_text() == "one"
-    assert (second_root / "second.txt").read_text() == "two"
-    assert not (first_root / "second.txt").exists()
-    assert not (second_root / "first.txt").exists()
-    assert "first-memory" in first.context["memories"]
-    assert "second-memory" in second.context["memories"]
+    try:
+        assert first.run_turn("write first project") == "first done"
+        assert second.run_turn("write second project") == "second done"
+        assert (first_root / "first.txt").read_text() == "one"
+        assert (second_root / "second.txt").read_text() == "two"
+        assert not (first_root / "second.txt").exists()
+        assert not (second_root / "first.txt").exists()
+        assert "first-memory" in first.context["memories"]
+        assert "second-memory" not in first.context["memories"]
+        assert "second-memory" in second.context["memories"]
+        assert "first-memory" not in second.context["memories"]
+        assert "legacy-" not in first.context["memories"]
+        assert "legacy-" not in second.context["memories"]
+        assert first.memory_service.repository.path != second.memory_service.repository.path
+        assert [row["text"] for row in first.memory_service.list_memories()] == ["first-memory"]
+        assert [row["text"] for row in second.memory_service.list_memories()] == ["second-memory"]
+    finally:
+        for runtime in (first, second):
+            runtime.memory_service.close()
+            runtime.context_coordinator.close()
 
 
 def test_source_runtime_new_session_resets_transient_state_only(

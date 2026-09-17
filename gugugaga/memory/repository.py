@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .models import Batch, ConsolidationResult, Exchange, SaveNoteResult
-from .validation import fact_hash
+from .validation import fact_hash, normalize_text, redact_credentials, validate_fact
 
 
 _ENGLISH_SEARCH_STOPWORDS = {
@@ -166,6 +166,7 @@ class MemoryRepository:
                     "lease_expires_at TEXT NULL",
                     "next_retry_at TEXT NULL",
                     "last_error_code TEXT NULL",
+                    "last_error_detail TEXT NULL",
                     "completed_at TEXT NULL",
                     "consolidated_at TEXT NULL",
                     "retrieval_state TEXT NOT NULL DEFAULT 'hot'",
@@ -272,6 +273,55 @@ class MemoryRepository:
                     "embedding_version TEXT NULL",
                 ):
                     self._add_column(connection, "episodes", definition)
+                for definition in (
+                    "reason TEXT NOT NULL DEFAULT ''",
+                    "candidate_hash TEXT NOT NULL DEFAULT ''",
+                    "anchor_hash TEXT NOT NULL DEFAULT ''",
+                    "original_fact_id TEXT NULL",
+                    "anchor_revision INTEGER NOT NULL DEFAULT 0",
+                    "resolution TEXT NULL",
+                    "resolution_content TEXT NULL",
+                    "resolved_fact_id TEXT NULL",
+                ):
+                    self._add_column(connection, "memory_conflicts", definition)
+                connection.executescript(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_memory_conflicts_pending
+                    ON memory_conflicts(existing_fact_id, status);
+                    CREATE TABLE IF NOT EXISTS memory_conflict_sources (
+                        conflict_id TEXT NOT NULL REFERENCES memory_conflicts(id),
+                        turn_id TEXT NOT NULL,
+                        PRIMARY KEY(conflict_id, turn_id)
+                    );
+                    """
+                )
+                for conflict in connection.execute(
+                    "SELECT * FROM memory_conflicts WHERE candidate_hash='' OR original_fact_id IS NULL"
+                ).fetchall():
+                    anchor = connection.execute(
+                        "SELECT normalized_hash FROM facts WHERE id=?", (conflict["existing_fact_id"],)
+                    ).fetchone()
+                    connection.execute(
+                        """UPDATE memory_conflicts SET candidate_hash=?, anchor_hash=?,
+                           original_fact_id=COALESCE(original_fact_id, existing_fact_id) WHERE id=?""",
+                        (fact_hash(conflict["candidate_subject"], conflict["candidate_content"]),
+                         anchor["normalized_hash"] if anchor else "", conflict["id"]),
+                    )
+                connection.execute(
+                    """INSERT OR IGNORE INTO memory_conflict_sources(conflict_id, turn_id)
+                       SELECT id, source_turn_id FROM memory_conflicts WHERE source_turn_id IS NOT NULL"""
+                )
+                connection.execute(
+                    """INSERT OR IGNORE INTO memory_conflict_sources(conflict_id, turn_id)
+                       SELECT m.id, c.turn_id FROM memory_conflicts m
+                       JOIN chat_log c ON c.batch_id=m.source_batch_id"""
+                )
+                connection.execute(
+                    """UPDATE facts SET status='conflicted' WHERE status='active'
+                       AND EXISTS(SELECT 1 FROM memory_conflicts c
+                                  WHERE (c.existing_fact_id=facts.id OR c.candidate_hash=facts.normalized_hash)
+                                    AND c.status='pending')"""
+                )
                 self._allow_multiple_episodes_per_batch(connection)
                 connection.executescript(
                     """
@@ -731,7 +781,7 @@ class MemoryRepository:
     ) -> SaveNoteResult:
         normalized_hash = fact_hash(subject, content)
         existing = connection.execute(
-            "SELECT id FROM facts WHERE normalized_hash=? AND status='active'",
+            "SELECT id FROM facts WHERE normalized_hash=? AND status IN ('active', 'conflicted') ORDER BY status LIMIT 1",
             (normalized_hash,),
         ).fetchone()
         now = utc_now()
@@ -790,6 +840,10 @@ class MemoryRepository:
                 occurred_at or now,
             ),
         )
+        if connection.execute(
+            "SELECT 1 FROM memory_conflicts WHERE candidate_hash=? AND status='pending' LIMIT 1", (normalized_hash,)
+        ).fetchone():
+            connection.execute("UPDATE facts SET status='conflicted', index_status='pending' WHERE id=?", (fact_id,))
         self._link_sources(
             connection,
             memory_kind="fact",
@@ -844,6 +898,351 @@ class MemoryRepository:
                 turn_id=turn_id,
             )
             connection.commit()
+            return result
+
+    def _conflict_candidates_unlocked(
+        self, connection: sqlite3.Connection, subject: str, content: str, limit: int = 20,
+        *, include_unmatched: bool = False,
+    ) -> list[dict[str, Any]]:
+        query_tokens = self._search_tokens(f"{subject} {content}")
+        normalized_subject = normalize_text(subject)
+        ranked = []
+        for row in connection.execute(
+            """SELECT id, subject, content, status, updated_at FROM facts
+               WHERE status IN ('active', 'conflicted')"""
+        ):
+            same_subject = normalize_text(str(row["subject"])) == normalized_subject
+            overlap = len(query_tokens & self._search_tokens(f"{row['subject']} {row['content']}"))
+            if include_unmatched or same_subject or overlap:
+                ranked.append((int(same_subject), overlap, str(row["updated_at"]), str(row["id"]), row))
+        ranked.sort(key=lambda item: item[:4], reverse=True)
+        return [
+            {key: str(item[4][key]) for key in ("id", "subject", "content", "status")}
+            for item in ranked[: max(1, min(int(limit), 100))]
+        ]
+
+    def conflict_candidates(
+        self, subject: str, content: str, limit: int = 20, *, include_unmatched: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Find review candidates, including quarantined anchors, without treating them as memory."""
+        with self._lock, self._connect() as connection:
+            return self._conflict_candidates_unlocked(
+                connection, subject, content, limit, include_unmatched=include_unmatched,
+            )
+
+    def _check_review_unlocked(
+        self, connection, subject, content, reviewed_candidates, *, include_unmatched: bool = False,
+    ) -> None:
+        if reviewed_candidates is None:
+            return
+        current = self._conflict_candidates_unlocked(
+            connection, subject, content, include_unmatched=include_unmatched,
+        )
+        actual = sorted((item["id"], item["content"], item["status"]) for item in current)
+        expected = sorted(tuple(item) for item in reviewed_candidates)
+        if actual != expected:
+            raise RuntimeError("memory_review_stale")
+
+    @staticmethod
+    def _get_conflict_unlocked(connection: sqlite3.Connection, conflict_id: str) -> dict[str, Any] | None:
+        row = connection.execute(
+            """SELECT c.*, f.subject AS existing_subject, f.content AS existing_content,
+                      f.status AS existing_status, f.source AS existing_source,
+                      f.source_turn_id AS existing_source_turn_id,
+                      f.source_batch_id AS existing_source_batch_id
+               FROM memory_conflicts c JOIN facts f ON f.id=c.existing_fact_id WHERE c.id=?""",
+            (conflict_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_conflict(self, conflict_id: str) -> dict[str, Any] | None:
+        with self._lock, self._connect() as connection:
+            return self._get_conflict_unlocked(connection, conflict_id)
+
+    def list_conflicts(self, status: str = "pending", limit: int = 100) -> list[dict[str, Any]]:
+        if status not in {"pending", "resolved", "cancelled", "all"}:
+            raise ValueError("invalid_conflict_status")
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """SELECT c.*, f.subject AS existing_subject, f.content AS existing_content,
+                          f.status AS existing_status, f.source AS existing_source,
+                          f.source_turn_id AS existing_source_turn_id,
+                          f.source_batch_id AS existing_source_batch_id
+                   FROM memory_conflicts c JOIN facts f ON f.id=c.existing_fact_id
+                   WHERE (?='all' OR c.status=?) ORDER BY c.created_at, c.id LIMIT ?""",
+                (status, status, max(1, min(int(limit), 1000))),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def _create_conflict_unlocked(
+        self, connection: sqlite3.Connection, *, existing_fact_id: str, subject: str,
+        content: str, source: str, turn_id: str | None = None,
+        batch_id: str | None = None, reason: str = "", source_turn_ids: Iterable[str] = (),
+        reopen: bool = False,
+    ) -> dict[str, Any]:
+        subject, content = validate_fact(subject, content)
+        if source not in {"explicit", "implicit", "manual"}:
+            raise ValueError("invalid_memory_source")
+        candidate_hash = fact_hash(subject, content)
+        # Retries of an already completed operation must not reopen its decision.
+        previous = connection.execute(
+            """SELECT id FROM memory_conflicts WHERE original_fact_id=? AND candidate_hash=?
+               AND source=? AND source_turn_id IS ? AND source_batch_id IS ?
+               ORDER BY created_at DESC LIMIT 1""",
+            (existing_fact_id, candidate_hash, source, turn_id, batch_id),
+        ).fetchone()
+        if previous:
+            existing_conflict = self._get_conflict_unlocked(connection, str(previous["id"]))
+            if existing_conflict["status"] != "pending" and not reopen:
+                return existing_conflict
+        anchor = connection.execute("SELECT * FROM facts WHERE id=?", (existing_fact_id,)).fetchone()
+        if anchor is None:
+            raise KeyError("fact_not_found")
+        if anchor["status"] not in {"active", "conflicted"}:
+            raise RuntimeError("stale_conflict")
+        if anchor["normalized_hash"] == candidate_hash:
+            raise ValueError("identical_fact")
+        pending = connection.execute(
+            """SELECT id FROM memory_conflicts WHERE existing_fact_id=?
+               AND candidate_hash=? AND status='pending' ORDER BY created_at, id LIMIT 1""",
+            (existing_fact_id, candidate_hash),
+        ).fetchone()
+        conflict_id = str(pending["id"]) if pending else f"conflict_{uuid.uuid4().hex}"
+        if not pending:
+            connection.execute(
+                """INSERT INTO memory_conflicts
+                   (id, existing_fact_id, candidate_subject, candidate_content, source,
+                    source_turn_id, source_batch_id, status, created_at, reason,
+                    candidate_hash, anchor_hash, original_fact_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)""",
+                (conflict_id, existing_fact_id, subject, content, source, turn_id, batch_id,
+                 utc_now(), str(reason)[:2000], candidate_hash, anchor["normalized_hash"], existing_fact_id),
+            )
+            connection.execute(
+                "UPDATE facts SET status='conflicted', updated_at=?, index_status='pending' WHERE id=?",
+                (utc_now(), existing_fact_id),
+            )
+            # The proposal can already have been selected against another anchor.
+            # It remains quarantined until every pending comparison is decided.
+            connection.execute(
+                """UPDATE facts SET status='conflicted', updated_at=?, index_status='pending'
+                   WHERE normalized_hash=? AND status='active'""", (utc_now(), candidate_hash),
+            )
+            self._audit(connection, operation="conflict_create", object_type="conflict",
+                        object_id=conflict_id, source=source, turn_id=turn_id,
+                        batch_id=batch_id, result_code="pending")
+        sources = {str(value) for value in source_turn_ids if value}
+        if turn_id:
+            sources.add(turn_id)
+        if batch_id:
+            sources.update(str(row[0]) for row in connection.execute(
+                "SELECT DISTINCT turn_id FROM chat_log WHERE batch_id=?", (batch_id,)
+            ))
+        connection.executemany(
+            "INSERT OR IGNORE INTO memory_conflict_sources(conflict_id, turn_id) VALUES (?, ?)",
+            [(conflict_id, value) for value in sources],
+        )
+        return self._get_conflict_unlocked(connection, conflict_id)
+
+    def create_conflict(
+        self, *, existing_fact_id: str, subject: str, content: str, source: str,
+        turn_id: str | None = None, batch_id: str | None = None, reason: str = "",
+    ) -> dict[str, Any]:
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            result = self._create_conflict_unlocked(
+                connection, existing_fact_id=existing_fact_id, subject=subject, content=content,
+                source=source, turn_id=turn_id, batch_id=batch_id, reason=reason,
+            )
+            connection.commit()
+            return result
+
+    def save_reviewed_fact(
+        self, *, subject: str, content: str, source: str, turn_id: str | None = None,
+        conflict_ids: Iterable[str] = (), reason: str = "", reviewed_candidates=None,
+    ) -> SaveNoteResult:
+        subject, content = validate_fact(subject, content)
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._check_review_unlocked(connection, subject, content, reviewed_candidates)
+            identifiers = tuple(dict.fromkeys(conflict_ids))
+            if identifiers:
+                if reviewed_candidates is not None and not set(identifiers) <= {item[0] for item in reviewed_candidates}:
+                    raise RuntimeError("memory_review_stale")
+                conflicts = [self._create_conflict_unlocked(
+                    connection, existing_fact_id=identifier, subject=subject, content=content,
+                    source=source, turn_id=turn_id, reason=reason,
+                ) for identifier in identifiers]
+                result = SaveNoteResult("pending", conflict_id=conflicts[0]["id"])
+            else:
+                result = self._add_fact(connection, subject=subject, content=content, source=source, turn_id=turn_id)
+                row = connection.execute("SELECT status FROM facts WHERE id=?", (result.fact_id,)).fetchone()
+                if row and row["status"] == "conflicted":
+                    pending = connection.execute(
+                        """SELECT id FROM memory_conflicts WHERE status='pending'
+                           AND (existing_fact_id=? OR candidate_hash=?) LIMIT 1""",
+                        (result.fact_id, fact_hash(subject, content)),
+                    ).fetchone()
+                    result = SaveNoteResult("pending", conflict_id=str(pending[0]) if pending else None)
+            connection.commit()
+            return result
+
+    def resolve_conflict(
+        self, conflict_id: str, resolution: str, *, content: str | None = None,
+        expected_existing_fact_id: str | None = None,
+    ) -> dict[str, Any]:
+        if resolution not in {"existing", "candidate", "custom", "neither"}:
+            raise ValueError("invalid_conflict_resolution")
+        if resolution != "custom" and content is not None:
+            raise ValueError("content_only_for_custom_resolution")
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            conflict = self._get_conflict_unlocked(connection, conflict_id)
+            if conflict is None:
+                raise KeyError("conflict_not_found")
+            custom = None
+            if resolution == "custom":
+                _, custom = validate_fact(conflict["existing_subject"], content)
+            if expected_existing_fact_id is not None and expected_existing_fact_id != conflict["existing_fact_id"]:
+                raise RuntimeError("stale_conflict")
+            if conflict["status"] != "pending":
+                if (conflict["status"] == "resolved" and conflict["resolution"] == resolution
+                        and conflict["resolution_content"] == custom):
+                    return conflict
+                raise RuntimeError("conflict_already_resolved")
+            if conflict["anchor_revision"] and expected_existing_fact_id is None:
+                raise RuntimeError("stale_conflict")
+            anchor = connection.execute("SELECT * FROM facts WHERE id=?", (conflict["existing_fact_id"],)).fetchone()
+            if anchor["status"] != "conflicted" or anchor["normalized_hash"] != conflict["anchor_hash"]:
+                raise RuntimeError("stale_conflict")
+            siblings = connection.execute(
+                "SELECT id FROM memory_conflicts WHERE existing_fact_id=? AND status='pending' AND id<>?",
+                (anchor["id"], conflict_id),
+            ).fetchall()
+            candidate_fact = connection.execute(
+                """SELECT * FROM facts WHERE normalized_hash=? AND status IN ('active','conflicted')
+                   AND id<>? ORDER BY status LIMIT 1""", (conflict["candidate_hash"], anchor["id"]),
+            ).fetchone()
+            candidate_siblings = [] if candidate_fact is None else connection.execute(
+                "SELECT id FROM memory_conflicts WHERE existing_fact_id=? AND status='pending' AND id<>?",
+                (candidate_fact["id"], conflict_id),
+            ).fetchall()
+            if resolution == "neither" and (siblings or candidate_siblings):
+                raise RuntimeError("other_conflicts_pending")
+            if resolution in {"candidate", "custom"}:
+                chosen_subject = conflict["candidate_subject"] if resolution == "candidate" else anchor["subject"]
+                chosen_content = conflict["candidate_content"] if resolution == "candidate" else custom
+                # A later pairwise choice cannot silently reverse an earlier
+                # decision involving a different anchor. Reopen that comparison
+                # visibly and keep both choices quarantined until reviewed again.
+                earlier = connection.execute(
+                    """SELECT DISTINCT c.existing_fact_id FROM memory_conflicts c
+                       JOIN facts f ON f.id=c.existing_fact_id
+                       WHERE c.status='resolved' AND c.resolution='existing'
+                         AND c.candidate_hash=? AND c.existing_fact_id<>?
+                         AND f.status IN ('active','conflicted')""",
+                    (fact_hash(str(chosen_subject), str(chosen_content)), anchor["id"]),
+                ).fetchall()
+                for previous_anchor in earlier:
+                    self._create_conflict_unlocked(
+                        connection, existing_fact_id=str(previous_anchor[0]),
+                        subject=str(chosen_subject), content=str(chosen_content), source="manual",
+                        reason="此前已确认保留旧事实；另一项确认再次选择了相反候选，请重新确认。",
+                        source_turn_ids=[str(row[0]) for row in connection.execute(
+                            "SELECT turn_id FROM memory_conflict_sources WHERE conflict_id=?", (conflict_id,)
+                        )], reopen=True,
+                    )
+            selected_id = None
+            if resolution == "existing":
+                selected_id = str(anchor["id"])
+            elif resolution == "neither":
+                connection.execute("UPDATE facts SET status='forgotten', forgotten_at=?, updated_at=?, index_status='pending' WHERE id=?",
+                                   (utc_now(), utc_now(), anchor["id"]))
+            else:
+                chosen_subject = conflict["candidate_subject"] if resolution == "candidate" else anchor["subject"]
+                chosen_content = conflict["candidate_content"] if resolution == "candidate" else custom
+                connection.execute("UPDATE facts SET status='superseded', updated_at=?, index_status='pending' WHERE id=?",
+                                   (utc_now(), anchor["id"]))
+                sources = {str(row[0]) for row in connection.execute(
+                    "SELECT turn_id FROM memory_sources WHERE memory_key=?", (f"fact:{anchor['id']}",)
+                )}
+                sources.update(str(row[0]) for row in connection.execute(
+                    "SELECT turn_id FROM memory_conflict_sources WHERE conflict_id=?", (conflict_id,)
+                ))
+                saved = self._add_fact(
+                    connection, subject=str(chosen_subject), content=str(chosen_content), source="manual",
+                    supersedes_id=str(anchor["id"]), source_turn_ids=sources,
+                )
+                selected_id = saved.fact_id
+                if siblings:
+                    connection.execute(
+                        """UPDATE memory_conflicts SET existing_fact_id=?, anchor_hash=?, anchor_revision=anchor_revision+1
+                           WHERE existing_fact_id=? AND status='pending' AND id<>?""",
+                        (selected_id, fact_hash(str(chosen_subject), str(chosen_content)), anchor["id"], conflict_id),
+                    )
+            # Keeping the existing fact or supplying a correction also rejects a
+            # materialized candidate previously selected against another anchor.
+            if candidate_fact is not None and resolution in {"existing", "custom", "neither"}:
+                if selected_id != candidate_fact["id"]:
+                    connection.execute(
+                        "UPDATE facts SET status=?, updated_at=?, index_status='pending' WHERE id=?",
+                        ("forgotten" if resolution == "neither" else "superseded", utc_now(), candidate_fact["id"]),
+                    )
+                    if selected_id and candidate_siblings:
+                        winner = connection.execute("SELECT normalized_hash FROM facts WHERE id=?", (selected_id,)).fetchone()
+                        connection.execute(
+                            """UPDATE memory_conflicts SET existing_fact_id=?, anchor_hash=?, anchor_revision=anchor_revision+1
+                               WHERE existing_fact_id=? AND status='pending' AND id<>?""",
+                            (selected_id, winner[0], candidate_fact["id"], conflict_id),
+                        )
+            connection.execute(
+                """UPDATE memory_conflicts SET status='resolved', resolution=?, resolution_content=?,
+                   resolved_fact_id=?, resolved_at=? WHERE id=? AND status='pending'""",
+                (resolution, custom, selected_id, utc_now(), conflict_id),
+            )
+            if selected_id:
+                winner = connection.execute("SELECT normalized_hash FROM facts WHERE id=?", (selected_id,)).fetchone()
+                outstanding = connection.execute(
+                    """SELECT 1 FROM memory_conflicts WHERE status='pending'
+                       AND (existing_fact_id=? OR candidate_hash=?) LIMIT 1""", (selected_id, winner[0]),
+                ).fetchone()
+                connection.execute(
+                    "UPDATE facts SET status=?, updated_at=?, index_status='pending' WHERE id=?",
+                    ("conflicted" if outstanding else "active", utc_now(), selected_id),
+                )
+            self._audit(connection, operation="conflict_resolve", object_type="conflict",
+                        object_id=conflict_id, source="manual", result_code=resolution)
+            result = self._get_conflict_unlocked(connection, conflict_id)
+            connection.commit()
+            return result
+
+    @staticmethod
+    def _conflict_evidence_turn_ids(connection: sqlite3.Connection) -> set[str]:
+        # Conservative by design: batch provenance cannot prove which individual
+        # sentence was superseded. Keep raw evidence for audit, out of default recall.
+        return {str(row[0]) for row in connection.execute(
+            """SELECT turn_id FROM memory_conflict_sources
+               UNION SELECT s.turn_id FROM memory_sources s JOIN memory_conflicts c
+               ON s.memory_key='fact:' || COALESCE(c.original_fact_id, c.existing_fact_id)
+               UNION SELECT s.turn_id FROM memory_sources s JOIN memory_conflicts c
+               ON s.memory_key='fact:' || c.existing_fact_id"""
+        )}
+
+    def conflict_evidence_turn_ids(self) -> set[str]:
+        with self._lock, self._connect() as connection:
+            return self._conflict_evidence_turn_ids(connection)
+
+    def filter_conflicted_candidates(self, candidates: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as connection:
+            blocked = self._conflict_evidence_turn_ids(connection)
+            result = []
+            for candidate in candidates:
+                key = str(candidate.get("memory_key") or "")
+                if key and self._candidate(connection, key) is None:
+                    continue
+                if candidate.get("kind") != "fact" and blocked.intersection(candidate.get("source_turn_ids") or ()):
+                    continue
+                result.append(candidate)
             return result
 
     def recover_expired_leases(self) -> int:
@@ -924,7 +1323,7 @@ class MemoryRepository:
                 UPDATE chat_log
                 SET consolidation_status='processing', batch_id=?,
                     attempt_count=attempt_count+1, lease_expires_at=?,
-                    next_retry_at=NULL, last_error_code=NULL
+                    next_retry_at=NULL, last_error_code=NULL, last_error_detail=NULL
                 WHERE consolidation_status='pending'
                   AND turn_id IN ({placeholders})
                 """,
@@ -966,7 +1365,7 @@ class MemoryRepository:
                 raise RuntimeError("batch_not_found")
             if batch_row["status"] == "consolidated":
                 connection.rollback()
-                return {"facts_added": 0, "facts_duplicate": 0, "episodes_added": 0}
+                return {"facts_added": 0, "facts_duplicate": 0, "facts_pending": 0, "episodes_added": 0}
             if (
                 batch_row["lease_expires_at"] is None
                 or str(batch_row["lease_expires_at"]) <= utc_now()
@@ -983,8 +1382,77 @@ class MemoryRepository:
             if processing < len(batch.exchanges) * 2:
                 connection.rollback()
                 raise RuntimeError("batch_lease_lost")
-            added = duplicate = 0
+            # Validate the full review against one pre-write database snapshot.
             for fact in result.facts:
+                self._check_review_unlocked(connection, fact.subject, fact.content, fact.reviewed_candidates)
+            review = result.conflict_review
+            if review is not None:
+                self._check_review_unlocked(
+                    connection, "", review.query, review.reviewed_candidates, include_unmatched=True,
+                )
+                allowed_ids = {item[0] for item in review.reviewed_candidates}
+                batch_turns = {item.turn_id for item in batch.exchanges}
+                user_sources: dict[str, list[str]] = {}
+                for row in connection.execute(
+                    """SELECT turn_id, content FROM chat_log
+                       WHERE batch_id=? AND role='user' AND is_final=1
+                         AND consolidation_status='processing'""", (batch.id,),
+                ):
+                    user_sources.setdefault(str(row["turn_id"]), []).append(str(row["content"]))
+                for probe in review.conflicts:
+                    if (not isinstance(probe.existing_fact_id, str)
+                            or probe.existing_fact_id.startswith("@batch:")
+                            or probe.existing_fact_id not in allowed_ids):
+                        raise RuntimeError("invalid_batch_conflict_reference")
+                    validate_fact(probe.subject, probe.content)
+                    anchor = connection.execute(
+                        "SELECT subject FROM facts WHERE id=?", (probe.existing_fact_id,),
+                    ).fetchone()
+                    if anchor is None or probe.subject != anchor["subject"]:
+                        raise RuntimeError("batch_conflict_subject_invalid")
+                    if (not isinstance(probe.turn_id, str) or probe.turn_id not in batch_turns
+                            or not isinstance(probe.evidence, str) or not probe.evidence.strip()
+                            or not any(
+                                probe.evidence in text or probe.evidence in redact_credentials(text)
+                                for text in user_sources.get(probe.turn_id, ())
+                            )):
+                        raise RuntimeError("batch_conflict_evidence_invalid")
+                    if not isinstance(probe.reason, str) or not 1 <= len(probe.reason.strip()) <= 1000:
+                        raise RuntimeError("batch_conflict_review_invalid")
+            added = duplicate = 0
+            pending_hashes: set[str] = set()
+            if review is not None:
+                for probe in review.conflicts:
+                    self._create_conflict_unlocked(
+                        connection, existing_fact_id=probe.existing_fact_id,
+                        subject=probe.subject, content=probe.content, source="implicit",
+                        turn_id=probe.turn_id, batch_id=batch.id,
+                        reason=redact_credentials(probe.reason),
+                        source_turn_ids=(probe.turn_id,),
+                    )
+                    pending_hashes.add(fact_hash(probe.subject, probe.content))
+            saved_by_index: dict[int, str] = {}
+            for fact_index, fact in enumerate(result.facts):
+                conflict_ids = []
+                for identifier in dict.fromkeys(fact.conflict_ids):
+                    if identifier.startswith("@batch:"):
+                        try:
+                            identifier = saved_by_index[int(identifier.partition(":")[2])]
+                        except (KeyError, ValueError):
+                            raise RuntimeError("invalid_batch_conflict_reference") from None
+                    elif fact.reviewed_candidates is not None and identifier not in {item[0] for item in fact.reviewed_candidates}:
+                        raise RuntimeError("memory_review_stale")
+                    conflict_ids.append(identifier)
+                if conflict_ids:
+                    for identifier in conflict_ids:
+                        self._create_conflict_unlocked(
+                            connection, existing_fact_id=identifier, subject=fact.subject,
+                            content=fact.content, source="implicit", batch_id=batch.id,
+                            reason=fact.conflict_reason,
+                            source_turn_ids=(item.turn_id for item in batch.exchanges),
+                        )
+                    pending_hashes.add(fact_hash(fact.subject, fact.content))
+                    continue
                 saved = self._add_fact(
                     connection,
                     subject=fact.subject,
@@ -995,6 +1463,12 @@ class MemoryRepository:
                     occurred_at=batch.exchanges[-1].completed_at,
                     source_turn_ids=(item.turn_id for item in batch.exchanges),
                 )
+                saved_by_index[fact_index] = saved.fact_id
+                # An admitted fact can also be a raw-review proposal. _add_fact
+                # keeps that record conflicted, including when later facts need
+                # it as a same-batch anchor; count the proposal only once.
+                if fact_hash(fact.subject, fact.content) in pending_hashes:
+                    continue
                 if saved.status == "added":
                     added += 1
                 else:
@@ -1076,11 +1550,13 @@ class MemoryRepository:
             return {
                 "facts_added": added,
                 "facts_duplicate": duplicate,
+                "facts_pending": len(pending_hashes),
                 "episodes_added": episodes_added,
             }
 
     def release_failed_batch(
-        self, batch_id: str, *, error_code: str, retry_seconds: float
+        self, batch_id: str, *, error_code: str, retry_seconds: float,
+        error_detail: str | None = None,
     ) -> None:
         retry_at = utc_after(retry_seconds)
         with self._lock, self._connect() as connection:
@@ -1089,10 +1565,10 @@ class MemoryRepository:
                 """
                 UPDATE chat_log
                 SET consolidation_status='pending', batch_id=NULL,
-                    lease_expires_at=NULL, next_retry_at=?, last_error_code=?
+                    lease_expires_at=NULL, next_retry_at=?, last_error_code=?, last_error_detail=?
                 WHERE batch_id=? AND consolidation_status='processing'
                 """,
-                (retry_at, error_code, batch_id),
+                (retry_at, error_code, error_detail[:500] if error_detail else None, batch_id),
             )
             connection.execute(
                 """
@@ -1394,13 +1870,18 @@ class MemoryRepository:
             source_rows = connection.execute(
                 """
                 SELECT turn_id FROM memory_sources
-                WHERE memory_key=? ORDER BY created_at, turn_id LIMIT 8
+                WHERE memory_key=? ORDER BY created_at, turn_id
                 """,
                 (memory_key,),
             ).fetchall()
-            candidate["source_turn_ids"] = [str(item["turn_id"]) for item in source_rows]
+            all_sources = [str(item["turn_id"]) for item in source_rows]
+            if kind == "episode" and self._conflict_evidence_turn_ids(connection).intersection(all_sources):
+                return None
+            candidate["source_turn_ids"] = all_sources[:8]
         else:
             candidate["source_turn_ids"] = [str(candidate.pop("turn_id"))]
+            if self._conflict_evidence_turn_ids(connection).intersection(candidate["source_turn_ids"]):
+                return None
         return candidate
 
     def has_searchable_memory(self) -> bool:
@@ -1520,7 +2001,7 @@ class MemoryRepository:
         self, candidates: Iterable[dict[str, Any]]
     ) -> list[dict[str, Any]]:
         """Collapse chat hits by turn and attach both sides of the Exchange."""
-        values = [dict(candidate) for candidate in candidates]
+        values = self.filter_conflicted_candidates(dict(candidate) for candidate in candidates)
         expanded: list[dict[str, Any]] = []
         exchanges: dict[str, dict[str, Any]] = {}
         with self._lock, self._connect() as connection:
@@ -1873,16 +2354,23 @@ class MemoryRepository:
             existing = connection.execute(
                 "SELECT subject, status FROM facts WHERE id=?", (fact_id,)
             ).fetchone()
+            if connection.execute(
+                "SELECT 1 FROM memory_conflicts WHERE existing_fact_id=? AND status='pending'", (fact_id,)
+            ).fetchone():
+                return SaveNoteResult("failed", error_code="pending_conflict")
             if existing is None or existing["status"] != "active":
                 connection.rollback()
                 return SaveNoteResult("failed", error_code="not_found")
+            _, content = validate_fact(str(existing["subject"]), content)
             new_hash = fact_hash(str(existing["subject"]), content)
             duplicate = connection.execute(
-                "SELECT id FROM facts WHERE normalized_hash=? AND status='active' AND id<>?",
+                "SELECT id, status FROM facts WHERE normalized_hash=? AND status IN ('active', 'conflicted') AND id<>?",
                 (new_hash, fact_id),
             ).fetchone()
             if duplicate is not None:
                 connection.rollback()
+                if duplicate["status"] == "conflicted":
+                    return SaveNoteResult("failed", error_code="pending_conflict")
                 return SaveNoteResult("duplicate", str(duplicate["id"]))
             connection.execute(
                 """
@@ -1897,6 +2385,9 @@ class MemoryRepository:
                 content=content,
                 source="manual",
                 supersedes_id=fact_id,
+                source_turn_ids=[str(row[0]) for row in connection.execute(
+                    "SELECT turn_id FROM memory_sources WHERE memory_key=?", (f"fact:{fact_id}",)
+                )],
             )
             connection.commit()
             return result
@@ -1916,6 +2407,26 @@ class MemoryRepository:
             if row["status"] == "forgotten":
                 connection.rollback()
                 return "already_forgotten"
+            affected_ids: set[str] = set()
+            if kind == "fact":
+                normalized_hash = connection.execute("SELECT normalized_hash FROM facts WHERE id=?", (memory_id,)).fetchone()[0]
+                pending = connection.execute(
+                    """SELECT id, existing_fact_id, candidate_hash FROM memory_conflicts
+                       WHERE status='pending' AND (existing_fact_id=? OR candidate_hash=?)""", (memory_id, normalized_hash),
+                ).fetchall()
+                affected_ids.update(str(item["existing_fact_id"]) for item in pending)
+                for item in pending:
+                    affected_ids.update(str(value[0]) for value in connection.execute(
+                        "SELECT id FROM facts WHERE normalized_hash=? AND status='conflicted'", (item["candidate_hash"],)
+                    ))
+                connection.execute(
+                    """UPDATE memory_conflicts SET status='cancelled', resolution='forgotten', resolved_at=?
+                       WHERE status='pending' AND (existing_fact_id=? OR candidate_hash=?)""",
+                    (utc_now(), memory_id, normalized_hash),
+                )
+                for conflict in pending:
+                    self._audit(connection, operation="conflict_cancel", object_type="conflict",
+                                object_id=str(conflict["id"]), source="manual", result_code="forgotten")
             connection.execute(
                 f"""
                 UPDATE {table}
@@ -1924,6 +2435,16 @@ class MemoryRepository:
                 """,
                 (utc_now(), memory_id),
             )
+            for affected_id in affected_ids - {memory_id}:
+                # Forgetting removes this comparison, not every other pending
+                # comparison against the remaining fact.
+                connection.execute(
+                    """UPDATE facts SET status='active', updated_at=?, index_status='pending'
+                       WHERE id=? AND status='conflicted'
+                         AND NOT EXISTS(SELECT 1 FROM memory_conflicts c WHERE c.status='pending'
+                             AND (c.existing_fact_id=facts.id OR c.candidate_hash=facts.normalized_hash))""",
+                    (utc_now(), affected_id),
+                )
             self._audit(
                 connection,
                 operation="forget",
@@ -2022,6 +2543,13 @@ class MemoryRepository:
                 WHERE status='active' ORDER BY period_end DESC LIMIT 100
                 """
             ).fetchall()
+            blocked = self._conflict_evidence_turn_ids(connection)
+            if blocked:
+                episodes = [row for row in episodes if not blocked.intersection(
+                    str(source[0]) for source in connection.execute(
+                        "SELECT turn_id FROM memory_sources WHERE memory_key=?", (f"episode:{row['id']}",)
+                    )
+                )]
 
         def ranked(rows: Iterable[sqlite3.Row], text_fields: tuple[str, ...], limit: int):
             values = []
@@ -2049,7 +2577,7 @@ class MemoryRepository:
         lines.append("</untrusted_memory>")
         return "\n".join(lines)
 
-    def status(self) -> dict[str, Any]:
+    def status(self, *, consolidation_threshold: int = 6) -> dict[str, Any]:
         with self._lock, self._connect() as connection:
             rows = connection.execute(
                 """
@@ -2059,6 +2587,9 @@ class MemoryRepository:
             ).fetchall()
             facts = connection.execute(
                 "SELECT COUNT(*) FROM facts WHERE status='active'"
+            ).fetchone()[0]
+            pending_conflicts = connection.execute(
+                "SELECT COUNT(*) FROM memory_conflicts WHERE status='pending'"
             ).fetchone()[0]
             episodes = connection.execute(
                 "SELECT COUNT(*) FROM episodes WHERE status='active'"
@@ -2098,9 +2629,21 @@ class MemoryRepository:
             indexed = connection.execute(
                 "SELECT COUNT(*) FROM memory_embeddings"
             ).fetchone()[0]
-            latest_batch = connection.execute(
+            pending_exchanges = connection.execute(
                 """
-                SELECT status FROM consolidation_batches
+                SELECT turn_id, MAX(last_error_code) AS error_code,
+                       MAX(last_error_detail) AS error_detail,
+                       MAX(attempt_count) AS attempt_count,
+                       MAX(next_retry_at) AS next_retry_at
+                FROM chat_log
+                WHERE is_final=1 AND consolidation_status='pending'
+                GROUP BY turn_id HAVING COUNT(DISTINCT role)=2
+                """
+            ).fetchall()
+            active_batch = connection.execute(
+                """
+                SELECT id, attempt_count, created_at, turn_ids
+                FROM consolidation_batches WHERE status='processing'
                 ORDER BY created_at DESC LIMIT 1
                 """
             ).fetchone()
@@ -2111,6 +2654,7 @@ class MemoryRepository:
         value.update(
             {
                 "facts": int(facts),
+                "pending_conflicts": int(pending_conflicts),
                 "episodes": int(episodes),
                 "evidence": int(evidence),
                 "evidence_hot": 0,
@@ -2125,16 +2669,45 @@ class MemoryRepository:
         value["last_failure"] = dict(last_failure) if last_failure else None
         value["index_jobs"] = {str(row[0]): int(row[1]) for row in index_rows}
         value["usage_events_pending"] = int(usage_pending)
-        latest_batch_failed = (
-            latest_batch is not None and str(latest_batch["status"]) == "failed"
+        now = utc_now()
+        retries = [row for row in pending_exchanges if row["error_code"]]
+        ready = sum(
+            not row["next_retry_at"] or str(row["next_retry_at"]) <= now
+            for row in pending_exchanges
         )
+        retry_dates = [str(row["next_retry_at"]) for row in retries if row["next_retry_at"]]
+        failure = max(
+            retries,
+            key=lambda row: (str(row["next_retry_at"] or ""), int(row["attempt_count"])),
+            default=None,
+        )
+        value.update({
+            "consolidation_threshold": consolidation_threshold,
+            "consolidation_waiting": len(pending_exchanges) - len(retries),
+            "consolidation_retry_pending": len(retries),
+            "consolidation_ready": ready,
+            "consolidation_next_retry_at": min(retry_dates) if retry_dates else None,
+            "consolidation_failure": (
+                {"error_code": failure["error_code"], "attempt_count": failure["attempt_count"],
+                 **({"error_detail": failure["error_detail"]} if failure["error_detail"] else {})}
+                if failure is not None else None
+            ),
+            "consolidation_active_batch": (
+                {"id": active_batch["id"], "attempt_count": active_batch["attempt_count"],
+                 "created_at": active_batch["created_at"],
+                 "exchange_count": len(json.loads(active_batch["turn_ids"]))}
+                if active_batch is not None else None
+            ),
+        })
         value["consolidation_state"] = (
             "running"
             if int(value.get("processing", 0)) > 0
+            else "queued"
+            if ready >= consolidation_threshold
             else "retrying"
-            if latest_batch_failed and int(value.get("pending", 0)) > 0
-            else "failed"
-            if latest_batch_failed
+            if retries
+            else "waiting"
+            if pending_exchanges
             else "idle"
         )
         return value

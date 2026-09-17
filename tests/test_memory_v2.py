@@ -554,6 +554,9 @@ def test_default_recall_injects_top_ten_with_scaled_route_quotas(tmp_path, monke
         service.repository, "bm25_candidates",
         lambda query, *, limit: candidates[:limit],
     )
+    # This test exercises quotas with synthetic candidates. Database-backed
+    # state/provenance revalidation is covered by the conflict repository tests.
+    monkeypatch.setattr(service.repository, "expand_chat_candidates", lambda values: list(values))
     try:
         result = service.recall_for_turn(query)
         assert result.should_inject

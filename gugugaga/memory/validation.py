@@ -64,10 +64,9 @@ def fact_hash(subject: str, content: str) -> str:
 def _importance(value: Any) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise MemoryValidationError("schema_invalid", "importance must be a number")
-    score = float(value)
-    if not 0 <= score <= 1:
-        raise MemoryValidationError("schema_invalid", "importance must be between 0 and 1")
-    return score
+    if not 0 <= value <= 1:
+        raise MemoryValidationError("schema_invalid", "importance must be finite and between 0 and 1")
+    return float(value)
 
 
 def _future_value(value: Any) -> str:
@@ -85,6 +84,42 @@ def _future_value(value: Any) -> str:
     return cleaned
 
 
+def _require_fields(value: Any, required: set[str], path: str) -> None:
+    if not isinstance(value, dict):
+        raise MemoryValidationError("schema_invalid", f"{path}: must be an object")
+    missing = sorted(required - set(value))
+    extra_count = len(set(value) - required)
+    if missing or extra_count:
+        details = []
+        if missing:
+            details.append("missing fields: " + ", ".join(missing))
+        if extra_count:
+            details.append(f"unexpected fields: {extra_count}")
+        raise MemoryValidationError("schema_invalid", f"{path}: {'; '.join(details)}")
+
+
+def _parse_json_object(raw: str) -> Any:
+    text = raw.strip()
+    fence = re.fullmatch(r"```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n```", text)
+    if fence is not None:
+        text = fence.group(1)
+
+    def reject_constant(_constant: str) -> None:
+        # json.loads accepts NaN and Infinity by default. Find the first such
+        # token outside strings so diagnostics expose a position, never text.
+        tokens = re.finditer(r'"(?:\\.|[^"\\])*"|(?P<constant>-?Infinity|NaN)', text)
+        position = next(match.start() for match in tokens if match.group("constant"))
+        raise json.JSONDecodeError("invalid numeric constant", text, position)
+
+    try:
+        return json.loads(text, parse_constant=reject_constant)
+    except json.JSONDecodeError as error:
+        raise MemoryValidationError(
+            "schema_invalid",
+            f"output: JSON syntax error at line {error.lineno}, column {error.colno}",
+        ) from None
+
+
 def parse_consolidation_result(
     raw: str,
     *,
@@ -92,6 +127,7 @@ def parse_consolidation_result(
     min_importance: float = 0.8,
     max_episodes: int = 5,
     episode_min_importance: float = 0.6,
+    admission_stats: dict[str, int] | None = None,
 ) -> ConsolidationResult:
     if not 0 <= min_importance <= 1:
         raise ValueError("min_importance must be between 0 and 1")
@@ -99,55 +135,89 @@ def parse_consolidation_result(
         raise ValueError("max_episodes must be between 0 and 5")
     if not 0 <= episode_min_importance <= 1:
         raise ValueError("episode_min_importance must be between 0 and 1")
-    try:
-        value = json.loads(raw)
-    except json.JSONDecodeError as error:
-        raise MemoryValidationError("schema_invalid", "consolidation output must be one JSON object") from error
-    if not isinstance(value, dict) or set(value) != {"facts", "episodes"}:
-        raise MemoryValidationError("schema_invalid", "output keys must be exactly facts and episodes")
+    value = _parse_json_object(raw)
+    _require_fields(value, {"facts", "episodes"}, "output")
     facts_value = value["facts"]
-    if not isinstance(facts_value, list) or len(facts_value) > max_facts:
-        raise MemoryValidationError("schema_invalid", f"facts must contain at most {max_facts} items")
+    if not isinstance(facts_value, list):
+        raise MemoryValidationError("schema_invalid", "facts: must be an array")
+    if len(facts_value) > max_facts:
+        raise MemoryValidationError("schema_invalid", f"facts: must contain at most {max_facts} items")
+    facts_filtered_importance = 0
+    facts_filtered_temporary = 0
     facts: list[FactCandidate] = []
-    for item in facts_value:
+    for index, item in enumerate(facts_value):
+        path = f"facts[{index}]"
         required = {"subject", "content", "importance", "durability", "future_value"}
-        if not isinstance(item, dict) or set(item) != required:
-            raise MemoryValidationError(
-                "schema_invalid",
-                "each fact must contain only subject, content, importance, durability, and future_value",
+        _require_fields(item, required, path)
+        for field in ("subject", "content"):
+            if not isinstance(item[field], str):
+                raise MemoryValidationError("schema_invalid", f"{path}.{field}: must be a string")
+        try:
+            subject, content = validate_fact(item["subject"], item["content"])
+        except MemoryValidationError as error:
+            field = (
+                "subject" if error.code == "subject_length"
+                else "content" if error.code == "content_length"
+                else "subject" if contains_credential(item["subject"])
+                else "content"
             )
-        subject, content = validate_fact(item["subject"], item["content"])
-        importance = _importance(item["importance"])
-        if item["durability"] not in {"long_term", "temporary"}:
+            raise MemoryValidationError(error.code, f"{path}.{field}: {error}") from None
+        try:
+            importance = _importance(item["importance"])
+        except MemoryValidationError as error:
+            raise MemoryValidationError(error.code, f"{path}.importance: {error}") from None
+        if not isinstance(item["durability"], str) or item["durability"] not in {"long_term", "temporary"}:
             raise MemoryValidationError(
-                "schema_invalid", "durability must be long_term or temporary"
+                "schema_invalid", f"{path}.durability: must be long_term or temporary"
             )
-        _future_value(item["future_value"])
+        try:
+            _future_value(item["future_value"])
+        except MemoryValidationError as error:
+            raise MemoryValidationError(error.code, f"{path}.future_value: {error}") from None
+        facts_filtered_importance += int(importance < min_importance)
+        facts_filtered_temporary += int(item["durability"] == "temporary")
         if importance >= min_importance and item["durability"] == "long_term":
             facts.append(FactCandidate(subject, content, importance))
     episodes_value = value["episodes"]
-    if not isinstance(episodes_value, list) or len(episodes_value) > max_episodes:
+    if not isinstance(episodes_value, list):
+        raise MemoryValidationError("schema_invalid", "episodes: must be an array")
+    if len(episodes_value) > max_episodes:
         raise MemoryValidationError(
-            "schema_invalid", f"episodes must contain at most {max_episodes} items"
+            "schema_invalid", f"episodes: must contain at most {max_episodes} items"
         )
     episodes: list[EpisodeCandidate] = []
-    for episode_value in episodes_value:
+    for index, episode_value in enumerate(episodes_value):
+        path = f"episodes[{index}]"
         required = {"summary", "importance", "future_value"}
-        if not isinstance(episode_value, dict) or set(episode_value) != required:
-            raise MemoryValidationError(
-                "schema_invalid",
-                "each episode must contain only summary, importance, and future_value",
-            )
+        _require_fields(episode_value, required, path)
         summary = episode_value["summary"]
         if not isinstance(summary, str):
-            raise MemoryValidationError("schema_invalid", "episode summary must be a string")
+            raise MemoryValidationError("schema_invalid", f"{path}.summary: must be a string")
         summary = summary.strip()
         if not 1 <= len(summary) <= 2000:
-            raise MemoryValidationError("episode_length", "episode must contain at most 2000 characters")
+            raise MemoryValidationError("episode_length", f"{path}.summary: must contain 1-2000 characters")
         if contains_credential(summary):
-            raise MemoryValidationError("sensitive_content", "credentials cannot be stored in an episode")
-        importance = _importance(episode_value["importance"])
-        _future_value(episode_value["future_value"])
+            raise MemoryValidationError("sensitive_content", f"{path}.summary: credentials cannot be stored in an episode")
+        try:
+            importance = _importance(episode_value["importance"])
+        except MemoryValidationError as error:
+            raise MemoryValidationError(error.code, f"{path}.importance: {error}") from None
+        try:
+            _future_value(episode_value["future_value"])
+        except MemoryValidationError as error:
+            raise MemoryValidationError(error.code, f"{path}.future_value: {error}") from None
         if importance >= episode_min_importance:
             episodes.append(EpisodeCandidate(summary, importance))
+    if admission_stats is not None:
+        # Publish counts only after the entire response has passed validation.
+        # A fact can fail both admission checks, so reason counts can overlap.
+        admission_stats.update(
+            facts_received=len(facts_value),
+            facts_admitted=len(facts),
+            facts_filtered_importance=facts_filtered_importance,
+            facts_filtered_temporary=facts_filtered_temporary,
+            episodes_received=len(episodes_value),
+            episodes_admitted=len(episodes),
+            episodes_filtered_importance=len(episodes_value) - len(episodes),
+        )
     return ConsolidationResult(tuple(facts), tuple(episodes))
