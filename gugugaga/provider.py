@@ -220,14 +220,17 @@ class SiliconFlowProvider(ChatProvider):
         *,
         enable_thinking: bool | None = None,
         temperature: float | None = None,
+        reasoning_effort: str | None = None,
     ):
         if temperature is not None and not 0.0 <= temperature <= 2.0:
             raise ValueError("temperature must be between 0 and 2")
+        if reasoning_effort is not None and reasoning_effort not in {"low", "high", "max"}:
+            raise ValueError("reasoning effort must be low, high, or max")
         self.settings = settings
         self.enable_thinking = enable_thinking
         self.temperature = temperature
         self._call_timeout_seconds: float | None = None
-        self._reasoning_effort: str | None = None
+        self._reasoning_effort = reasoning_effort
         self.client = client or OpenAI(
             api_key=settings.api_key,
             base_url=settings.base_url,

@@ -1,6 +1,8 @@
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from gugugaga.config import Settings
 from gugugaga.provider import SiliconFlowProvider
 
@@ -204,7 +206,8 @@ def test_internal_context_metadata_is_not_sent_to_openai(tmp_path):
     }
 
 
-def test_create_can_disable_provider_thinking_mode(tmp_path):
+@pytest.mark.parametrize("thinking,effort", [(False, None), (None, "low")])
+def test_create_forwards_thinking_and_reasoning_settings(tmp_path, thinking, effort):
     completion = SimpleNamespace(
         choices=[
             SimpleNamespace(
@@ -217,8 +220,9 @@ def test_create_can_disable_provider_thinking_mode(tmp_path):
     provider = SiliconFlowProvider(
         settings(tmp_path),
         client=client,
-        enable_thinking=False,
+        enable_thinking=thinking,
         temperature=0,
+        reasoning_effort=effort,
     )
 
     provider.create(
@@ -228,5 +232,9 @@ def test_create_can_disable_provider_thinking_mode(tmp_path):
         max_tokens=20,
     )
 
-    assert client.requests[0]["extra_body"] == {"enable_thinking": False}
+    if thinking is None:
+        assert "extra_body" not in client.requests[0]
+    else:
+        assert client.requests[0]["extra_body"] == {"enable_thinking": thinking}
+    assert client.requests[0].get("reasoning_effort") == effort
     assert client.requests[0]["temperature"] == 0
