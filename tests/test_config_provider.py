@@ -22,13 +22,36 @@ def test_settings_builds_state_paths(tmp_path, monkeypatch):
     assert settings.state_dir == tmp_path / ".gugugaga"
     assert settings.tasks_dir.exists()
     assert settings.mailboxes_dir.exists()
-    assert settings.memory_consolidation_timeout_seconds == 90
+    assert settings.memory_consolidation_timeout_seconds == 300
     assert settings.memory_evidence_hot_exchanges == 10_000
     assert settings.memory_retrieval_final_limit == 10
     assert settings.memory_recall_token_budget == 2000
     assert settings.memory_intent_gate_enabled is True
     assert settings.memory_intent_gate_model is None
     assert settings.memory_intent_gate_timeout_seconds == 5
+
+
+def test_settings_accepts_five_minute_consolidation_timeout(tmp_path, monkeypatch):
+    monkeypatch.setenv("SILICONFLOW_API_KEY", "test-key")
+    monkeypatch.setenv("SILICONFLOW_MODEL", "test-model")
+    monkeypatch.setenv("GUGUGAGA_MEMORY_CONSOLIDATION_TIMEOUT", "300")
+    monkeypatch.delenv("GUGUGAGA_MEMORY_CONSOLIDATION_LEASE", raising=False)
+
+    settings = Settings.from_env(tmp_path)
+
+    assert settings.memory_consolidation_timeout_seconds == 300
+    assert settings.memory_consolidation_lease_seconds > 300
+
+
+@pytest.mark.parametrize("timeout,lease", [("301", "600"), ("300", "300")])
+def test_settings_rejects_invalid_timeout_or_short_lease(tmp_path, monkeypatch, timeout, lease):
+    monkeypatch.setenv("SILICONFLOW_API_KEY", "test-key")
+    monkeypatch.setenv("SILICONFLOW_MODEL", "test-model")
+    monkeypatch.setenv("GUGUGAGA_MEMORY_CONSOLIDATION_TIMEOUT", timeout)
+    monkeypatch.setenv("GUGUGAGA_MEMORY_CONSOLIDATION_LEASE", lease)
+
+    with pytest.raises(ValueError, match="GUGUGAGA_MEMORY_CONSOLIDATION_"):
+        Settings.from_env(tmp_path)
 
 
 def test_settings_reads_memory_intent_gate_configuration(tmp_path, monkeypatch):

@@ -105,7 +105,7 @@ class Settings:
     memory_consolidation_enabled: bool = True
     memory_consolidation_exchange_threshold: int = 6
     memory_consolidation_model: str | None = None
-    memory_consolidation_timeout_seconds: int = 30
+    memory_consolidation_timeout_seconds: int = 300
     memory_consolidation_lease_seconds: int = 600
     memory_consolidation_max_facts: int = 10
     memory_consolidation_min_importance: float = 0.8
@@ -147,7 +147,7 @@ class Settings:
         for path in paths.values():
             path.mkdir(parents=True, exist_ok=True)
         threshold = int(os.getenv("GUGUGAGA_MEMORY_CONSOLIDATION_EXCHANGES", "6"))
-        timeout_seconds = int(os.getenv("GUGUGAGA_MEMORY_CONSOLIDATION_TIMEOUT", "90"))
+        timeout_seconds = int(os.getenv("GUGUGAGA_MEMORY_CONSOLIDATION_TIMEOUT", "300"))
         lease_seconds = int(os.getenv("GUGUGAGA_MEMORY_CONSOLIDATION_LEASE", "600"))
         max_facts = int(os.getenv("GUGUGAGA_MEMORY_CONSOLIDATION_MAX_FACTS", "10"))
         min_importance = float(
@@ -173,8 +173,8 @@ class Settings:
         min_score = float(os.getenv("GUGUGAGA_MEMORY_RETRIEVAL_MIN_SCORE", "0.20"))
         if not 1 <= threshold <= 100:
             raise ValueError("GUGUGAGA_MEMORY_CONSOLIDATION_EXCHANGES must be 1-100")
-        if not 1 <= timeout_seconds <= 120:
-            raise ValueError("GUGUGAGA_MEMORY_CONSOLIDATION_TIMEOUT must be 1-120")
+        if not 1 <= timeout_seconds <= 300:
+            raise ValueError("GUGUGAGA_MEMORY_CONSOLIDATION_TIMEOUT must be 1-300")
         if lease_seconds <= timeout_seconds:
             raise ValueError("GUGUGAGA_MEMORY_CONSOLIDATION_LEASE must exceed timeout")
         if not 0 <= max_facts <= 20:

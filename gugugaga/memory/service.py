@@ -5,11 +5,16 @@ import queue
 import re
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from ..observability import notify, record_llm_call
-from .models import Batch, ConsolidationResult, RecallItem, RecallResult, SaveNoteResult
+from .models import Batch, BatchConflictReview, ConsolidationResult, FactCandidate, RecallItem, RecallResult, SaveNoteResult
+from .conflicts import (
+    BATCH_CONFLICT_SYSTEM, RELATION_SYSTEM, RELEVANCE_SYSTEM, lexical_relevant_conflicts,
+    parse_batch_conflicts, parse_relations, parse_relevant_ids, render_pending_conflicts,
+)
 from .repository import MemoryRepository
 from .retrieval import (
     classify_memory_query,
@@ -23,6 +28,7 @@ from .validation import (
     MemoryValidationError,
     parse_consolidation_result,
     redact_credentials,
+    fact_hash,
     validate_fact,
 )
 
@@ -162,7 +168,7 @@ class MemoryService:
         consolidation_enabled: bool = True,
         threshold: int = 6,
         model: str | None = None,
-        timeout_seconds: int = 30,
+        timeout_seconds: int = 300,
         lease_seconds: int = 600,
         max_facts: int = 10,
         min_importance: float = 0.8,
@@ -252,19 +258,175 @@ class MemoryService:
             self._thread.start()
             self._wake.set()
 
+    def _structured_provider(self, timeout_seconds: float, model: str | None) -> Any:
+        """Bound background calls independently of the foreground provider."""
+        with_timeout = getattr(self.provider, "with_timeout", None)
+        if not callable(with_timeout):
+            return self.provider
+        effective_model = model or getattr(getattr(self.provider, "settings", None), "model", "")
+        # GLM-5.3 is a reasoning-only model. Its low effort setting is suited to
+        # these short JSON tasks; do not disable thinking or alter chat calls.
+        if str(effective_model).rsplit("/", 1)[-1].casefold() == "glm-5.3":
+            return with_timeout(timeout_seconds, reasoning_effort="low")
+        return with_timeout(timeout_seconds)
+
+    def _conflict_call(
+        self, system: str, payload: dict[str, Any], *, call_type: str, max_tokens: int,
+        deadline: float | None = None,
+    ) -> str:
+        outcomes: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+        timeout = self.timeout_seconds if call_type in {
+            "memory_conflict_review", "memory_batch_conflict_review",
+        } else self.intent_gate_timeout_seconds
+        if deadline is not None:
+            timeout = min(timeout, deadline - time.monotonic())
+            if timeout <= 0:
+                raise TimeoutError("conflict_review_timeout")
+        model = self.intent_gate_model or self.model
+
+        def call() -> None:
+            try:
+                response = record_llm_call(
+                    self._structured_provider(timeout, model), model=model,
+                    system=system,
+                    messages=[{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+                    tools=[], max_tokens=max_tokens, call_type=call_type,
+                )
+                outcomes.put_nowait((True, response))
+            except Exception as error:
+                outcomes.put_nowait((False, error))
+
+        threading.Thread(target=call, name=f"gugugaga-{call_type}", daemon=True).start()
+        try:
+            succeeded, response = outcomes.get(timeout=timeout)
+        except queue.Empty as error:
+            raise TimeoutError("conflict_review_timeout") from error
+        if not succeeded:
+            raise RuntimeError("conflict_review_failed") from response
+        if getattr(response, "stop_reason", None) == "max_tokens":
+            raise MemoryValidationError(
+                "output_truncated", "Conflict review reached its token limit; incomplete review was not saved"
+            )
+        return _response_text(response).strip()
+
+    def _review_fact(
+        self, fact: FactCandidate, *, projected: list[dict[str, Any]] | None = None,
+        source_exchanges: str = "", deadline: float | None = None,
+    ) -> FactCandidate:
+        stored = self.repository.conflict_candidates(fact.subject, fact.content, limit=20)
+        snapshot = tuple((str(item["id"]), str(item["content"]), str(item["status"])) for item in stored)
+        candidates = [*stored, *(projected or [])]
+        digest = fact_hash(fact.subject, fact.content)
+        identical = [item for item in candidates if fact_hash(str(item["subject"]), str(item["content"])) == digest]
+        if identical:
+            # The repository returns the existing pending conflict for a
+            # duplicate quarantined anchor; do not create a self-conflict.
+            return replace(fact, reviewed_candidates=snapshot)
+        if not candidates:
+            return replace(fact, reviewed_candidates=snapshot)
+        raw = self._conflict_call(
+            RELATION_SYSTEM,
+            {"candidate": {"subject": fact.subject, "content": fact.content},
+             "existing": candidates, "source_exchanges": source_exchanges[:24_000]},
+            call_type="memory_conflict_review", max_tokens=2200, deadline=deadline,
+        )
+        conflict_ids, reason = parse_relations(raw, candidates)
+        return replace(fact, conflict_ids=conflict_ids, conflict_reason=reason,
+                       reviewed_candidates=snapshot)
+
+    def _review_batch_conflicts(
+        self, batch: Batch, *, deadline: float | None = None,
+    ) -> BatchConflictReview:
+        # Admission may return no facts precisely because the user supplied
+        # inconsistent versions. Review the source independently so that an
+        # older stored version cannot remain trusted for that reason alone.
+        exchanges = tuple(replace(
+            item, user_content=redact_credentials(item.user_content),
+            assistant_content=redact_credentials(item.assistant_content),
+        ) for item in batch.exchanges)
+        query = "\n".join(item.user_content for item in exchanges)
+        candidates = self.repository.conflict_candidates("", query, limit=20, include_unmatched=True)
+        snapshot = tuple((str(item["id"]), str(item["content"]), str(item["status"]))
+                         for item in candidates)
+        conflicts = ()
+        if candidates:
+            raw = self._conflict_call(
+                BATCH_CONFLICT_SYSTEM,
+                {"existing": candidates, "exchanges": [
+                    {"turn_id": item.turn_id, "completed_at": item.completed_at,
+                     "user": item.user_content, "assistant": item.assistant_content}
+                    for item in exchanges
+                ]},
+                call_type="memory_batch_conflict_review", max_tokens=4000, deadline=deadline,
+            )
+            conflicts = parse_batch_conflicts(raw, candidates=candidates, exchanges=exchanges)
+        notify("memory", {
+            "action": "batch_conflict_review", "batch_id": batch.id,
+            "status": "complete", "exchanges_reviewed": len(exchanges) if candidates else 0,
+            "existing_candidates": len(candidates), "conflicts_proposed": len(conflicts),
+        })
+        return BatchConflictReview(query=query, reviewed_candidates=snapshot, conflicts=conflicts)
+
+    def _review_consolidation(
+        self, result: ConsolidationResult, batch: Batch, *, deadline: float | None = None,
+    ) -> ConsolidationResult:
+        conflict_review = self._review_batch_conflicts(batch, deadline=deadline)
+        reviewed: list[FactCandidate] = []
+        projected: list[dict[str, Any]] = []
+        evidence = self._batch_prompt(batch)
+        for index, fact in enumerate(result.facts):
+            item = self._review_fact(fact, projected=projected, source_exchanges=evidence, deadline=deadline)
+            reviewed.append(item)
+            if not item.conflict_ids:
+                projected.append({"id": f"@batch:{index}", "subject": item.subject,
+                                  "content": item.content, "status": "active"})
+        return replace(result, facts=tuple(reviewed), conflict_review=conflict_review)
+
+    def _pending_for_query(self, query: str) -> list[dict[str, Any]]:
+        pending = self.repository.list_conflicts(status="pending", limit=100)
+        if not pending:
+            return []
+        # Bound the model input, preferring lexical matches without requiring
+        # literal overlap ('near my home' can depend on a residence fact).
+        matched = lexical_relevant_conflicts(query, pending)
+        ordered = matched + [item for item in pending if item not in matched]
+        candidates = ordered[:20]
+        try:
+            raw = self._conflict_call(
+                RELEVANCE_SYSTEM,
+                {"input": query, "conflicts": [
+                    {key: str(item.get(key) or "")[:1000] for key in (
+                        "id", "existing_subject", "existing_content", "candidate_subject", "candidate_content")}
+                    for item in candidates]},
+                call_type="memory_conflict_relevance", max_tokens=400,
+            )
+            relevant = parse_relevant_ids(raw, candidates)
+            return [item for item in candidates if str(item["id"]) in relevant]
+        except Exception:
+            notify("memory", {"action": "conflict_relevance", "status": "rule_fallback"})
+            return matched
+
     def save_note(self, *, subject: Any, content: Any, turn_id: str | None) -> SaveNoteResult:
         if not self.enabled or not self.explicit_enabled:
             return SaveNoteResult("rejected", error_code="explicit_memory_disabled")
         try:
             clean_subject, clean_content = validate_fact(subject, content)
-            result = self.repository.save_fact(
-                subject=clean_subject,
-                content=clean_content,
-                source="explicit",
-                turn_id=turn_id,
-            )
+            for attempt in range(2):
+                reviewed = self._review_fact(FactCandidate(clean_subject, clean_content))
+                try:
+                    result = self.repository.save_reviewed_fact(
+                        subject=clean_subject, content=clean_content, source="explicit", turn_id=turn_id,
+                        conflict_ids=reviewed.conflict_ids, reason=reviewed.conflict_reason,
+                        reviewed_candidates=reviewed.reviewed_candidates,
+                    )
+                    break
+                except RuntimeError as error:
+                    if str(error) != "memory_review_stale" or attempt:
+                        raise
         except MemoryValidationError as error:
             result = SaveNoteResult("rejected", error_code=error.code)
+        except (RuntimeError, TimeoutError) as error:
+            result = SaveNoteResult("failed", error_code=str(error)[:100])
         except Exception:
             result = SaveNoteResult("failed", error_code="storage_failed")
         notify(
@@ -276,7 +438,7 @@ class MemoryService:
                 "error_code": result.error_code,
             },
         )
-        if result.status in {"added", "duplicate"}:
+        if result.status in {"added", "duplicate", "pending"}:
             self._wake.set()
         return result
 
@@ -320,7 +482,7 @@ class MemoryService:
         def call_provider() -> None:
             try:
                 response = record_llm_call(
-                    self.provider,
+                    self._structured_provider(self.timeout_seconds, self.model),
                     model=self.model,
                     system=_CONSOLIDATION_SYSTEM,
                     messages=[{"role": "user", "content": self._batch_prompt(batch)}],
@@ -345,13 +507,24 @@ class MemoryService:
         if status == "error":
             raise value
         response = value
-        return parse_consolidation_result(
+        if getattr(response, "stop_reason", None) == "max_tokens":
+            raise MemoryValidationError(
+                "output_truncated", "Model output reached its token limit; incomplete memory output was not saved"
+            )
+        admission_stats: dict[str, int] = {}
+        result = parse_consolidation_result(
             _response_text(response),
             max_facts=self.max_facts,
             min_importance=self.min_importance,
             max_episodes=self.max_episodes,
             episode_min_importance=self.episode_min_importance,
+            admission_stats=admission_stats,
         )
+        notify("memory", {
+            "action": "consolidation_admission", "batch_id": batch.id,
+            "status": "complete", **admission_stats,
+        })
+        return result
 
     @staticmethod
     def _retry_delay(attempt_count: int) -> int:
@@ -381,11 +554,13 @@ class MemoryService:
             )
             try:
                 result = self._consolidate(batch)
+                result = self._review_consolidation(result, batch, deadline=started + self.timeout_seconds)
                 counts = self.repository.commit_batch(batch, result)
             except MemoryValidationError as error:
                 self.repository.release_failed_batch(
                     batch.id,
                     error_code=error.code,
+                    error_detail=str(error),
                     retry_seconds=self._retry_delay(batch.attempt_count),
                 )
                 notify(
@@ -395,6 +570,7 @@ class MemoryService:
                         "batch_id": batch.id,
                         "status": "failed",
                         "error_code": error.code,
+                        "error_detail": str(error)[:500],
                         "attempt_count": batch.attempt_count,
                     },
                 )
@@ -446,6 +622,7 @@ class MemoryService:
                     "attempt_count": batch.attempt_count,
                     "facts_added": counts["facts_added"],
                     "facts_duplicate": counts["facts_duplicate"],
+                    "facts_pending": counts["facts_pending"],
                     "episodes_added": counts["episodes_added"],
                     "latency_ms": round((time.monotonic() - started) * 1000),
                 },
@@ -553,7 +730,9 @@ class MemoryService:
         def call_provider() -> None:
             try:
                 response = record_llm_call(
-                    self.provider,
+                    self._structured_provider(
+                        self.intent_gate_timeout_seconds, self.intent_gate_model or self.model
+                    ),
                     model=self.intent_gate_model or self.model,
                     system=_MEMORY_INTENT_SYSTEM,
                     messages=[
@@ -637,10 +816,36 @@ class MemoryService:
         """Compatibility wrapper for callers that only need rendered memory."""
         return self.recall_for_turn(query).content
 
+    def refresh_recall_state(self, recall: RecallResult) -> RecallResult:
+        """Recheck turn-cached memory after writes, without another model call."""
+        if not recall.items and not recall.pending_conflicts:
+            return recall
+        valid = self.repository.filter_conflicted_candidates(item.as_dict() for item in recall.items)
+        keys = {str(item["memory_key"]) for item in valid}
+        items = tuple(item for item in recall.items if item.memory_key in keys)
+        pending = []
+        for item in recall.pending_conflicts:
+            current = self.repository.get_conflict(str(item["id"]))
+            if current and current["status"] == "pending":
+                pending.append(current)
+        if items == recall.items and tuple(pending) == recall.pending_conflicts:
+            return recall
+        pending_text, pending_items = render_pending_conflicts(pending, self.recall_token_budget * 2)
+        available = max(0, self.recall_token_budget * 4 - len(pending_text) - (2 if pending_text else 0))
+        rendered = render_candidates(valid)[:available]
+        content = "\n\n".join(part for part in (rendered, pending_text) if part)
+        names = {"fact": "semantic", "episode": "episodic", "chat": "evidence"}
+        return replace(recall, content=content, decision="retrieve" if content else "skip",
+                       hit_count=len(items), items=items,
+                       kinds=tuple(dict.fromkeys(names[item.kind] for item in items if item.kind in names)),
+                       memory_keys=tuple(item.memory_key for item in items), pending_conflicts=pending_items)
+
     def recall_for_turn(
         self, query: str, *, trace: dict[str, Any] | None = None
     ) -> RecallResult:
         """Run Pre-Gate, hybrid retrieval, reranking, and Post-Gate once."""
+        pending_text = ""
+        pending_items: tuple[dict[str, Any], ...] = ()
         if trace is not None:
             trace.clear()
             trace.update({
@@ -659,6 +864,12 @@ class MemoryService:
             })
 
         def finish(result: RecallResult) -> RecallResult:
+            if pending_text:
+                result = replace(
+                    result, content="\n\n".join(part for part in (result.content, pending_text) if part),
+                    decision="retrieve", pending_conflicts=pending_items,
+                    reason=result.reason if result.content else "pending_conflict",
+                )
             if trace is not None:
                 trace["final"] = {
                     "decision": result.decision,
@@ -673,6 +884,7 @@ class MemoryService:
                     "items": [item.as_dict() for item in result.items],
                     "candidates": trace["stages"].get("render", {}).get("candidates", []),
                     "content": result.content,
+                    "pending_conflicts": list(result.pending_conflicts),
                 }
             return result
 
@@ -723,6 +935,12 @@ class MemoryService:
             )
             return finish(result)
         direct_reference = bool(_DIRECT_MEMORY_REFERENCE.search(cleaned_query))
+        try:
+            pending_text, pending_items = render_pending_conflicts(
+                self._pending_for_query(cleaned_query), max(0, self.recall_token_budget * 2),
+            )
+        except Exception:
+            notify("memory", {"action": "pending_conflicts", "status": "failed"})
         if direct_reference:
             route_source = "hard_rule"
             notify(
@@ -867,7 +1085,7 @@ class MemoryService:
                 return finish(result)
             # Render only complete candidates when possible. The character
             # ceiling is deterministic because tokenization is outside this boundary.
-            character_budget = self.recall_token_budget * 4
+            character_budget = max(0, self.recall_token_budget * 4 - len(pending_text) - (2 if pending_text else 0))
             rendered = render_candidates(selected)
             if trace is not None:
                 trace["stages"]["render"] = {
@@ -922,6 +1140,7 @@ class MemoryService:
                     },
                     relevance_score=float(item.get("relevance_score") or 0.0),
                     final_score=float(item.get("final_score") or 0.0),
+                    source_turn_ids=tuple(str(value) for value in item.get("source_turn_ids") or ()),
                 )
                 for item in selected
             )
@@ -993,6 +1212,25 @@ class MemoryService:
             notify("memory", {"action": "recall", "status": "failed"})
             return finish(RecallResult(reason="retrieval_failed"))
 
+    def list_conflicts(self, status: str = "pending", limit: int = 100) -> list[dict[str, Any]]:
+        return self.repository.list_conflicts(status=status, limit=limit)
+
+    def get_conflict(self, conflict_id: str) -> dict[str, Any] | None:
+        return self.repository.get_conflict(conflict_id)
+
+    def resolve_conflict(
+        self, conflict_id: str, resolution: str, *, content: str | None = None,
+        expected_existing_fact_id: str | None = None,
+    ) -> dict[str, Any]:
+        result = self.repository.resolve_conflict(
+            conflict_id, resolution, content=content,
+            expected_existing_fact_id=expected_existing_fact_id,
+        )
+        self._wake.set()
+        notify("memory", {"action": "conflict_resolved", "conflict_id": conflict_id,
+                          "resolution": resolution, "status": result.get("status")})
+        return result
+
     def update_fact(self, fact_id: str, content: Any) -> SaveNoteResult:
         existing = self.repository.get_memory(fact_id)
         if existing is None or existing.get("kind") != "fact":
@@ -1036,7 +1274,9 @@ class MemoryService:
         return changed
 
     def status(self) -> dict[str, Any]:
-        value = self.repository.status()
+        value = self.repository.status(consolidation_threshold=self.threshold)
+        if not self.enabled or not self.consolidation_enabled:
+            value["consolidation_state"] = "disabled"
         jobs = value.get("index_jobs") or {}
         if not self.embedding_model:
             vector_state = "disabled"
@@ -1049,6 +1289,7 @@ class MemoryService:
         value.update(
             {
                 "intent_gate_enabled": self.intent_gate_enabled,
+                "consolidation_timeout_seconds": self.timeout_seconds,
                 "vector_enabled": bool(self.embedding_model),
                 "vector_state": vector_state,
                 "evidence_hot_limit": self.evidence_hot_exchanges,

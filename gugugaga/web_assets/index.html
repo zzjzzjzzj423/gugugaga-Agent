@@ -162,6 +162,15 @@
           <label class="search-field"><span class="sr-only">搜索记忆</span><input id="memory-search" type="search" placeholder="搜索记忆…"><span>⌕</span></label>
         </header>
 
+        <section class="memory-conflicts-panel" aria-labelledby="memory-conflicts-title">
+          <div class="panel-heading compact">
+            <div><h2 id="memory-conflicts-title">待确认的记忆 <span id="memory-conflicts-count">0</span></h2><p>发现可能矛盾的事实。选择处理方式会更新长期记忆；稍后处理不会更改记忆。</p></div>
+            <button id="memory-conflicts-refresh" class="memory-conflict-button" type="button">刷新</button>
+          </div>
+          <p id="memory-conflicts-status" class="memory-conflicts-status" role="status" aria-live="polite"></p>
+          <div id="memory-conflicts-list" class="memory-conflicts-list"></div>
+        </section>
+
         <div class="memory-types" role="tablist" aria-label="记忆类型">
           <button class="memory-type is-active" type="button" data-memory-kind="procedural" role="tab" aria-selected="true"><span class="type-icon purple">P</span><span><strong>Procedural</strong><small>程序性记忆 · 怎么做</small></span><b id="count-procedural">0</b></button>
           <button class="memory-type" type="button" data-memory-kind="semantic" role="tab" aria-selected="false"><span class="type-icon teal">S</span><span><strong>Semantic</strong><small>语义记忆 · 知道什么</small></span><b id="count-semantic">0</b></button>
@@ -237,6 +246,10 @@
         <div id="session-list" class="session-list"></div>
       </section>
       <div id="history-mode-banner" class="history-mode-banner" hidden><span>正在查看历史对话</span><div><button id="resume-session-button" class="resume-session-button" type="button">从这里继续</button><button id="back-current-button" type="button">返回当前</button></div></div>
+      <div id="memory-conflict-notice" class="memory-conflict-notice" hidden>
+        <span id="memory-conflict-notice-text" role="status" aria-live="polite"></span>
+        <button id="memory-conflict-notice-view" type="button">查看</button>
+      </div>
       <div id="chat-messages" class="chat-messages" aria-live="polite"></div>
       <div class="typing-state" id="typing-state" hidden><span class="typing-dots"><i></i><i></i><i></i></span><span id="typing-label">Agent 正在工作</span></div>
       <form id="chat-form" class="composer">

@@ -179,12 +179,7 @@ class SourceRuntime:
                 query = message["content"]
                 break
         recalled = self.memory_service.recall_for_turn(query)
-        if recalled.should_inject:
-            state["memories"] = "\n\n".join(
-                value
-                for value in (state.get("memories", ""), recalled.content)
-                if value
-            )
+        state["memories"] = recalled.content if recalled.should_inject else ""
         return {
             **state,
             "workspace": str(self.context_coordinator.workspace),
@@ -294,11 +289,7 @@ class SourceRuntime:
                     memory_query = query or inbox_prompt
                     recalled = self.memory_service.recall_for_turn(memory_query)
                     self.last_memory_recall = recalled
-                    if recalled.should_inject:
-                        legacy = self.context.get("memories", "")
-                        self.context["memories"] = "\n\n".join(
-                            value for value in (legacy, recalled.content) if value
-                        )
+                    self.context["memories"] = recalled.content if recalled.should_inject else ""
                     try:
                         agent_loop(
                             self.messages,
@@ -320,11 +311,11 @@ class SourceRuntime:
                         self.messages,
                         self.context_coordinator.memory_dir / "MEMORY.md",
                     )
-                    if recalled.should_inject:
-                        legacy = self.context.get("memories", "")
-                        self.context["memories"] = "\n\n".join(
-                            value for value in (legacy, recalled.content) if value
-                        )
+                    refresh = getattr(self.memory_service, "refresh_recall_state", None)
+                    if callable(refresh):
+                        recalled = refresh(recalled)
+                    self.last_memory_recall = recalled
+                    self.context["memories"] = recalled.content if recalled.should_inject else ""
                     reply = self._turn_text(self.messages, turn_start)
                 turn.finish(
                     reply,
@@ -657,11 +648,13 @@ def agent_loop(
             context_coordinator.memory_dir / "MEMORY.md",
         )
         if memory_service is not None:
+            refresh = getattr(memory_service, "refresh_recall_state", None)
+            if memory_recall is not None and callable(refresh):
+                memory_recall = refresh(memory_recall)
             if memory_recall is not None and memory_recall.should_inject:
-                legacy = context.get("memories", "")
-                context["memories"] = "\n\n".join(
-                    value for value in (legacy, memory_recall.content) if value
-                )
+                # The SQLite service owns validity. A legacy MEMORY.md has no
+                # lifecycle metadata and must not bypass quarantine filtering.
+                context["memories"] = memory_recall.content
             else:
                 context["memories"] = ""
         system = assemble_system_prompt(context)

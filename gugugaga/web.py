@@ -1444,6 +1444,36 @@ class DashboardApplication:
     def pending_permissions(self) -> dict[str, Any]:
         return {"items": self.permissions.pending()}
 
+    def memory_conflicts(self, status: str = "pending", limit: int = 100) -> dict[str, Any]:
+        if not isinstance(status, str) or not status or len(status) > 40:
+            raise ValueError("valid conflict status is required")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        return {"items": self.store.repository.list_conflicts(status=status, limit=limit)}
+
+    def resolve_memory_conflict(self, conflict_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        resolution = payload.get("resolution")
+        if not isinstance(resolution, str) or resolution not in {"existing", "candidate", "custom", "neither"}:
+            raise ValueError("resolution must be existing, candidate, custom, or neither")
+        expected_fact_id = payload.get("expected_existing_fact_id")
+        if not isinstance(expected_fact_id, str) or not expected_fact_id.strip():
+            raise ValueError("expected_existing_fact_id is required; refresh the conflict first")
+        content = payload.get("content")
+        if resolution == "custom":
+            if not isinstance(content, str) or not content.strip():
+                raise ValueError("custom resolution requires non-empty content")
+            content = content.strip()
+        elif content is not None:
+            raise ValueError("content is only supported for a custom resolution")
+        item = self.store.repository.resolve_conflict(
+            conflict_id,
+            resolution,
+            content=content,
+            expected_existing_fact_id=expected_fact_id,
+        )
+        self.events.publish({"type": "memory_conflict", "action": "resolved", "conflict_id": conflict_id})
+        return item
+
     def record_memory_feedback(self, payload: dict[str, Any]) -> dict[str, Any]:
         session_id = str(payload.get("session_id") or "").strip()
         turn_id = str(payload.get("turn_id") or "").strip()
@@ -1847,6 +1877,11 @@ def _handler_factory(application: DashboardApplication):
                     kind = query.get("kind", ["semantic"])[0]
                     search = query.get("q", [None])[0]
                     self._json(application.store.memories(kind, search))
+                elif parsed.path == "/api/memory/conflicts":
+                    self._json(application.memory_conflicts(
+                        status=query.get("status", ["pending"])[0],
+                        limit=int(query.get("limit", ["100"])[0]),
+                    ))
                 elif parsed.path == "/api/tasks":
                     self._json(application.store.task_system())
                 elif parsed.path == "/api/team/settings":
@@ -1944,6 +1979,10 @@ def _handler_factory(application: DashboardApplication):
                 r"/api/team/agents/([A-Za-z0-9][A-Za-z0-9_-]{0,63})/(stop|restart)",
                 parsed.path,
             )
+            conflict_action = re.fullmatch(
+                r"/api/memory/conflicts/([A-Za-z0-9][A-Za-z0-9_-]{0,199})/resolve",
+                parsed.path,
+            )
             if parsed.path not in {
                 "/api/chat",
                 "/api/config",
@@ -1953,7 +1992,7 @@ def _handler_factory(application: DashboardApplication):
                 "/api/memories/feedback",
                 "/api/permissions/review",
                 "/api/interactions",
-            } and task_action is None and agent_action is None:
+            } and task_action is None and agent_action is None and conflict_action is None:
                 self._error(HTTPStatus.NOT_FOUND, "not found")
                 return
             try:
@@ -1966,6 +2005,7 @@ def _handler_factory(application: DashboardApplication):
                     }
                     or task_action
                     or agent_action
+                    or conflict_action
                 ):
                     if not self._is_loopback():
                         self._error(
@@ -1973,6 +2013,18 @@ def _handler_factory(application: DashboardApplication):
                             "configuration and permission changes require a local connection",
                         )
                         return
+                if conflict_action is not None:
+                    origin = self.headers.get("Origin")
+                    if origin and (
+                        urlparse(origin).netloc != self.headers.get("Host")
+                        or urlparse(origin).scheme not in {"http", "https"}
+                    ):
+                        self._error(HTTPStatus.FORBIDDEN, "memory changes do not allow cross-site requests")
+                        return
+                    self._json(application.resolve_memory_conflict(
+                        conflict_action.group(1), self._read_json_body(),
+                    ))
+                    return
                 if task_action is not None:
                     payload = self._read_json_body(allow_empty=True)
                     task_id, action = task_action.groups()

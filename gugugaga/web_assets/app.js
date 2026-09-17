@@ -3,11 +3,20 @@
     page: 'overview',
     memoryKind: 'procedural',
     memoryItems: [],
+    memoryConflictSubmitting: new Set(),
+    memoryConflictLoadSequence: 0,
+    memoryConflictNeedsRefresh: false,
+    pendingMemoryConflicts: null,
     table: null,
     tableView: 'rows',
     eventId: 0,
     eventQueue: [],
     eventPlayback: false,
+    overviewLoadSequence: 0,
+    overviewError: null,
+    runtimeStatusText: '等待输入',
+    runtimeStageSequence: 0,
+    backgroundRefreshQueued: false,
     currentStage: null,
     currentSessionId: null,
     viewingSessionId: null,
@@ -142,7 +151,12 @@
 
     if (page === 'overview') loadOverview();
     if (page === 'tasks') loadTasks();
-    if (page === 'memory') loadMemories();
+    if (page === 'memory') {
+      loadMemories();
+      // View transitions update state.page asynchronously. Wait until the page
+      // is selected before the conflict loader checks whether Memory is visible.
+      pageTransition.then(() => loadMemoryConflicts());
+    }
     if (page === 'database') loadTables();
     window.MemoryEvaluation?.onPageChange(page, pageTransition);
   }
@@ -844,10 +858,22 @@
   });
 
   const backgroundStateLabels = {
-    idle: 'Idle', running: 'Running', failed: 'Failed',
-    retrying: 'Retry pending',
-    disabled: 'Disabled', indexing: 'Indexing', synced: 'Synced', failed: 'Failed',
+    idle: '无待整理', waiting: '等待积累', queued: '等待执行', running: '正在整合',
+    retrying: '等待重试', disabled: '已关闭', indexing: '正在同步',
+    synced: '已同步现有记忆', failed: '失败',
   };
+
+  function renderRuntimeStatus() {
+    const target = $('#runtime-label');
+    if (!target) return;
+    const error = state.overviewError;
+    target.textContent = error
+      ? (error.network ? '连接暂时中断 · 正在重试' : '概览获取失败 · 正在重试')
+      : state.runtimeStatusText;
+    const container = target.parentElement;
+    container?.classList.toggle('is-error', Boolean(error) || state.runtimeStatusText === '运行失败');
+    if (container) container.title = error ? error.message : '';
+  }
 
   function setBackgroundState(kind, value) {
     const id = kind === 'consolidation' ? '#consolidation-state' : '#vector-index-state';
@@ -856,39 +882,119 @@
     const normalized = String(value || (kind === 'consolidation' ? 'idle' : 'disabled')).toLowerCase();
     target.textContent = backgroundStateLabels[normalized] || normalized;
     const container = target.parentElement;
-    container?.classList.toggle('is-active', normalized === 'running' || normalized === 'indexing' || normalized === 'retrying');
-    container?.classList.toggle('is-error', normalized === 'failed');
-    container?.classList.toggle('is-disabled', normalized === 'disabled');
+    container?.classList.toggle('is-active', normalized === 'running' || normalized === 'indexing');
+    container?.classList.toggle('is-error', normalized === 'failed' || normalized === 'retrying');
+    container?.classList.toggle('is-disabled', normalized === 'disabled' || normalized === 'waiting' || normalized === 'queued');
+    if (container) container.title = '';
+  }
+
+  function consolidationErrorLabel(code) {
+    switch (code) {
+      case 'batch_conflict_review_invalid': return '冲突核验格式错误';
+      case 'batch_conflict_evidence_invalid': return '冲突核验依据无效';
+      case 'batch_conflict_subject_invalid': return '冲突核验主题无效';
+      case 'conflict_review_failed': return '冲突核验调用失败';
+      case 'conflict_review_timeout': return '冲突核验超时';
+      case 'memory_review_stale': return '记忆发生变化，需重新核验';
+    }
+    if (String(code || '').toLowerCase().includes('timeout')) return '整合超时';
+    if (code === 'provider_failed') return '模型调用失败';
+    if (code === 'output_truncated') return '模型输出被截断';
+    if (String(code || '').includes('invalid')) return '模型返回格式错误';
+    return code ? `整合失败（${code}）` : '整合失败';
+  }
+
+  function renderConsolidationState(memory = {}) {
+    const value = String(memory.consolidation_state || 'idle').toLowerCase();
+    setBackgroundState('consolidation', value);
+    const target = $('#consolidation-state');
+    if (!target) return;
+    const threshold = Number(memory.consolidation_threshold || 6);
+    const waiting = Number(memory.consolidation_waiting || 0);
+    const retryPending = Number(memory.consolidation_retry_pending || 0);
+    const ready = Number(memory.consolidation_ready || 0);
+    const consolidationFailure = memory.consolidation_failure || {};
+    const active = memory.consolidation_active_batch;
+    const lines = [];
+    if (value === 'waiting') {
+      lines.push(`等待积累 · ${waiting}/${threshold} 轮`);
+    } else if (value === 'queued') {
+      lines.push(`等待执行 · ${ready} 轮已就绪`);
+    } else if (value === 'running') {
+      lines.push(active
+        ? `正在整合 · ${Number(active.exchange_count || 0)} 轮 · 第 ${Number(active.attempt_count || 1)} 次尝试`
+        : '正在整合');
+      if (waiting) lines.push(`另有 ${waiting} 轮待处理`);
+    } else if (value === 'retrying' || value === 'failed') {
+      lines.push(`${consolidationErrorLabel(consolidationFailure.error_code)} · ${retryPending} 轮待重试`);
+      const attempts = Number(consolidationFailure.attempt_count || 0);
+      if (attempts) lines.push(`已尝试 ${attempts} 次`);
+      if (waiting) lines.push(`新增 ${waiting} 轮待处理`);
+    }
+    if (retryPending && value !== 'disabled') {
+      if (value !== 'retrying' && value !== 'failed') {
+        lines.push(`${consolidationErrorLabel(consolidationFailure.error_code)} · 另有 ${retryPending} 轮待重试`);
+        target.parentElement?.classList.add('is-error');
+      }
+      const retryAt = new Date(memory.consolidation_next_retry_at || '');
+      if (!Number.isNaN(retryAt.getTime())) {
+        lines.push(retryAt.getTime() <= Date.now()
+          ? '已到重试时间 · 等待后台执行'
+          : `预计 ${new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(retryAt)} 自动重试`);
+      } else {
+        lines.push('等待自动重试');
+      }
+    }
+    if (value !== 'disabled' && (value === 'retrying' || value === 'failed' || retryPending > 0)) {
+      const detail = typeof consolidationFailure.error_detail === 'string' ? consolidationFailure.error_detail.trim() : '';
+      if (detail) lines.push(`具体原因：${detail}`);
+    }
+    if (lines.length) target.textContent = lines.join('\n');
+    if (target.parentElement) target.parentElement.title = target.textContent;
+  }
+
+  function renderMemoryConflictNotice(memory = {}) {
+    const rawCount = Number(memory.pending_conflicts || 0);
+    const count = Number.isFinite(rawCount) ? Math.max(0, Math.floor(rawCount)) : 0;
+    if (count !== state.pendingMemoryConflicts) state.memoryConflictNeedsRefresh = true;
+    state.pendingMemoryConflicts = count;
+    const notice = $('#memory-conflict-notice');
+    if (!notice) return;
+    notice.hidden = count === 0;
+    $('#memory-conflict-notice-text').textContent = count ? `有 ${count} 条记忆冲突待确认` : '';
+  }
+
+  function scheduleBackgroundRefresh({ conflicts = false } = {}) {
+    if (conflicts) state.memoryConflictNeedsRefresh = true;
+    if (state.backgroundRefreshQueued) return;
+    state.backgroundRefreshQueued = true;
+    // Event batches may contain historical failures. Fetch current status once
+    // instead of replaying those failures behind the main-turn animation.
+    Promise.resolve().then(() => {
+      state.backgroundRefreshQueued = false;
+      return loadOverview();
+    });
   }
 
   async function loadOverview(sessionId = state.viewingSessionId || state.currentSessionId) {
+    const sequence = ++state.overviewLoadSequence;
     try {
       const query = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : '';
       const data = await api(`/api/overview${query}`);
+      if (sequence !== state.overviewLoadSequence) return;
+      state.overviewError = null;
+      renderRuntimeStatus();
       $('#metric-turn').textContent = `#${data.turn_count || 0}`;
       $('#metric-turn-time').textContent = data.last_turn_at ? `更新于 ${formatDate(data.last_turn_at)}` : '尚无记录';
       $('#metric-latency').textContent = Number.isFinite(data.last_latency_ms) ? `${(data.last_latency_ms / 1000).toFixed(1)}s` : '—';
       $('#metric-memory').textContent = data.memory_hits || 0;
       $('#metric-memory-total').textContent = `Fact ${Number(data.memory?.facts || 0)} · Episode ${Number(data.memory?.episodes || 0)} · Evidence Hot ${Number(data.memory?.evidence_hot || 0)} / Cold ${Number(data.memory?.evidence_cold || 0)}`;
-      const consolidationState = String(data.memory?.consolidation_state || 'idle').toLowerCase();
-      setBackgroundState('consolidation', consolidationState);
-      const consolidationTarget = $('#consolidation-state');
-      const consolidationPending = Number(data.memory?.pending || 0);
-      const consolidationFailure = data.memory?.last_failure || {};
-      if (consolidationTarget && consolidationState === 'retrying') {
-        consolidationTarget.textContent = `Retry pending · ${consolidationPending}`;
-      }
-      if (consolidationTarget) {
-        const error = consolidationFailure.error_code || '';
-        const attempts = Number(consolidationFailure.attempt_count || 0);
-        consolidationTarget.parentElement.title = error
-          ? `最近错误：${error} · 尝试 ${attempts} 次 · ${consolidationPending} 轮等待重试`
-          : `${consolidationPending} 轮等待整理`;
-      }
+      renderConsolidationState(data.memory);
+      renderMemoryConflictNotice(data.memory);
       setBackgroundState('vector', data.memory?.vector_state);
       const jobs = data.memory?.index_jobs || {};
       const vectorState = $('#vector-index-state');
-      if (vectorState) vectorState.parentElement.title = `${Number(data.memory?.indexed || 0)} indexed · ${Number(jobs.pending || 0)} pending · ${Number(jobs.failed || 0)} failed`;
+      if (vectorState) vectorState.parentElement.title = `仅表示现有记忆的向量索引状态；对话整合进度见左侧。已索引 ${Number(data.memory?.indexed || 0)} · 待处理 ${Number(jobs.pending || 0)} · 失败 ${Number(jobs.failed || 0)}`;
       const retrieval = data.retrieval || {};
       const strategy = retrieval.strategy && retrieval.strategy !== 'none'
         ? retrieval.strategy
@@ -901,8 +1007,15 @@
       updateContextModeControl();
       $('#sidebar-model').textContent = data.model || 'not configured';
       $('#chat-model').textContent = data.model || 'Agent';
+      if (state.page === 'memory' && state.memoryConflictNeedsRefresh) await loadMemoryConflicts({ background: true });
     } catch (error) {
-      $('#runtime-label').textContent = error.message;
+      if (sequence !== state.overviewLoadSequence) return;
+      const message = String(error?.message || '未知错误');
+      state.overviewError = {
+        message,
+        network: /failed to fetch|networkerror|network request failed|load failed/i.test(message),
+      };
+      renderRuntimeStatus();
     }
   }
 
@@ -920,6 +1033,9 @@
     $$('[data-stage]').forEach((node) => node.classList.remove('is-active', 'is-complete', 'is-error', 'is-skipped'));
     $$('[data-memory-stage]').forEach((node) => node.classList.remove('is-active'));
     state.currentStage = null;
+    state.runtimeStageSequence += 1;
+    state.runtimeStatusText = '等待输入';
+    renderRuntimeStatus();
   }
 
   function activateMemoryKinds(kinds = []) {
@@ -929,6 +1045,7 @@
   function activateStage(stage, status = 'active') {
     const nodes = $$('[data-stage]');
     if (stage === 'input') resetRuntimeGraph();
+    const sequence = ++state.runtimeStageSequence;
     const previous = state.currentStage ? $(`[data-stage="${state.currentStage}"]`) : null;
     if (previous && state.currentStage !== stage) {
       previous.classList.remove('is-active');
@@ -941,14 +1058,17 @@
       active.classList.toggle('is-error', status === 'error');
     }
     state.currentStage = stage;
-    $('#runtime-label').textContent = status === 'error' ? '运行失败' : `正在执行 · ${stageLabels[stage] || stage}`;
+    state.runtimeStatusText = status === 'error' ? '运行失败' : `正在执行 · ${stageLabels[stage] || stage}`;
+    renderRuntimeStatus();
     $('#event-chip').textContent = stageLabels[stage] || stage;
     $('#typing-label').textContent = stageLabels[stage] || 'Agent 正在工作';
     if (stage === 'reply' && status === 'complete') {
       setTimeout(() => {
+        if (sequence !== state.runtimeStageSequence || state.currentStage !== 'reply') return;
         nodes.forEach((node) => node.classList.remove('is-active'));
         state.currentStage = null;
-        $('#runtime-label').textContent = '等待输入';
+        state.runtimeStatusText = '等待输入';
+        renderRuntimeStatus();
         $('#event-chip').textContent = 'idle';
       }, 900);
     }
@@ -974,14 +1094,7 @@
       }
       else if (event.type === 'memory') {
         if (event.action === 'intent_gate' && event.status === 'active') stage = 'retrieval_gate';
-        else if (event.action === 'consolidate') {
-          const next = event.status === 'active' ? 'running' : event.status === 'failed' ? 'retrying' : 'idle';
-          return { action: 'background-state', kind: 'consolidation', value: next };
-        }
-        else if (event.action === 'index_outbox') {
-          const next = event.status === 'active' ? 'indexing' : event.status === 'failed' ? 'failed' : 'synced';
-          return { action: 'background-state', kind: 'vector', value: next };
-        }
+        else if (event.action === 'consolidate' || event.action === 'index_outbox') return { action: 'background-refresh' };
         else if (event.action === 'recall' && event.status === 'hit') return { action: 'memory-hit', memoryKinds: event.kinds || [] };
         else return null;
       }
@@ -1008,11 +1121,6 @@
           activateMemoryKinds(item.memoryKinds);
           continue;
         }
-        if (item.action === 'background-state') {
-          setBackgroundState(item.kind, item.value);
-          if (item.value !== 'running' && item.value !== 'indexing') loadOverview();
-          continue;
-        }
         if (!item.stage) continue;
         if (item.stage === 'retrieval_gate' && item.strategy && item.strategy !== 'none') {
           $('#retrieval-strategy').textContent = `Retrieval · ${item.strategy}`;
@@ -1029,6 +1137,15 @@
   }
 
   function enqueueEvent(event) {
+    const conflictChanged = event.type === 'memory_conflict' || (event.type === 'memory' && (
+      event.action === 'conflict_resolved'
+      || (event.action === 'save_note' && event.status === 'pending')
+      || (event.action === 'consolidate' && ['consolidated', 'success'].includes(event.status))
+    ));
+    if (conflictChanged) {
+      scheduleBackgroundRefresh({ conflicts: true });
+      return;
+    }
     if (['task_matching_requested', 'task_matching_updated', 'task_assignment', 'task', 'team_agent', 'team_agent_profile', 'team_settings'].includes(event.type)) {
       scheduleTaskRefresh();
     }
@@ -1050,6 +1167,10 @@
     }
     const item = normalizeEvent(event);
     if (!item) return;
+    if (item.action === 'background-refresh') {
+      scheduleBackgroundRefresh();
+      return;
+    }
     const previous = state.eventQueue[state.eventQueue.length - 1];
     if (previous && item.stage && previous.stage === item.stage && previous.status === item.status) return;
     state.eventQueue.push(item);
@@ -1069,6 +1190,165 @@
       }
     }
   }
+
+  function memoryConflictText(tag, className, value) {
+    const node = document.createElement(tag);
+    node.className = className;
+    node.textContent = value == null ? '' : String(value);
+    return node;
+  }
+
+  function syncMemoryConflictBusy() {
+    $$('.memory-conflict-card').forEach((card) => {
+      const busy = state.memoryConflictSubmitting.has(card.dataset.conflictId);
+      $$('button, textarea', card).forEach((control) => { control.disabled = busy; });
+      card.setAttribute('aria-busy', String(busy));
+    });
+    $('#memory-conflicts-refresh').disabled = state.memoryConflictSubmitting.size > 0;
+  }
+
+  function renderMemoryConflicts(items) {
+    const list = $('#memory-conflicts-list');
+    list.replaceChildren();
+    $('#memory-conflicts-count').textContent = String(items.length);
+    if (!items.length) {
+      list.append(memoryConflictText('p', 'memory-conflicts-empty', '目前没有待确认的记忆。'));
+      return;
+    }
+    items.forEach((item) => {
+      const card = document.createElement('details');
+      card.className = 'memory-conflict-card';
+      card.dataset.conflictId = item.id;
+      card.open = true;
+      const heading = document.createElement('summary');
+      heading.append(
+        memoryConflictText('strong', '', item.candidate_subject || item.existing_subject || '事实冲突'),
+        memoryConflictText('span', 'memory-conflict-badge', item.status === 'pending' ? '待确认' : item.status),
+      );
+      card.append(heading);
+      const pair = document.createElement('div'); pair.className = 'memory-conflict-pair';
+      const existing = document.createElement('section');
+      existing.append(
+        memoryConflictText('h3', '', '原记忆'),
+        memoryConflictText('p', 'memory-conflict-content', item.existing_content),
+        memoryConflictText('small', '', `主题：${item.existing_subject || '—'} · 事实 ID：${item.existing_fact_id || '—'}`),
+        memoryConflictText('small', '', `来源：${item.existing_source || '未提供原始来源'}`),
+        memoryConflictText('small', '', `对话轮次：${item.existing_source_turn_id || '—'} · 整理批次：${item.existing_source_batch_id || '—'}`),
+      );
+      const candidate = document.createElement('section');
+      candidate.append(
+        memoryConflictText('h3', '', '新候选记忆'),
+        memoryConflictText('p', 'memory-conflict-content', item.candidate_content),
+        memoryConflictText('small', '', `主题：${item.candidate_subject || '—'} · 来源：${item.source || '未提供'}`),
+        memoryConflictText('small', '', `对话轮次：${item.source_turn_id || '—'} · 整理批次：${item.source_batch_id || '—'}`),
+      );
+      pair.append(existing, candidate); card.append(pair);
+      card.append(memoryConflictText('p', 'memory-conflict-reason', `待确认原因：${item.reason || '这两条事实可能矛盾'} · ${formatDate(item.created_at)}`));
+      const feedback = memoryConflictText('p', 'memory-conflict-feedback', '');
+      feedback.setAttribute('role', 'status'); feedback.setAttribute('aria-live', 'polite');
+      const actions = document.createElement('div'); actions.className = 'memory-conflict-actions';
+      const custom = document.createElement('div'); custom.className = 'memory-conflict-custom'; custom.hidden = true;
+      const label = memoryConflictText('label', '', '修订后的长期记忆');
+      const content = document.createElement('textarea'); content.rows = 3;
+      content.placeholder = '写下应长期保留的准确事实，也可以注明适用条件或时间。';
+      label.append(content); custom.append(label);
+      const controls = [content];
+      const setBusy = (busy) => {
+        controls.forEach((control) => { control.disabled = busy; });
+        card.setAttribute('aria-busy', String(busy));
+        $('#memory-conflicts-refresh').disabled = state.memoryConflictSubmitting.size > 0;
+      };
+      const resolve = async (resolution) => {
+        if (state.memoryConflictSubmitting.has(item.id)) return;
+        const revised = content.value.trim();
+        if (resolution === 'custom' && !revised) {
+          feedback.textContent = '请先填写修订后的记忆。'; content.focus(); return;
+        }
+        state.memoryConflictSubmitting.add(item.id);
+        state.memoryConflictLoadSequence += 1;
+        setBusy(true); feedback.textContent = '正在更新长期记忆…';
+        try {
+          await api(`/api/memory/conflicts/${encodeURIComponent(item.id)}/resolve`, {
+            method: 'POST',
+            body: JSON.stringify({
+              resolution,
+              expected_existing_fact_id: item.existing_fact_id,
+              ...(resolution === 'custom' ? { content: revised } : {}),
+            }),
+          });
+          await loadMemoryConflicts({ message: '已处理这条冲突，长期记忆已更新。其他待确认项请分别处理。' });
+          await loadMemories();
+        } catch (error) {
+          if (/stale_conflict|conflict_already_resolved/.test(error.message)) {
+            await loadMemoryConflicts({ message: '这条冲突已发生变化，列表已刷新。请阅读当前内容后重新选择。' });
+          } else {
+            feedback.textContent = error.message.includes('other_conflicts_pending')
+              ? '同一条记忆还有其他待确认项，请先处理其他冲突后再选择两条都不再使用。'
+              : `未能确认更新：${error.message}。可刷新列表核对当前状态。`;
+          }
+        } finally {
+          state.memoryConflictSubmitting.delete(item.id);
+          setBusy(false);
+          syncMemoryConflictBusy();
+        }
+      };
+      const addButton = (text, action, target = actions) => {
+        const button = memoryConflictText('button', 'memory-conflict-button', text);
+        button.type = 'button'; button.addEventListener('click', action);
+        controls.push(button); target.append(button); return button;
+      };
+      addButton('保留原记忆', () => resolve('existing'));
+      addButton('采用新记忆', () => resolve('candidate'));
+      const edit = addButton('填写修订内容', () => {
+        custom.hidden = !custom.hidden;
+        edit.setAttribute('aria-expanded', String(!custom.hidden));
+        if (!custom.hidden) content.focus();
+      });
+      edit.setAttribute('aria-expanded', 'false');
+      addButton('两条都不再使用', () => resolve('neither'));
+      addButton('稍后处理', () => {
+        card.open = false;
+        $('#memory-conflicts-status').textContent = '已折叠这条待确认项，未更改长期记忆。需要时可展开继续处理。';
+      });
+      addButton('保存修订并更新记忆', () => resolve('custom'), custom);
+      card.append(actions, custom, feedback); list.append(card);
+      setBusy(state.memoryConflictSubmitting.has(item.id));
+    });
+  }
+
+  function memoryConflictRefreshIsBlocked() {
+    return state.memoryConflictSubmitting.size > 0
+      || $$('.memory-conflict-custom textarea').some((input) => input.value.length > 0 || input === document.activeElement);
+  }
+
+  async function loadMemoryConflicts({ message = '', background = false } = {}) {
+    if (state.page !== 'memory') return;
+    const preserveDraft = () => {
+      if (!background || !memoryConflictRefreshIsBlocked()) return false;
+      state.memoryConflictNeedsRefresh = true;
+      if (!state.memoryConflictSubmitting.size) {
+        $('#memory-conflicts-status').textContent = '发现记忆更新，已保留正在填写的修订；完成处理后可刷新。';
+      }
+      return true;
+    };
+    if (preserveDraft()) return;
+    const sequence = ++state.memoryConflictLoadSequence;
+    if (!background) $('#memory-conflicts-status').textContent = '正在读取待确认的记忆…';
+    try {
+      const data = await api('/api/memory/conflicts?status=pending&limit=100');
+      if (sequence !== state.memoryConflictLoadSequence || state.page !== 'memory' || preserveDraft()) return;
+      renderMemoryConflicts(Array.isArray(data.items) ? data.items : []);
+      state.memoryConflictNeedsRefresh = false;
+      $('#memory-conflicts-status').textContent = message;
+    } catch (error) {
+      if (sequence === state.memoryConflictLoadSequence) {
+        $('#memory-conflicts-status').textContent = `待确认列表加载失败：${error.message}`;
+      }
+    }
+  }
+
+  $('#memory-conflicts-refresh').addEventListener('click', () => loadMemoryConflicts());
+  $('#memory-conflict-notice-view')?.addEventListener('click', () => setPage('memory'));
 
   function memoryLabel(kind) {
     return { procedural: '程序性记忆', semantic: '语义记忆', episodic: '情景记忆' }[kind] || kind;
@@ -1874,7 +2154,7 @@
       renderPermission();
       if (state.permission.remaining_seconds <= 0) loadPermissions();
     }, 1000);
-    setInterval(() => { if (!state.turnRunning) loadOverview(); }, 5000);
+    setInterval(loadOverview, 5000);
     setInterval(() => { if (!state.turnRunning && state.page === 'tasks') loadTasks(); }, 15000);
     setInterval(() => { if (state.page === 'tasks') loadTeamCommunications(); }, 2500);
     setInterval(loadTeamAgentDetail, 2500);
