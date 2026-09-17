@@ -713,7 +713,13 @@ class SessionContextCoordinator:
                 f"{system}\nThe required headings, in exact order, are:\n"
                 + "\n".join(headings)
             )
-        chunks = self._summary_chunks(prompt, 60_000)
+        # Hermes and Pi submit each logical summary input in full. Pi may
+        # separately summarize a split-turn prefix; neither uses byte chunks.
+        chunks = (
+            [prompt]
+            if self.mode in (ContextMode.HERMES, ContextMode.PI)
+            else self._summary_chunks(prompt, 60_000)
+        )
         try:
             if len(chunks) == 1:
                 summary = self.summary_callback(system, chunks[0], max_tokens).strip()

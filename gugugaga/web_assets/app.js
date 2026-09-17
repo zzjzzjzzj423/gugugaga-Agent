@@ -158,7 +158,19 @@
       pageTransition.then(() => loadMemoryConflicts());
     }
     if (page === 'database') loadTables();
-    window.MemoryEvaluation?.onPageChange(page, pageTransition);
+    if (typeof window.MemoryEvaluation?.onPageChange === 'function') {
+      window.MemoryEvaluation.onPageChange(page, pageTransition);
+    } else if (page === 'evaluation') {
+      const error = $('#evaluation-error');
+      error.textContent = '记忆测评组件加载失败。请检查应用安装是否完整，修复后刷新页面。';
+      error.classList.add('task-load-error');
+      error.hidden = false;
+      $('#evaluation-connection').textContent = '组件未加载';
+      $('#evaluation-new').disabled = true;
+      $('#evaluation-new').textContent = '测评暂不可用';
+      $('#evaluation-refresh').disabled = true;
+      $('#evaluation-content').replaceChildren();
+    }
   }
 
   $$('.nav-item').forEach((button) => button.addEventListener('click', () => setPage(button.dataset.page)));

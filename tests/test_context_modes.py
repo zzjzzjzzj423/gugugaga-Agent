@@ -480,12 +480,11 @@ def test_pi_second_entry_links_previous_summary(tmp_path):
     assert any(first.summary in prompt for prompt in prompts[1:])
 
 
-def test_large_summary_input_is_bounded_and_hierarchically_merged(tmp_path):
+def test_hermes_large_middle_is_summarized_in_one_request_without_truncation(tmp_path):
     requests = []
 
-    def bounded_summary(system, prompt, max_tokens):
+    def recording_summary(system, prompt, max_tokens):
         requests.append((system, prompt, max_tokens))
-        assert len(prompt.encode("utf-8")) <= 65_536
         return structured(HERMES_HEADINGS)
 
     session = coordinator(
@@ -495,16 +494,154 @@ def test_large_summary_input_is_bounded_and_hierarchically_merged(tmp_path):
         pi_reserve_tokens=10_000,
         pi_keep_recent_tokens=10_000,
     )
-    session.summary_callback = bounded_summary
+    session.summary_callback = recording_summary
     messages = [
-        {"role": "user" if index % 2 == 0 else "assistant", "content": "x" * 20_000}
+        {"role": "user" if index % 2 == 0 else "assistant", "content": f"message-{index}\n" + "x" * 20_000}
         for index in range(10)
     ]
-    session.prepare_request(messages, request(), force=True)
+    projected = session.prepare_request(messages, request(), force=True)
 
-    assert len(requests) >= 3
-    assert "final merged summary" in requests[-1][0]
+    assert len(requests) == 1
+    system, prompt, max_tokens = requests[0]
+    assert len(prompt.encode("utf-8")) > 65_536
+    assert "This is part" not in system and "final merged summary" not in system
+    assert all(heading in system for heading in HERMES_HEADINGS)
+    assert max_tokens == 2_000
+    submitted = json.loads(prompt.split("History to summarize:\n", 1)[1])
+    assert submitted == [{"role": m["role"], "content": m["content"]} for m in messages[3:9]]
+    assert projected[:3] == [{"role": m["role"], "content": m["content"]} for m in messages[:3]]
+    assert projected[-1]["content"] == messages[-1]["content"]
     assert session.status()["successful_compactions"] == 1
+
+
+@pytest.mark.parametrize("failure", ["exception", "invalid_summary"])
+def test_hermes_single_request_failure_preserves_existing_summary(tmp_path, failure):
+    session = coordinator(tmp_path, "hermes", context_window_tokens=250_000,
+                          pi_reserve_tokens=10_000, pi_keep_recent_tokens=10_000)
+    messages = [{"role": "user" if i % 2 == 0 else "assistant", "content": "x" * 20_000}
+                for i in range(10)]
+    session.prepare_request(messages, request(), force=True)
+    previous_summary = session.state.hermes_summary
+    previous_projection = copy.deepcopy(session.state.projection)
+    messages.extend({"role": "user" if i % 2 == 0 else "assistant", "content": "new" * 10_000}
+                    for i in range(6))
+    session.observe_history(messages)
+    raw_before = copy.deepcopy(messages)
+    calls = []
+
+    def failed_summary(system, prompt, max_tokens):
+        calls.append(prompt)
+        if failure == "exception":
+            raise RuntimeError("summary input exceeds provider capacity")
+        return "missing required headings"
+
+    session.summary_callback = failed_summary
+    with pytest.raises(ContextModeError) as caught:
+        session.prepare_request(messages, request(), force=True)
+    assert caught.value.code == "SUMMARY_FAILED"
+    assert len(calls) == 1 and len(calls[0].encode("utf-8")) > 65_536
+    assert previous_summary in calls[0]
+    assert session.state.hermes_summary == previous_summary
+    assert session.state.projection == previous_projection
+    assert session.state.successful_compactions == 1
+    assert messages == raw_before
+
+
+@pytest.mark.parametrize("split_turn", [False, True])
+def test_pi_large_summary_inputs_are_submitted_whole(tmp_path, split_turn):
+    session = coordinator(tmp_path, "pi", context_window_tokens=250_000,
+                          pi_reserve_tokens=10_000, pi_keep_recent_tokens=10_000)
+    messages = [
+        {"role": "user", "content": "old request " + "甲" * 40_000},
+        {"role": "assistant", "content": "old result " + "乙" * 40_000},
+        {"role": "user", "content": "current request " + "丙" * 40_000},
+        {"role": "assistant", "content": "current result " + "丁" * 40_000},
+        {"role": "assistant" if split_turn else "user", "content": "recent " + "x" * 1_000},
+    ]
+    session.observe_history(messages)
+    raw_before = copy.deepcopy(messages)
+    calls = []
+
+    def recording_summary(system, prompt, max_tokens):
+        calls.append((system, prompt, max_tokens))
+        return structured(PI_HEADINGS)
+
+    session.summary_callback = recording_summary
+    projected = session.prepare_request(messages, request(), force=True)
+
+    assert len(calls) == (2 if split_turn else 1)
+    for system, prompt, max_tokens in calls:
+        assert len(prompt.encode("utf-8")) > 65_536
+        assert "This is part" not in system and "final merged summary" not in system
+        assert 0 < max_tokens <= 2_000
+    submitted = json.loads(calls[0][1].split("Newly removed history:\n", 1)[1])
+    expected = [{"role": m["role"], "content": m["content"]} for m in messages]
+    assert submitted == expected[:2 if split_turn else 4]
+    if split_turn:
+        prefix = json.loads(calls[1][1].split("Removed turn prefix:\n", 1)[1])
+        assert prefix == expected[2:4]
+    entry = session.state.pi_entries[0]
+    assert entry.is_split_turn == split_turn
+    assert bool(entry.turn_prefix_summary) == split_turn
+    assert entry.first_kept_message_id == messages[4]["message_id"]
+    assert projected[-1] == expected[-1]
+    assert messages == raw_before
+    assert session.project(messages) == projected
+
+
+@pytest.mark.parametrize("failure", ["exception", "invalid_summary"])
+def test_pi_prefix_failure_preserves_existing_entry(tmp_path, failure):
+    session = coordinator(tmp_path, "pi", context_window_tokens=250_000,
+                          pi_reserve_tokens=10_000, pi_keep_recent_tokens=10_000)
+    messages = [{"role": "user" if i % 2 == 0 else "assistant", "content": "x" * 20_000}
+                for i in range(10)]
+    session.prepare_request(messages, request(), force=True)
+    previous_entries = copy.deepcopy(session.state.pi_entries)
+    messages.extend([
+        {"role": "user", "content": "new request " + "a" * 40_000},
+        {"role": "assistant", "content": "new result " + "b" * 40_000},
+        {"role": "assistant", "content": "recent " + "c" * 1_000},
+    ])
+    session.observe_history(messages)
+    raw_before = copy.deepcopy(messages)
+    projection_before = session.project(messages)
+    calls = []
+
+    def fail_prefix(system, prompt, max_tokens):
+        calls.append(prompt)
+        if len(calls) == 1:
+            assert previous_entries[-1].summary in prompt
+            return structured(PI_HEADINGS)
+        assert "Removed turn prefix:\n" in prompt
+        assert len(prompt.encode("utf-8")) > 65_536
+        if failure == "exception":
+            raise RuntimeError("summary input exceeds provider capacity")
+        return "missing required headings"
+
+    session.summary_callback = fail_prefix
+    with pytest.raises(ContextModeError) as caught:
+        session.prepare_request(messages, request(), force=True)
+    assert caught.value.code == "SUMMARY_FAILED"
+    assert len(calls) == 2
+    assert session.state.pi_entries == previous_entries
+    assert session.state.successful_compactions == 1
+    assert session.project(messages) == projection_before
+    assert messages == raw_before
+
+
+def test_cc_keeps_existing_hierarchical_summary_path(tmp_path):
+    calls = []
+    session = coordinator(tmp_path, "cc")
+
+    def bounded_summary(system, prompt, max_tokens):
+        assert len(prompt.encode("utf-8")) <= 65_536
+        calls.append(system)
+        return structured(PI_HEADINGS)
+
+    session.summary_callback = bounded_summary
+    session._summary("summarize", "x" * 120_001, PI_HEADINGS)
+    assert len(calls) == 4
+    assert "final merged summary" in calls[-1]
 
 
 def test_hermes_512k_boundary_and_trigger_equality(tmp_path):
