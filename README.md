@@ -555,6 +555,23 @@ CLI 示例：
 
 模式只能在空白会话开始前选择，首条消息发出后锁定。
 
+启动新会话时，默认从 [models.dev](https://models.dev/) 按 `siliconflow/模型 ID`
+精确查询上下文窗口，并在工作区的 `.gugugaga/model_context_cache.json` 中缓存 24 小时。
+目录暂时不可用时使用该模型最后一次缓存的窗口；目录和缓存都没有时提示手动设置，
+不会把 131,072 当成查询结果。可用环境变量 `GUGUGAGA_CONTEXT_WINDOW_TOKENS`
+、CLI 参数 `--context-window-tokens`，或 Web「配置 → 上下文窗口（tokens）」手动覆盖；
+Web 输入框留空会恢复自动查询。`/status` 显示窗口来源和压缩触发点。
+models.dev 中普通版与 `Pro/` 型号按不同 ID 处理；例如只有
+`MiniMaxAI/MiniMax-M2.5` 时，不会自动套用到 `Pro/MiniMaxAI/MiniMax-M2.5`。
+目录中的窗口是模型资料，不是 API 实时测量值；如服务商实际限制不同，请手动覆盖。
+
+三种模式共用自动摘要触发线：查到或手动设置的上下文窗口小于 512,000 tokens 时，
+默认在请求达到窗口的 75% 时触发；达到或超过 512,000 tokens 时，默认在 50% 时触发。
+例如窗口设为 131,072 tokens 的触发线是 98,304 tokens。CC 仍会在检查该触发线前
+缩短过大的工具结果、过长的消息历史和旧工具结果；Pi 的 `reserve_tokens` 仍约束压缩后的
+请求预算。可用 `--context-threshold-ratio` 调整基础比例；旧参数
+`--hermes-threshold-ratio` 继续作为同一参数的别名。
+
 默认计数器会根据模型名选择 Qwen、DeepSeek、GLM、OpenAI、Claude、
 Llama、Mistral 或 Gemma 的估算配置；未知模型使用保守回退配置。
 CC、Hermes 和 Pi 的自动触发都使用同一个近似 Token 计数器。该计数器

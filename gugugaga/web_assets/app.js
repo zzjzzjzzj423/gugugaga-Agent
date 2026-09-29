@@ -797,6 +797,7 @@
 
   function renderConfiguration(data) {
     $('#settings-model').value = data.model || '';
+    $('#settings-context-window').value = data.context_window_tokens || '';
     $('#settings-small-model').value = data.consolidation_model || '';
     $('#settings-intent-model').value = data.intent_gate_model || '';
     $('#settings-embedding-model').value = data.embedding_model || '';
@@ -850,6 +851,7 @@
         method: 'POST',
         body: JSON.stringify({
           model: $('#settings-model').value.trim(),
+          context_window_tokens: $('#settings-context-window').value.trim(),
           consolidation_model: $('#settings-small-model').value.trim(),
           intent_gate_model: $('#settings-intent-model').value.trim(),
           embedding_model: $('#settings-embedding-model').value.trim(),

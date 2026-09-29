@@ -42,6 +42,19 @@ VALID_CONTEXT_MODES = ("cc", "hermes", "pi")
 SMALL_WINDOW_BOUNDARY = 512_000
 
 
+def automatic_compaction_threshold(
+    session_config: "SessionContextConfig",
+) -> tuple[int, float]:
+    """Use one request-token trigger for every context mode."""
+    effective_ratio = session_config.hermes_threshold_ratio
+    if session_config.context_window_tokens < SMALL_WINDOW_BOUNDARY:
+        effective_ratio = max(effective_ratio, 0.75)
+    return (
+        math.floor(session_config.context_window_tokens * effective_ratio),
+        effective_ratio,
+    )
+
+
 class ContextMode(str, Enum):
     CC = "cc"
     HERMES = "hermes"
@@ -86,6 +99,7 @@ class SessionContextConfig:
     mode: ContextMode = ContextMode.CC
     source: str = "default"
     context_window_tokens: int = 131_072
+    context_window_source: str = "configured"
     token_counter_id: str = "gugugaga_model_estimator"
     token_counter_version: str = "v1"
     hermes_threshold_ratio: float = 0.50
@@ -100,6 +114,7 @@ class SessionContextConfig:
         *,
         source: str | None = None,
         context_window_tokens: int = 131_072,
+        context_window_source: str = "configured",
         token_counter_id: str = "gugugaga_model_estimator",
         token_counter_version: str = "v1",
         hermes_threshold_ratio: float = 0.50,
@@ -130,7 +145,7 @@ class SessionContextConfig:
         if not 0 < hermes_threshold_ratio < 1:
             raise ContextModeError(
                 "INVALID_CONTEXT_CONFIG",
-                "hermes.threshold_ratio must be greater than 0 and less than 1.",
+                "Automatic compaction threshold ratio must be greater than 0 and less than 1.",
             )
         if not 0 < hermes_target_ratio < 1:
             raise ContextModeError(
@@ -151,6 +166,7 @@ class SessionContextConfig:
             mode=ContextMode(raw_mode),
             source=source or ("default" if mode is None else "explicit"),
             context_window_tokens=context_window_tokens,
+            context_window_source=context_window_source,
             token_counter_id=token_counter_id,
             token_counter_version=token_counter_version,
             hermes_threshold_ratio=hermes_threshold_ratio,
@@ -650,6 +666,7 @@ class SessionContextCoordinator:
     def status(self) -> dict[str, Any]:
         with self._lock:
             result = self.state.last_result
+            trigger, effective_ratio = automatic_compaction_threshold(self.config)
             return {
                 "mode": self.config.mode.value,
                 "display_name": self.config.mode.value.capitalize()
@@ -668,6 +685,9 @@ class SessionContextCoordinator:
                 "token_counter_model": getattr(self.counter, "model", None),
                 "token_counter_profile": getattr(self.counter, "profile_id", None),
                 "context_window_tokens": self.config.context_window_tokens,
+                "context_window_source": self.config.context_window_source,
+                "automatic_trigger_tokens": trigger,
+                "automatic_threshold_ratio": effective_ratio,
                 "pi_entry_count": len(self.state.pi_entries),
             }
 
@@ -972,11 +992,8 @@ class SessionContextCoordinator:
         candidate_tokens = self.counter.count_request(
             request.system, request.tools, candidate
         )
-        cc_trigger = min(
-            config.CONTEXT_LIMIT,
-            max(1, math.floor(self.config.context_window_tokens * 0.80)),
-        )
-        should_summarize = force or candidate_tokens > cc_trigger
+        cc_trigger, _ = automatic_compaction_threshold(self.config)
+        should_summarize = force or candidate_tokens >= cc_trigger
         if should_summarize:
             if len(candidate) <= 1 and force:
                 result = CompressionResult(
@@ -1057,10 +1074,7 @@ class SessionContextCoordinator:
     ) -> list[dict[str, Any]]:
         started = time.perf_counter()
         before = self.counter.count_request(request.system, request.tools, projection)
-        effective = self.config.hermes_threshold_ratio
-        if self.config.context_window_tokens < SMALL_WINDOW_BOUNDARY:
-            effective = max(effective, 0.75)
-        trigger = math.floor(self.config.context_window_tokens * effective)
+        trigger, effective = automatic_compaction_threshold(self.config)
         tail_budget = math.floor(trigger * self.config.hermes_target_ratio)
         if not force and before < trigger:
             return projection
@@ -1264,8 +1278,8 @@ class SessionContextCoordinator:
     ) -> list[dict[str, Any]]:
         started = time.perf_counter()
         before = self.counter.count_request(request.system, request.tools, projection)
-        trigger = self.config.context_window_tokens - self.config.pi_reserve_tokens
-        if not force and before <= trigger:
+        trigger, _ = automatic_compaction_threshold(self.config)
+        if not force and before < trigger:
             return projection
         tail, raw_offset = self._pi_raw_tail(raw)
         cut = self._pi_cut(tail)
@@ -1293,7 +1307,11 @@ class SessionContextCoordinator:
             if previous_entry.turn_prefix_summary:
                 previous += "\n\nPrevious split-turn prefix summary:\n" + previous_entry.turn_prefix_summary
         transcript = self._transcript(raw)
-        target = min(trigger, before - 1)
+        target = min(
+            trigger,
+            self.config.context_window_tokens - self.config.pi_reserve_tokens,
+            before - 1,
+        )
         plan = self._pi_budget_plan(tail, request, cut, target)
         attempts = 0
         after = None

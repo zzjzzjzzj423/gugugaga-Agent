@@ -12,6 +12,7 @@ _ALLOWED_FIELDS = {
     "consolidation_model",
     "intent_gate_model",
     "embedding_model",
+    "context_window_tokens",
     "siliconflow_api_key",
     "tavily_api_key",
 }
@@ -20,6 +21,7 @@ _ENV_NAMES = {
     "consolidation_model": "GUGUGAGA_MEMORY_CONSOLIDATION_MODEL",
     "intent_gate_model": "GUGUGAGA_MEMORY_INTENT_GATE_MODEL",
     "embedding_model": "GUGUGAGA_MEMORY_EMBEDDING_MODEL",
+    "context_window_tokens": "GUGUGAGA_CONTEXT_WINDOW_TOKENS",
     "siliconflow_api_key": "SILICONFLOW_API_KEY",
     "tavily_api_key": "TAVILY_API_KEY",
 }
@@ -40,6 +42,19 @@ def _clean(value: Any, field: str, *, required: bool = False, limit: int = 1000)
 
 def _hint(value: str) -> str | None:
     return f"••••{value[-4:]}" if value else None
+
+
+def _context_window(value: Any) -> str:
+    if value is None or value == "":
+        return ""
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise ValueError("context_window_tokens must be a positive integer or blank")
+    raw = str(value).strip()
+    if not raw:
+        return ""
+    if not raw.isascii() or not raw.isdecimal() or int(raw) <= 0:
+        raise ValueError("context_window_tokens must be a positive integer or blank")
+    return str(int(raw))
 
 
 class WebConfiguration:
@@ -66,13 +81,19 @@ class WebConfiguration:
         return {
             key: item
             for key, item in value.items()
-            if key in _ALLOWED_FIELDS and isinstance(item, str) and item
+            if key in _ALLOWED_FIELDS
+            and isinstance(item, str)
+            and (item or key == "context_window_tokens")
         }
 
     def apply_environment(self) -> None:
         with self._lock:
             stored = self._load()
             for field, environment in _ENV_NAMES.items():
+                if field == "context_window_tokens":
+                    # Runtime settings resolve this field directly, so a blank
+                    # Web value can override an existing workspace .env value.
+                    continue
                 value = stored.get(field) or self._base_environment[field]
                 if value:
                     os.environ[environment] = value
@@ -82,6 +103,15 @@ class WebConfiguration:
     def effective(self, model_override: str | None = None) -> dict[str, str]:
         with self._lock:
             stored = self._load()
+            stored_window = stored.get("context_window_tokens")
+            window = (
+                stored_window if stored_window is not None
+                else self._base_environment["context_window_tokens"]
+            )
+            if stored_window is None:
+                window_source = "environment" if window else "auto"
+            else:
+                window_source = "web" if stored_window else "auto"
             return {
                 "model": stored.get("model")
                 or (model_override or "").strip()
@@ -92,6 +122,8 @@ class WebConfiguration:
                 or self._base_environment["intent_gate_model"],
                 "embedding_model": stored.get("embedding_model")
                 or self._base_environment["embedding_model"],
+                "context_window_tokens": window,
+                "context_window_source": window_source,
                 "siliconflow_api_key": stored.get("siliconflow_api_key")
                 or self._base_environment["siliconflow_api_key"],
                 "tavily_api_key": stored.get("tavily_api_key")
@@ -105,6 +137,8 @@ class WebConfiguration:
             "consolidation_model": value["consolidation_model"],
             "intent_gate_model": value["intent_gate_model"],
             "embedding_model": value["embedding_model"],
+            "context_window_tokens": value["context_window_tokens"],
+            "context_window_source": value["context_window_source"],
             "siliconflow_api_key_configured": bool(value["siliconflow_api_key"]),
             "siliconflow_api_key_hint": _hint(value["siliconflow_api_key"]),
             "tavily_api_key_configured": bool(value["tavily_api_key"]),
@@ -147,6 +181,10 @@ class WebConfiguration:
                 stored["embedding_model"] = embedding_model
             else:
                 stored.pop("embedding_model", None)
+            if "context_window_tokens" in payload:
+                stored["context_window_tokens"] = _context_window(
+                    payload["context_window_tokens"]
+                )
             for field in ("siliconflow_api_key", "tavily_api_key"):
                 secret = _clean(payload.get(field), field)
                 if secret:

@@ -94,6 +94,7 @@ class Settings:
     context_mode: str = "cc"
     context_mode_source: str = "default"
     context_window_tokens: int = 131_072
+    context_window_source: str = "auto"
     token_counter_id: str = "gugugaga_model_estimator"
     token_counter_version: str = "v1"
     hermes_threshold_ratio: float = 0.50
@@ -171,6 +172,16 @@ class Settings:
         candidate_limit = int(os.getenv("GUGUGAGA_MEMORY_RETRIEVAL_CANDIDATES", "20"))
         final_limit = int(os.getenv("GUGUGAGA_MEMORY_RETRIEVAL_TOP_K", "10"))
         min_score = float(os.getenv("GUGUGAGA_MEMORY_RETRIEVAL_MIN_SCORE", "0.20"))
+        configured_window = os.getenv("GUGUGAGA_CONTEXT_WINDOW_TOKENS", "").strip()
+        if configured_window:
+            try:
+                context_window_tokens = int(configured_window)
+            except ValueError as error:
+                raise ValueError("GUGUGAGA_CONTEXT_WINDOW_TOKENS must be a positive integer") from error
+            if context_window_tokens <= 0:
+                raise ValueError("GUGUGAGA_CONTEXT_WINDOW_TOKENS must be a positive integer")
+        else:
+            context_window_tokens = 131_072
         if not 1 <= threshold <= 100:
             raise ValueError("GUGUGAGA_MEMORY_CONSOLIDATION_EXCHANGES must be 1-100")
         if not 1 <= timeout_seconds <= 300:
@@ -219,6 +230,8 @@ class Settings:
             ).rstrip("/"),
             max_rounds=int(os.getenv("GUGUGAGA_MAX_ROUNDS", "40")),
             max_tokens=int(os.getenv("GUGUGAGA_MAX_TOKENS", "8192")),
+            context_window_tokens=context_window_tokens,
+            context_window_source="environment" if configured_window else "auto",
             idle_poll_seconds=float(os.getenv("GUGUGAGA_IDLE_POLL", "1")),
             idle_timeout_seconds=float(os.getenv("GUGUGAGA_IDLE_TIMEOUT", "30")),
             memory_enabled=_env_bool("GUGUGAGA_MEMORY_ENABLED", True),
