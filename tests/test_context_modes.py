@@ -17,6 +17,7 @@ from gugugaga.context_modes import (
     SessionContextConfig,
     SessionContextCoordinator,
     TokenCounterRegistry,
+    automatic_compaction_threshold,
     create_child_context_coordinator,
     ensure_message_ids,
     legal_cut,
@@ -237,6 +238,44 @@ def test_cc_automatic_summary_uses_registered_token_counter(tmp_path):
     assert len(projected) == 1
     assert projected[0]["content"].startswith("[Compacted]")
     assert session.status()["successful_compactions"] == 1
+
+
+@pytest.mark.parametrize("mode", ["cc", "hermes", "pi"])
+def test_all_modes_use_the_same_automatic_trigger_at_equality(tmp_path, mode):
+    messages = [
+        {"role": "user" if index % 2 == 0 else "assistant", "content": "x" * 73}
+        for index in range(9)
+    ] + [{"role": "assistant", "content": "x" * 75}]
+    assert LengthCounter().count_request("system", [], messages) == 750
+
+    at_trigger = coordinator(tmp_path / "at", mode)
+    assert at_trigger.status()["automatic_trigger_tokens"] == 750
+    at_trigger.prepare_request(copy.deepcopy(messages), request())
+    assert at_trigger.status()["successful_compactions"] == 1
+
+    below_trigger = coordinator(tmp_path / "below", mode)
+    messages[-1]["content"] = "x" * 74
+    assert LengthCounter().count_request("system", [], messages) == 749
+    below_trigger.prepare_request(messages, request())
+    assert below_trigger.status()["successful_compactions"] == 0
+
+
+@pytest.mark.parametrize(
+    ("window", "expected_trigger", "expected_ratio"),
+    [
+        (131_072, 98_304, 0.75),
+        (511_999, 383_999, 0.75),
+        (512_000, 256_000, 0.50),
+        (1_000_000, 500_000, 0.50),
+    ],
+)
+def test_shared_automatic_trigger_uses_window_boundary(window, expected_trigger, expected_ratio):
+    session_config = SessionContextConfig.parse(
+        context_window_tokens=window,
+        pi_reserve_tokens=100,
+        pi_keep_recent_tokens=100,
+    )
+    assert automatic_compaction_threshold(session_config) == (expected_trigger, expected_ratio)
 
 
 def test_hermes_first_then_later_compaction_shapes(tmp_path):

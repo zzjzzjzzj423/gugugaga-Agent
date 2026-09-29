@@ -1,7 +1,7 @@
 from gugugaga.agent import AgentRuntime
-from gugugaga import config
 from gugugaga.background import BackgroundManager, CronScheduler
 from gugugaga.context import ContextManager
+from gugugaga.context_modes import SessionContextConfig
 from gugugaga.hooks import HookEvent, HookManager
 from gugugaga.models import ModelResponse, ToolCall
 from gugugaga.permissions import PermissionPolicy
@@ -110,13 +110,16 @@ def test_compact_tool_forces_transcript_archive(tmp_path):
     )
 
 
-def test_automatic_compaction_uses_provider_summary(tmp_path, monkeypatch):
+def test_automatic_compaction_uses_provider_summary(tmp_path):
     provider = ScriptedProvider([
         ModelResponse("A concise history summary", [], "stop"),
         ModelResponse("Done", [], "stop"),
     ])
     runtime = make_runtime(tmp_path, provider)
-    monkeypatch.setattr(config, "CONTEXT_LIMIT", 100)
+    runtime.context_coordinator.config = SessionContextConfig.parse(
+        "cc", context_window_tokens=1_000,
+        pi_reserve_tokens=200, pi_keep_recent_tokens=200,
+    )
     runtime.messages.extend(
         {"role": "user", "content": f"{i}-" + "x" * 200}
         for i in range(4)

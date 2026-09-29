@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import json
+import os
 import threading
 import time
 from pathlib import Path
@@ -9,6 +10,8 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+
+import pytest
 
 from gugugaga import tasks, teams, web
 from gugugaga.memory import RecallItem, RecallResult
@@ -21,6 +24,27 @@ from gugugaga.web import (
     _handler_factory,
     create_server,
 )
+from gugugaga.web_config import WebConfiguration
+
+
+@pytest.fixture(autouse=True)
+def restore_web_configuration_environment():
+    names = (
+        "SILICONFLOW_API_KEY",
+        "SILICONFLOW_MODEL",
+        "GUGUGAGA_MEMORY_CONSOLIDATION_MODEL",
+        "GUGUGAGA_MEMORY_INTENT_GATE_MODEL",
+        "GUGUGAGA_MEMORY_EMBEDDING_MODEL",
+        "GUGUGAGA_CONTEXT_WINDOW_TOKENS",
+        "TAVILY_API_KEY",
+    )
+    original = {name: os.environ.get(name) for name in names}
+    yield
+    for name, value in original.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
 
 
 class FakeMemoryService:
@@ -100,6 +124,13 @@ def test_chat_markdown_renderer_uses_safe_dom_nodes():
     assert ".innerHTML" not in script
     assert ".markdown-body" in styles
     assert ".markdown-table-wrap" in styles
+
+
+def test_settings_form_edits_context_window():
+    html = (WEB_ASSETS / "index.html").read_text(encoding="utf-8")
+    script = (WEB_ASSETS / "app.js").read_text(encoding="utf-8")
+    assert 'id="settings-context-window"' in html
+    assert "context_window_tokens: $('#settings-context-window').value.trim()" in script
 
 
 def test_agent_overview_uses_intent_gate_and_conversation_evidence_labels():
@@ -316,14 +347,16 @@ def test_store_exposes_real_memory_and_sqlite_views():
             },
         ]
         assert recent_overview["session_id"] == "session_recent"
-        assert recent_overview["context_ratio"] == 25.0
+        assert recent_overview["context_ratio"] is None
+        assert recent_overview["context_window_tokens"] is None
+        assert recent_overview["context"]["context_window_source"] == "unresolved"
         assert recent_overview["context_tokens"] == 32_768
         assert recent_overview["memory"]["evidence"] == 2
         assert recent_overview["memory"]["evidence_hot"] == 2
         assert recent_overview["memory"]["evidence_cold"] == 0
         assert recent_overview["memory"]["indexed"] == 0
         assert old_overview["session_id"] == "session_old"
-        assert old_overview["context_ratio"] == 50.0
+        assert old_overview["context_ratio"] is None
         assert {item["name"] for item in tables} >= {"chat_log", "facts", "episodes"}
         assert rows["rows"][0]["id"] == saved.fact_id
         assert any(item["name"] == "content" for item in schema["rows"])
@@ -1223,6 +1256,7 @@ def test_configuration_api_masks_secrets_and_persists_workspace_settings(monkeyp
         "GUGUGAGA_MEMORY_CONSOLIDATION_MODEL",
         "GUGUGAGA_MEMORY_INTENT_GATE_MODEL",
         "GUGUGAGA_MEMORY_EMBEDDING_MODEL",
+        "GUGUGAGA_CONTEXT_WINDOW_TOKENS",
         "TAVILY_API_KEY",
     ):
         monkeypatch.delenv(name, raising=False)
@@ -1241,6 +1275,7 @@ def test_configuration_api_masks_secrets_and_persists_workspace_settings(monkeyp
                         "consolidation_model": "Qwen/small",
                         "intent_gate_model": "Qwen/gate",
                         "embedding_model": "BAAI/bge-m3",
+                        "context_window_tokens": "262144",
                         "siliconflow_api_key": "sf-secret-1234",
                         "tavily_api_key": "tvly-secret-5678",
                     }
@@ -1255,6 +1290,8 @@ def test_configuration_api_masks_secrets_and_persists_workspace_settings(monkeyp
             assert payload["consolidation_model"] == "Qwen/small"
             assert payload["intent_gate_model"] == "Qwen/gate"
             assert payload["embedding_model"] == "BAAI/bge-m3"
+            assert payload["context_window_tokens"] == "262144"
+            assert payload["context_window_source"] == "web"
             assert payload["siliconflow_api_key_configured"] is True
             assert payload["siliconflow_api_key_hint"] == "••••1234"
             assert payload["tavily_api_key_configured"] is True
@@ -1266,6 +1303,7 @@ def test_configuration_api_masks_secrets_and_persists_workspace_settings(monkeyp
                 fetched = json.loads(response.read())
             assert fetched["siliconflow_api_key_hint"] == "••••1234"
             assert fetched["tavily_api_key_hint"] == "••••5678"
+            assert fetched["context_window_tokens"] == "262144"
             request = Request(
                 f"{base}/api/config",
                 data=json.dumps(
@@ -1274,6 +1312,7 @@ def test_configuration_api_masks_secrets_and_persists_workspace_settings(monkeyp
                         "consolidation_model": "",
                         "intent_gate_model": "",
                         "embedding_model": "",
+                        "context_window_tokens": "",
                         "siliconflow_api_key": "",
                         "tavily_api_key": "",
                     }
@@ -1287,6 +1326,8 @@ def test_configuration_api_masks_secrets_and_persists_workspace_settings(monkeyp
             assert cleared["consolidation_model"] == ""
             assert cleared["intent_gate_model"] == ""
             assert cleared["embedding_model"] == ""
+            assert cleared["context_window_tokens"] == ""
+            assert cleared["context_window_source"] == "auto"
             assert cleared["siliconflow_api_key_hint"] == "••••1234"
             assert cleared["tavily_api_key_hint"] == "••••5678"
             stored = json.loads(
@@ -1298,6 +1339,7 @@ def test_configuration_api_masks_secrets_and_persists_workspace_settings(monkeyp
             assert "consolidation_model" not in stored
             assert "intent_gate_model" not in stored
             assert "embedding_model" not in stored
+            assert stored["context_window_tokens"] == ""
             with urlopen(f"{base}/api/status", timeout=3) as response:
                 status = json.loads(response.read())
             assert status["chat_configured"] is True
@@ -1318,12 +1360,14 @@ def test_web_configuration_loads_embedding_model_from_workspace_dotenv(
         "SILICONFLOW_API_KEY",
         "SILICONFLOW_MODEL",
         "GUGUGAGA_MEMORY_EMBEDDING_MODEL",
+        "GUGUGAGA_CONTEXT_WINDOW_TOKENS",
     ):
         monkeypatch.delenv(name, raising=False)
     (tmp_path / ".env").write_text(
         "SILICONFLOW_API_KEY=dotenv-key\n"
         "SILICONFLOW_MODEL=dotenv-model\n"
-        "GUGUGAGA_MEMORY_EMBEDDING_MODEL=BAAI/bge-m3\n",
+        "GUGUGAGA_MEMORY_EMBEDDING_MODEL=BAAI/bge-m3\n"
+        "GUGUGAGA_CONTEXT_WINDOW_TOKENS=262144\n",
         encoding="utf-8",
     )
 
@@ -1332,7 +1376,49 @@ def test_web_configuration_loads_embedding_model_from_workspace_dotenv(
         configuration = application.configuration_status()
         assert configuration["model"] == "dotenv-model"
         assert configuration["embedding_model"] == "BAAI/bge-m3"
+        assert configuration["context_window_tokens"] == "262144"
+        assert configuration["context_window_source"] == "environment"
         assert configuration["siliconflow_api_key_configured"] is True
+    finally:
+        application.close()
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "1.5", "abc", True])
+def test_web_configuration_rejects_invalid_context_window(tmp_path, value):
+    configuration = WebConfiguration(tmp_path)
+    with pytest.raises(ValueError, match="context_window_tokens"):
+        configuration.update({"model": "demo", "context_window_tokens": value})
+    assert not configuration.path.exists()
+
+
+def test_web_window_override_reaches_runtime_and_blank_restores_auto(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("SILICONFLOW_API_KEY", "test-key")
+    monkeypatch.setenv("SILICONFLOW_MODEL", "test-model")
+    monkeypatch.setenv("GUGUGAGA_CONTEXT_WINDOW_TOKENS", "131072")
+    received = []
+
+    def fake_build_runtime(settings, **kwargs):
+        received.append(settings)
+        return FakeApp()
+
+    monkeypatch.setattr(web, "build_runtime", fake_build_runtime)
+    application = DashboardApplication(tmp_path)
+    try:
+        application.update_configuration({
+            "model": "test-model", "context_window_tokens": "262144",
+        })
+        application.runtime()
+        assert received[-1].context_window_tokens == 262_144
+        assert received[-1].context_window_source == "web"
+
+        result = application.update_configuration({
+            "model": "test-model", "context_window_tokens": "",
+        })
+        assert result["runtime_reloaded"] is True
+        assert received[-1].context_window_source == "auto"
+        assert application.configuration_status()["context_window_tokens"] == ""
     finally:
         application.close()
 

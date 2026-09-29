@@ -327,6 +327,7 @@
       </header>
       <form id="settings-form" class="settings-form">
         <label><span>主模型</span><small>用于聊天、推理和工具调用</small><input id="settings-model" name="model" type="text" required maxlength="300" placeholder="Qwen/Qwen3-Coder-30B-A3B-Instruct" autocomplete="off"></label>
+        <label><span>上下文窗口（tokens）</span><small>留空从 models.dev 自动获取；填写后用于计算 CC、Hermes、Pi 的压缩触发点</small><input id="settings-context-window" name="context_window_tokens" type="number" min="1" step="1" inputmode="numeric" placeholder="留空自动获取"></label>
         <label><span>记忆整理小模型</span><small>用于后台 Memory Consolidation；留空则使用主模型</small><input id="settings-small-model" name="consolidation_model" type="text" maxlength="300" placeholder="Qwen/Qwen3-8B" autocomplete="off"></label>
         <label><span>记忆意图门控模型</span><small>用于 LLM Intent Gate；留空则依次使用记忆整理模型和主模型</small><input id="settings-intent-model" name="intent_gate_model" type="text" maxlength="300" placeholder="Qwen/Qwen3-8B" autocomplete="off"></label>
         <label><span>Embedding Model</span><small>用于 Memory 向量索引和语义召回；保存并重载后会自动处理待索引任务</small><input id="settings-embedding-model" name="embedding_model" type="text" maxlength="300" placeholder="BAAI/bge-m3" autocomplete="off"></label>

@@ -35,6 +35,7 @@ from .hooks import trigger_hooks
 from .interactions import interaction_broker
 from .models import ChatProvider, ToolCall
 from .memory import MemoryService
+from .model_context import resolve_context_window
 from .observability import RecordingSystem, set_default_observer
 from .permissions import PermissionPolicy
 from .provider import SiliconFlowProvider
@@ -214,6 +215,17 @@ def build_runtime(
     token_counter: TokenCounter | None = None,
 ) -> GugugagaApp:
     provider = provider or SiliconFlowProvider(settings)
+    if context_config is None and settings.context_window_source == "auto":
+        if isinstance(provider, SiliconFlowProvider):
+            window, source = resolve_context_window(
+                "siliconflow", settings.model,
+                settings.state_dir / "model_context_cache.json",
+            )
+            settings = replace(
+                settings, context_window_tokens=window, context_window_source=source,
+            )
+        else:
+            settings = replace(settings, context_window_source="configured")
     config.configure_workspace(settings.workspace)
     config.MODEL = settings.model
     config.PRIMARY_MODEL = settings.model
@@ -235,6 +247,7 @@ def build_runtime(
             selected_mode,
             source=source,
             context_window_tokens=settings.context_window_tokens,
+            context_window_source=settings.context_window_source,
             token_counter_id=settings.token_counter_id,
             token_counter_version=settings.token_counter_version,
             hermes_threshold_ratio=settings.hermes_threshold_ratio,
@@ -247,6 +260,7 @@ def build_runtime(
             context_mode,
             source="programmatic",
             context_window_tokens=context_config.context_window_tokens,
+            context_window_source=context_config.context_window_source,
             token_counter_id=context_config.token_counter_id,
             token_counter_version=context_config.token_counter_version,
             hermes_threshold_ratio=context_config.hermes_threshold_ratio,
@@ -344,15 +358,22 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--context-window-tokens",
         type=int,
-        default=131_072,
-        help="Model context window in tokens (default: 131072)",
+        default=None,
+        help="Override automatic model context-window discovery with an explicit token count",
     )
     parser.add_argument(
         "--token-counter-id",
         default="gugugaga_model_estimator",
         help="Registered request token counter (default: model-aware estimator)",
     )
-    parser.add_argument("--hermes-threshold-ratio", type=float, default=0.50)
+    parser.add_argument(
+        "--context-threshold-ratio",
+        "--hermes-threshold-ratio",
+        dest="hermes_threshold_ratio",
+        type=float,
+        default=0.50,
+        help="Automatic compaction ratio shared by CC, Hermes, and Pi (default: 0.50; minimum 0.75 below 512000 tokens)",
+    )
     parser.add_argument("--hermes-target-ratio", type=float, default=0.20)
     parser.add_argument("--pi-reserve-tokens", type=int, default=16_384)
     parser.add_argument("--pi-keep-recent-tokens", type=int, default=20_000)
@@ -386,8 +407,11 @@ def handle_command(command: str, app: GugugagaApp) -> tuple[bool, str]:
             f"Context counter: {context_status['token_counter_id']} "
             f"{context_status['token_counter_version']} / "
             f"{context_status['context_window_tokens']} tokens "
-            f"(model={context_status.get('token_counter_model') or 'custom'}, "
+            f"(window_source={context_status['context_window_source']}, "
+            f"model={context_status.get('token_counter_model') or 'custom'}, "
             f"profile={context_status.get('token_counter_profile') or 'custom'})\n"
+            f"Automatic summary trigger: {context_status['automatic_trigger_tokens']} tokens "
+            f"({context_status['automatic_threshold_ratio']:.0%} of configured window)\n"
             f"Successful compactions: {context_status['successful_compactions']}\n"
             f"Last context result: {last}\n"
             f"Reactive recovery used: {context_status['recovery_used']}\n"
@@ -616,7 +640,15 @@ def main(argv: list[str] | None = None) -> int:
         context_config = SessionContextConfig.parse(
             args.context_mode,
             source="cli" if "--context-mode" in raw_argv else "default",
-            context_window_tokens=args.context_window_tokens,
+            context_window_tokens=(
+                args.context_window_tokens
+                if args.context_window_tokens is not None
+                else settings.context_window_tokens
+            ),
+            context_window_source=(
+                "cli" if args.context_window_tokens is not None
+                else settings.context_window_source
+            ),
             token_counter_id=args.token_counter_id,
             hermes_threshold_ratio=args.hermes_threshold_ratio,
             hermes_target_ratio=args.hermes_target_ratio,
@@ -628,6 +660,7 @@ def main(argv: list[str] | None = None) -> int:
             context_mode=context_config.mode.value,
             context_mode_source=context_config.source,
             context_window_tokens=context_config.context_window_tokens,
+            context_window_source=context_config.context_window_source,
             token_counter_id=context_config.token_counter_id,
             token_counter_version=context_config.token_counter_version,
             hermes_threshold_ratio=context_config.hermes_threshold_ratio,

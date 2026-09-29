@@ -11,7 +11,7 @@ import sqlite3
 import threading
 import time
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -271,20 +271,21 @@ class DashboardStore:
             context = stored_context
         else:
             mode = os.getenv("GUGUGAGA_CONTEXT_MODE", "cc")
+            configured_window = os.getenv("GUGUGAGA_CONTEXT_WINDOW_TOKENS", "").strip()
             context = {
                 "mode": mode,
                 "display_name": mode.upper(),
                 "lifecycle": "idle",
-                "context_window_tokens": int(
-                    os.getenv("GUGUGAGA_CONTEXT_WINDOW_TOKENS", "131072")
-                ),
+                "context_window_tokens": int(configured_window) if configured_window else None,
+                "context_window_source": "environment" if configured_window else "unresolved",
                 "successful_compactions": 0,
                 "locked": bool(turn_count),
             }
         usage = self._last_usage(selected_session_id)
         input_tokens = usage.get("input_tokens")
-        window = int(context.get("context_window_tokens") or 131_072)
-        if isinstance(input_tokens, int):
+        raw_window = context.get("context_window_tokens")
+        window = int(raw_window) if raw_window else None
+        if isinstance(input_tokens, int) and window:
             ratio = round((int(input_tokens) / window) * 100, 1)
         else:
             ratio = 0.0 if turn_count == 0 else None
@@ -1114,6 +1115,14 @@ class DashboardApplication:
             return self._runtime_factory()
         effective = self.configuration.effective(self.model)
         settings = Settings.from_env(self.workspace, effective["model"] or None)
+        if effective["context_window_source"] == "web":
+            settings = replace(
+                settings,
+                context_window_tokens=int(effective["context_window_tokens"]),
+                context_window_source="web",
+            )
+        elif effective["context_window_source"] == "auto":
+            settings = replace(settings, context_window_source="auto")
         return build_runtime(
             settings, approval_callback=self.permissions.callback
         )

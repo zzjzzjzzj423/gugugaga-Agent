@@ -1,5 +1,6 @@
 import pytest
 
+import gugugaga.__main__ as cli
 from gugugaga.__main__ import build_runtime, create_parser, handle_command, main
 from gugugaga.config import Settings
 from gugugaga.context_modes import ContextModeError
@@ -24,6 +25,12 @@ def test_parser_accepts_workspace_and_model(tmp_path):
     assert args.context_window_tokens == 262_144
 
 
+@pytest.mark.parametrize("flag", ["--context-threshold-ratio", "--hermes-threshold-ratio"])
+def test_parser_accepts_shared_compaction_ratio_alias(flag):
+    args = create_parser().parse_args([flag, "0.6"])
+    assert args.hermes_threshold_ratio == 0.6
+
+
 def test_build_runtime_and_status_command(tmp_path, monkeypatch):
     settings = make_settings(tmp_path, monkeypatch)
     app = build_runtime(settings, provider=ScriptedProvider([ModelResponse("ok")]))
@@ -32,7 +39,48 @@ def test_build_runtime_and_status_command(tmp_path, monkeypatch):
     assert "Workspace" in output
     assert "test-model" in output
     assert "Context mode: CC" in output
+    assert "Automatic summary trigger: 98304 tokens (75%" in output
     assert "Successful compactions: 0" in output
+
+
+@pytest.mark.parametrize("mode", ["cc", "hermes", "pi"])
+def test_discovered_window_sets_shared_threshold(tmp_path, monkeypatch, mode):
+    settings = make_settings(tmp_path, monkeypatch)
+
+    class FakeSiliconFlow(ScriptedProvider):
+        pass
+
+    monkeypatch.setattr(cli, "SiliconFlowProvider", FakeSiliconFlow)
+    monkeypatch.setattr(
+        cli, "resolve_context_window",
+        lambda provider, model, path: (1_000_000, "models.dev"),
+    )
+    app = build_runtime(settings, provider=FakeSiliconFlow(), context_mode=mode)
+    try:
+        status = app.runtime.context_status()
+        assert status["context_window_tokens"] == 1_000_000
+        assert status["automatic_trigger_tokens"] == 500_000
+        assert status["context_window_source"] == "models.dev"
+    finally:
+        app.close()
+
+
+def test_manual_window_skips_catalog_lookup(tmp_path, monkeypatch):
+    monkeypatch.setenv("GUGUGAGA_CONTEXT_WINDOW_TOKENS", "262144")
+    settings = make_settings(tmp_path, monkeypatch)
+
+    def unexpected(*args):
+        raise AssertionError("catalog must not be fetched")
+
+    monkeypatch.setattr(cli, "resolve_context_window", unexpected)
+    app = build_runtime(settings, provider=ScriptedProvider())
+    try:
+        status = app.runtime.context_status()
+        assert status["context_window_tokens"] == 262_144
+        assert status["automatic_trigger_tokens"] == 196_608
+        assert status["context_window_source"] == "environment"
+    finally:
+        app.close()
 
 
 def test_exit_command_requests_shutdown(tmp_path, monkeypatch):
